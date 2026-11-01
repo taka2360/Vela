@@ -83,6 +83,16 @@ final class VNetMachine: @unchecked Sendable {
     /// ブラウザの User-Agent を使う
     func setUserAgent(_ ua: String) { queue.async { self.pool.userAgent = ua } }
 
+    /// 守りの決まり（Cookie の写し・HSTS・LAN の保護）を渡す。pool は queue の上でしか触らない
+    func configurePolicies(cookieJar: CookieJar, hsts: HSTSStore, localNetworkProtection: Bool) {
+        queue.async {
+            self.pool.cookieJar = cookieJar
+            self.pool.hsts = hsts
+            self.pool.localNetworkProtection = localNetworkProtection
+            self.pool.policyLog = { [weak self] s in self?.log?(s) }
+        }
+    }
+
     func stats() -> String {
         "フレーム 送 \(framesOut)（\(bytesOut / 1024)KB）・受 \(framesIn)（\(bytesIn / 1024)KB）・接続 新 \(pool.opened) 使い回し \(pool.reused)"
     }

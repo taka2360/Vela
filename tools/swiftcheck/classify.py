@@ -89,6 +89,24 @@ def in_override_init_of_main_actor_class(src_lines, line_no):
     return False
 
 
+ISOLATED_NAME = re.compile(r"main actor-isolated [\w ]*?'(?P<name>[^']+)'")
+
+
+def isolated_target_is_own_code(msg, project_text):
+    """隔離のエラーの相手が、このプロジェクトで書いた @MainActor のもの（メソッド・init・プロパティ）か。
+    そうなら iPad でも本当のエラーになる（実際に iPad で出た）。iOS の API（Objective-C から来たもの）なら iPad では警告どまり"""
+    m = ISOLATED_NAME.search(msg)
+    if not m:
+        return False    # 相手が分からないときは、前と同じく「調べられなかった」に入れる
+    name = m.group("name")
+    if name.startswith("init("):
+        labels = name[5:].rstrip(")").split(":")
+        first = labels[0] if labels and labels[0] else ""
+        return re.search(r"\binit\(\s*" + re.escape(first) + (r"\s*:" if first else r"\s*\)"), project_text) is not None
+    base = name.split("(")[0]
+    return re.search(r"\b(func|var|let)\s+`?" + re.escape(base) + r"\b", project_text) is not None
+
+
 def enclosing_decl(src_lines, line_no):
     """その行を囲んでいる関数・init の始まりの行番号（見つからなければ None）"""
     for i in range(min(line_no, len(src_lines)) - 1, -1, -1):
@@ -136,6 +154,7 @@ def main():
             p = orig_of(d.path)
             objc_funcs.add((p, enclosing_decl(src_lines(p), d.line)))
 
+    project_text = "\n".join("\n".join(src_lines(p)) for p in originals)
     errors, warnings, skipped = [], [], []
     for d in diags:
         path = orig_of(d.path)
@@ -144,7 +163,8 @@ def main():
                 skipped.append((d, "Objective-C の仕組み"))
             elif path and (path, enclosing_decl(src_lines(path), d.line)) in objc_funcs:
                 skipped.append((d, "Objective-C の仕組みの巻き添え"))
-            elif ISOLATION.search(d.msg) and path and in_override_init_of_main_actor_class(src_lines(path), d.line):
+            elif ISOLATION.search(d.msg) and path and in_override_init_of_main_actor_class(src_lines(path), d.line) \
+                    and not isolated_target_is_own_code(d.msg, project_text):
                 skipped.append((d, "NSObject の override init の MainActor"))
             else:
                 errors.append(d)

@@ -1,0 +1,10 @@
+// Vela の単体テストの入口（tools/tests/run.sh がビルドして動かす）
+siteTests()
+setCookieTests()
+cookiePolicyTests()
+cookieJarTests()
+redirectTests()
+corsTests()
+localNetworkTests()
+hstsTests()
+finishTests()

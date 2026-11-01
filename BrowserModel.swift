@@ -33,6 +33,18 @@ final class LogBuffer: @unchecked Sendable {
     }
 }
 
+/// 通信の作り
+enum NetMode: String {
+    /// https・http をそのまま VNetScheme が引き受ける（アドレスは本物の https://…）
+    case vnetDirect = "VNet"
+    /// 予備の vnets://… の作り（開発者向けの実験。CSP などを外すので安全ではない）
+    case vnetsLegacy = "VNet（vnets://・実験）"
+    /// 標準の通信（WebKit 内蔵）
+    case native = "標準"
+
+    var usesVNet: Bool { self != .native }
+}
+
 @MainActor
 final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
     @Published var address = "https://example.com/"
@@ -41,29 +53,51 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
     @Published var pageTitle = ""
     let webView: WKWebView
     let machine = VNetMachine(factory: NWUserNetFactory())
-    /// true: https://… をそのまま自作の通信で読む。false: 予備の vnets://… の作り
-    let direct: Bool
+    /// 通信の作り（起動のときに決める）
+    let mode: NetMode
+    /// https の横取りの結果
+    let takeover: HTTPSTakeover.Outcome
+    /// Cookie の写し（正本は WebKit の置き場）
+    let cookieJar = CookieJar()
+    /// HSTS の記録
+    let hsts = HSTSStore(fileURL: HSTSStore.defaultFileURL())
     private let scheme = VNetScheme()
     private let cookies = CookieBridge()
+    private let actions = PageActionBridge()
+    private var cookieSync: WebCookieSync?
     private let logs = LogBuffer()
     private var timer: Timer?
     private var logTimer: Timer?
 
     override init() {
         let config = WKWebViewConfiguration()
-        direct = HTTPSTakeover.install()
+        let outcome = HTTPSTakeover.install()
+        takeover = outcome
+        if outcome == .installed { mode = .vnetDirect }
+        else if VelaSettings.legacyVNetsFallback && !VelaSettings.vnetDisabled { mode = .vnetsLegacy }
+        else { mode = .native }
         let content = config.userContentController
-        if direct {
+        switch mode {
+        case .vnetDirect:
             config.setURLSchemeHandler(scheme, forURLScheme: "https")
             config.setURLSchemeHandler(scheme, forURLScheme: "http")
-        } else {
+        case .vnetsLegacy:
             config.setURLSchemeHandler(scheme, forURLScheme: "vnet")
             config.setURLSchemeHandler(scheme, forURLScheme: "vnets")
             content.addUserScript(WKUserScript(source: PageScripts.rewriteURLs, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        case .native:
+            break
         }
-        // クッキー: ページの JavaScript が作ったものをアプリにも知らせる
-        content.addUserScript(WKUserScript(source: PageScripts.watchCookies, injectionTime: .atDocumentStart, forMainFrameOnly: false))
-        content.add(cookies, name: PageScripts.cookieHandlerName)
+        if mode.usesVNet {
+            // Cookie: ページの JavaScript が変えたら「合図」だけもらって、WebKit の置き場（正本）を読み直す
+            content.addUserScript(WKUserScript(source: PageScripts.watchCookies, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+            content.add(cookies, name: PageScripts.cookieHandlerName)
+        }
+        // LAN の保護: WebSocket は VNet を通らないので、ページの中でも止める
+        if VelaSettings.localNetworkProtection {
+            content.addUserScript(WKUserScript(source: PageScripts.webSocketGuard, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        }
+        content.add(actions, name: PageScripts.actionHandlerName)
         // 動画: 全画面にせずページの中で再生する・自動再生を許す
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
@@ -74,29 +108,58 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
         // アプリの中のブラウザやロボットだと思われて、エラーや「不審なトラフィック」の画面になりやすい
         webView.customUserAgent = BrowserIdentity.userAgent
         super.init()
-        scheme.machine = machine
-        scheme.pushCookies = { [weak self] lines, done in
+        webView.navigationDelegate = self
+        // 残りの準備は、画面のスレッドで改めて行う。
+        // NSObject の override init は、iPad の Swift だと MainActor の中と見なされないことがあり、
+        // 自分の @MainActor のメソッド（startTimers など）をここから呼ぶとエラーになるため
+        Task { @MainActor in self.setUp() }
+    }
+
+    /// init の続き（画面のスレッドで 1 回だけ）
+    private func setUp() {
+        let lb = logs
+        logs.add(takeover.description)
+        switch mode {
+        case .vnetDirect: logs.add("https・http をそのまま自作の通信で読みます（アドレスは本物の https://…）")
+        case .vnetsLegacy:
+            logs.add("⚠️ 予備の vnets://… の作りで読みます（開発者向けの実験。CSP などを外すので安全ではありません）")
+            blockDirectLoads()
+        case .native: logs.add("標準の通信（WebKit）で読みます。VNet は使いません")
+        }
+        if VelaSettings.localNetworkProtection { installLocalNetworkRules() } else { logs.add("⚠️ LAN の保護は切ってあります") }
+        actions.onAction = { [weak self] body, isMain, origin in
             let model = self
+            Task { @MainActor in model?.handleAction(body, isMainFrame: isMain, origin: origin) }
+        }
+
+        guard mode.usesVNet else { startTimers(); return }
+        // VNet: Cookie の正本は WebKit の置き場。CookieJar はその写し
+        cookieJar.settings = VelaSettings.cookiePolicy
+        cookieJar.log = { s in lb.add(s) }
+        hsts.log = { s in lb.add(s) }
+        let sync = WebCookieSync(store: webView.configuration.websiteDataStore.httpCookieStore, jar: cookieJar)
+        sync.log = { s in lb.add(s) }
+        cookieSync = sync
+        cookies.onSignal = { [weak sync] in
+            let target = sync   // weak の変数は並行の閉包から直接さわれないので、let に受け直す
+            Task { @MainActor in target?.scheduleRefresh() }
+        }
+        scheme.machine = machine
+        scheme.hsts = hsts
+        scheme.pushCookies = { [weak sync] changes, done in
+            let target = sync
             Task { @MainActor in
-                await model?.pushCookies(lines)
+                await target?.apply(changes)
                 done()
             }
         }
-        webView.navigationDelegate = self
-        if direct {
-            logs.add("https・http をそのまま自作の通信で読みます（アドレスは本物の https://…）")
-        } else {
-            logs.add("https を引き受けられませんでした。vnets://… の作りで読みます")
-            blockDirectLoads()
-        }
-        let m = machine
-        let lb = logs
         machine.log = { s in lb.add(s) }
         scheme.log = { s in lb.add(s) }
         cookies.log = { s in lb.add(s) }
+        machine.configurePolicies(cookieJar: cookieJar, hsts: hsts, localNetworkProtection: VelaSettings.localNetworkProtection)
         // 自作の通信で送る User-Agent も同じもの（ページの JavaScript から見えるものと食い違うと、ロボットだと思われる）
-        m.setUserAgent(BrowserIdentity.userAgent)
-        m.boot()
+        machine.setUserAgent(BrowserIdentity.userAgent)
+        machine.boot()
         startTimers()
     }
 
@@ -106,6 +169,19 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
         WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "vnet-only", encodedContentRuleList: rules) { [weak self] list, _ in
             let model = self
             if let list { Task { @MainActor in model?.webView.configuration.userContentController.add(list) } }
+        }
+    }
+
+    /// LAN の保護のルール（標準の通信のタブ・WebSocket・VNet の手前）を WebKit に入れる
+    private func installLocalNetworkRules() {
+        let lb = logs
+        WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "vela-lan-protection", encodedContentRuleList: PageScripts.localNetworkRules) { [weak self] list, error in
+            let model = self
+            if let list {
+                Task { @MainActor in model?.webView.configuration.userContentController.add(list) }
+            } else {
+                lb.add("⚠️ LAN の保護のルールを WebKit に入れられません: \(error.map { "\($0)" } ?? "不明")")
+            }
         }
     }
 
@@ -127,34 +203,53 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
     }
 
     private func refreshStatus() {
+        guard mode.usesVNet else { status = "通信: \(mode.rawValue)"; return }
         let ip = machine.stack.ready ? "IP \(machine.stack.ip.ipString)" : "IP をもらっています…"
-        status = "\(ip)・\(machine.stats())"
+        status = "\(mode.rawValue)・\(ip)・\(machine.stats())"
     }
 
-    /// サーバーから届いたクッキーを、ブラウザ（WebKit）の置き場にも入れる（ページの JavaScript から document.cookie で見えるように）
-    func pushCookies(_ lines: [CookieLine]) async {
-        let store = webView.configuration.websiteDataStore.httpCookieStore
-        for l in lines {
-            guard let real = VNetURL.toReal(l.url) else { continue }
-            for c in CookieSync.parse(l.header, url: real) {
-                if let e = c.expiresDate, e <= Date() { await store.deleteCookie(c) } else { await store.setCookie(c) }
+    /// エラーページのボタン・守りのスクリプトからの知らせ
+    private func handleAction(_ body: [String: Any], isMainFrame: Bool, origin: String) {
+        switch body["action"] as? String {
+        case "allowLocalNetwork":
+            // 確認のページ（メインフレーム）からの、合言葉の合っている知らせだけを受け付ける
+            guard isMainFrame, let nonce = body["nonce"] as? String, let u = scheme.consumeConsent(nonce) else {
+                addLog("🛡 LAN の確認: 受け付けない知らせです（\(origin)）")
+                return
             }
+            addLog("🛡 LAN の確認: ユーザーが許可しました → \(u.absoluteString)")
+            open(u)
+        case "blockedWebSocket":
+            addLog("🛡 LAN の保護: WebSocket を止めました（\(origin) → \(body["url"] as? String ?? "?")）")
+        default:
+            break
         }
+    }
+
+    /// ユーザーの操作として開く（LAN の保護・SameSite の判定で「ユーザーの操作」になる）
+    private func open(_ u: URL) {
+        let target: URL
+        switch mode {
+        case .vnetsLegacy: guard let v = VNetURL.toVNet(u) else { addLog("アドレスが正しくありません"); return }; target = v
+        case .vnetDirect, .native: target = u
+        }
+        if mode.usesVNet { scheme.noteUserNavigation(target) }
+        webView.load(URLRequest(url: target))
     }
 
     func go() {
         var text = address.trimmingCharacters(in: .whitespaces)
         if !text.contains("://") { text = "https://" + text }
-        guard let u = URL(string: text), let v = direct ? Optional(u) : VNetURL.toVNet(u) else { addLog("アドレスが正しくありません"); return }
+        guard let u = URL(string: text) else { addLog("アドレスが正しくありません"); return }
         addLog("―― \(text) を開きます ――")
-        webView.load(URLRequest(url: v))
+        open(u)
     }
 
     // MARK: WKNavigationDelegate
 
     // リンクを押したとき: https:// などのアドレスなら、自作の通信のアドレスに直して開き直す（vnets:// の作りのときだけ）
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
-        if direct { return .allow }
+        if mode != .vnetsLegacy { return .allow }
         if let u = navigationAction.request.url, let s = u.scheme?.lowercased(), s == "http" || s == "https",
            navigationAction.targetFrame?.isMainFrame ?? true, let v = VNetURL.toVNet(u) {
             webView.load(URLRequest(url: v))
@@ -169,5 +264,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         pageTitle = webView.title ?? ""
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        addLog("✕ 読み込みに失敗: \(error.localizedDescription)")
     }
 }

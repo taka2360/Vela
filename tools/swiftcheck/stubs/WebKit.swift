@@ -4,9 +4,17 @@
 
 open class WKNavigation: NSObject {}
 
+open class WKSecurityOrigin: NSObject {
+    open var `protocol`: String { "" }
+    open var host: String { "" }
+    open var port: Int { 0 }
+}
+
 open class WKFrameInfo: NSObject {
     open var isMainFrame: Bool { true }
     open var request: URLRequest { URLRequest(url: URL(string: "about:blank")!) }
+    open var securityOrigin: WKSecurityOrigin { WKSecurityOrigin() }
+    open weak var webView: WKWebView? { nil }
 }
 
 public enum WKNavigationType: Int { case linkActivated, formSubmitted, backForward, reload, formResubmitted, other = -1 }
@@ -105,7 +113,16 @@ open class WKUserContentController: NSObject {
     open func removeAllContentRuleLists() {}
 }
 
+public protocol WKHTTPCookieStoreObserver: NSObjectProtocol {
+    func cookiesDidChange(in cookieStore: WKHTTPCookieStore)
+}
+public extension WKHTTPCookieStoreObserver {
+    func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {}
+}
+
 open class WKHTTPCookieStore: NSObject {
+    open func add(_ observer: WKHTTPCookieStoreObserver) {}
+    open func remove(_ observer: WKHTTPCookieStoreObserver) {}
     open func getAllCookies(_ completionHandler: @escaping @MainActor ([HTTPCookie]) -> Void) {}
     open func allCookies() async -> [HTTPCookie] { [] }
     open func setCookie(_ cookie: HTTPCookie, completionHandler: (@MainActor () -> Void)? = nil) {}
@@ -193,5 +210,6 @@ open class WKBackForwardList: NSObject {
     @MainActor open func evaluateJavaScript(_ javaScriptString: String) async throws -> Any { 0 }
     @MainActor open func callAsyncJavaScript(_ functionBody: String, arguments: [String: Any] = [:], in frame: WKFrameInfo? = nil,
                                              contentWorld: Any) async throws -> Any? { nil }
-    open class func handlesURLScheme(_ urlScheme: String) -> Bool { false }
+    // 本物は MainActor の WKWebView の中だが、Objective-C から来た API なので、隔離の食い違いは iPad では警告どまり。スタブでは nonisolated にしておく
+    nonisolated open class func handlesURLScheme(_ urlScheme: String) -> Bool { false }
 }

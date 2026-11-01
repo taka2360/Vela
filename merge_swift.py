@@ -19,7 +19,8 @@ from pathlib import Path
 
 # README の順（ここに無いファイルは最後に名前順で足す）
 ORDER = [
-    "MyApp", "BrowserView", "BrowserModel", "VNetScheme", "HTTPSTakeover", "PageScripts",
+    "MyApp", "BrowserView", "BrowserModel", "Persistence", "VNetScheme", "HTTPSTakeover", "PageScripts",
+    "NetPolicy", "CookieJar", "HSTSStore",
     "HTTPClient", "HTTPResponseParser", "HTTPSupport", "TLSClient",
     "GuestStack", "GuestTCP", "DNSMessage", "Packet",
     "VNetMachine", "VNetCore", "VNetDriver",

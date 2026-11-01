@@ -9,8 +9,11 @@ import Security
 // そこで、古いけれど今も使える Apple の「SecureTransport」（SSLCreateContext など）を使う。
 // これは「読む・書く」を自分で用意できるので、GuestTCP の上で TLS 1.2 を話せる。
 // 証明書は iPad と同じ仕組みで確かめる（相手の名前も確かめる）。
-// ブラウザらしく見えるよう: ALPN（http/1.1）を名乗る・TLS 1.3 を試す（だめなら呼ぶ側が 1.2 でやり直す）・
-// 前の暗号の約束を使い回す（セッション再開。握手が速くなる）
+// ブラウザらしく見えるよう: ALPN（http/1.1）を名乗る・前の暗号の約束を使い回す（セッション再開。握手が速くなる）
+//
+// 注意（技術的負債）: SecureTransport は 2019 年から非推奨で、TLS 1.3 には対応しない（Apple TN3151）。
+// なので VNet の TLS は 1.2 まで。TLS 1.3 だけのサーバーは版が合わずに失敗する（versionMismatch）。そのときは標準の通信で開く。
+// 自作の TCP の上では Network.framework の TLS を使えないので、TLS エンジンの移行は別の課題にしている
 //
 // 使い方: TLSStream(host:) を作る → TCP がつながったら attach → onReady で write → onData で中身が届く → onClosed
 // SecureTransport が無い環境では TLSStream(host:) が nil を返す（https は使えない）
@@ -30,30 +33,31 @@ final class TLSStream: @unchecked Sendable {
     private var done = false
     /// 握手に失敗したときの番号（0 なら握手の失敗ではない）
     private(set) var handshakeError: OSStatus = 0
-    /// TLS 1.3 まで試したか
-    private(set) var triedTLS13 = false
     /// 決まった版（"TLS 1.2" など）
     private(set) var version = ""
     var onReady: (() -> Void)?
     var onData: ((Data) -> Void)?
     var onClosed: ((String?) -> Void)?
 
-    init?(host: String, port: UInt16 = 443, allowTLS13: Bool = true) {
+    init?(host: String, port: UInt16 = 443) {
         self.host = host
         guard let c = SSLCreateContext(nil, .clientSide, .streamType) else { return nil }
         ctx = c
         SSLSetIOFuncs(ctx, tlsRead, tlsWrite)
         SSLSetProtocolVersionMin(ctx, .tlsProtocol12)
-        if allowTLS13 && SSLSetProtocolVersionMax(ctx, .tlsProtocol13) == errSecSuccess { triedTLS13 = true }
-        else { SSLSetProtocolVersionMax(ctx, .tlsProtocol12) }
+        SSLSetProtocolVersionMax(ctx, .tlsProtocol12)      // SecureTransport は 1.3 を話せない
         _ = host.withCString { SSLSetPeerDomainName(ctx, $0, strlen($0)) }
         SSLSetALPNProtocols(ctx, ["http/1.1"] as CFArray)
-        let peer = Array("\(host):\(port):\(triedTLS13 ? 13 : 12)".utf8)
+        let peer = Array("\(host):\(port)".utf8)
         _ = peer.withUnsafeBytes { SSLSetPeerID(ctx, $0.baseAddress, $0.count) }
     }
 
-    /// 証明書の問題での失敗か（版を下げてやり直しても無駄）
+    /// 証明書の問題での失敗か
     var failedOnCertificate: Bool { handshakeError <= -9807 && handshakeError >= -9815 }
+
+    /// 版や暗号の組み合わせが合わずに失敗したか（相手が TLS 1.3 だけなど）
+    /// -9836: errSSLPeerProtocolVersion（相手が版を断った）、-9831: errSSLPeerHandshakeFail、-9801: errSSLNegotiation、-9830: errSSLIllegalParam
+    var versionMismatch: Bool { [-9836, -9831, -9801].contains(handshakeError) }
 
     /// TCP がつながったら呼ぶ
     func attach(_ t: GuestTCP) {
@@ -77,9 +81,24 @@ final class TLSStream: @unchecked Sendable {
 
     /// 暗号にして送る（つながる前なら、つながってから送る）
     func write(_ d: Data) {
+        if done { return }
         if handshaking { pendingWrite.append(d); return }
-        var processed = 0
-        _ = d.withUnsafeBytes { SSLWrite(ctx, $0.baseAddress, d.count, &processed) }
+        // 書き込みの関数（tlsWrite）は全部を TCP に渡すので、普通は 1 回で全部書ける。
+        // それでも、書けた分を確かめて残りを書く。エラーなら閉じる（黙って捨てない）
+        var offset = 0
+        while offset < d.count {
+            var processed = 0
+            let st = d.withUnsafeBytes { buf -> OSStatus in
+                SSLWrite(ctx, buf.baseAddress! + offset, d.count - offset, &processed)
+            }
+            offset += processed
+            if st == errSSLWouldBlock && processed > 0 { continue }
+            if st != errSecSuccess {
+                finish("TLS の書き込みに失敗（\(st)）")
+                return
+            }
+            if processed == 0 { finish("TLS の書き込みが進みません"); return }
+        }
     }
 
     private func finish(_ error: String?) {
@@ -97,7 +116,8 @@ final class TLSStream: @unchecked Sendable {
             if st == errSSLWouldBlock { return }
             if st != errSecSuccess {
                 handshakeError = st
-                finish("TLS の握手に失敗（\(st)）" + (st == errSSLXCertChainInvalid || st == -9807 ? "：証明書を確かめられません" : ""))
+                finish("TLS の握手に失敗（\(st)）" + (failedOnCertificate ? "：証明書を確かめられません"
+                                                   : versionMismatch ? "：TLS の版が合いません（VNet は TLS 1.2 まで）" : ""))
                 return
             }
             handshaking = false
@@ -151,13 +171,13 @@ private func tlsWrite(_ conn: SSLConnectionRef, _ data: UnsafeRawPointer, _ leng
 final class TLSStream: @unchecked Sendable {
     static let isSupported = false
     let handshakeError: Int32 = 0
-    let triedTLS13 = false
     let version = ""
     var failedOnCertificate: Bool { false }
+    var versionMismatch: Bool { false }
     var onReady: (() -> Void)?
     var onData: ((Data) -> Void)?
     var onClosed: ((String?) -> Void)?
-    init?(host: String, port: UInt16 = 443, allowTLS13: Bool = true) { return nil }
+    init?(host: String, port: UInt16 = 443) { return nil }
     func attach(_ t: GuestTCP) {}
     func tcpData(_ d: Data) {}
     func tcpClosed(_ error: String?) {}

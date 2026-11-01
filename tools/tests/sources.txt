@@ -1,0 +1,5 @@
+# テストに入れるアプリ側の .swift（UI・WebKit に頼らないものだけ。プロジェクトのフォルダからの相対パス）
+NetPolicy.swift
+HSTSStore.swift
+CookieJar.swift
+HTTPSupport.swift

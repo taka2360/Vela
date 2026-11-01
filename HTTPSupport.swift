@@ -6,7 +6,9 @@ import FoundationNetworking
 import Compression
 #endif
 
-// MARK: - http の小さな道具（ヘッダ・gzip・クッキー）
+// MARK: - http の小さな道具（ヘッダ・gzip・ブラウザらしさ）
+//
+// Cookie は CookieJar.swift（WebKit の置き場の写し）と NetPolicy.swift の CookiePolicy に移した
 
 /// ヘッダ（名前, 値）の並び。名前の大文字小文字は区別しない
 extension Array where Element == (String, String) {
@@ -145,54 +147,4 @@ enum BrowserIdentity {
             i == 0 ? l : "\(l);q=\(String(format: "%.1f", max(0.1, 1.0 - Double(i) * 0.1)))"
         }.joined(separator: ",")
     }()
-}
-
-// MARK: クッキー
-
-/// Set-Cookie の 1 行と、それが来たアドレス
-struct CookieLine: Sendable {
-    let header: String
-    let url: URL
-}
-
-/// クッキーを自分の置き場（HTTPCookieStorage）に入れる・送る。
-/// 期限切れのものは消す（サーバーも JavaScript も「消す」を期限切れで伝える）
-enum CookieSync {
-    static func parse(_ line: String, url: URL) -> [HTTPCookie] {
-        HTTPCookie.cookies(withResponseHeaderFields: ["Set-Cookie": line], for: url)
-    }
-
-    static func store(_ line: String, url: URL) {
-        let st = HTTPCookieStorage.shared
-        for c in parse(line, url: url) {
-            if let e = c.expiresDate, e <= Date() {
-                let d = c.domain.hasPrefix(".") ? String(c.domain.dropFirst()) : c.domain
-                for old in st.cookies ?? [] where old.name == c.name && old.path == c.path
-                    && (old.domain == d || old.domain == "." + d) {
-                    st.deleteCookie(old)
-                }
-            } else {
-                st.setCookie(c)
-            }
-        }
-    }
-
-    /// 送る Cookie ヘッダの中身。ブラウザ（WebKit）が付けてきたものを先に、
-    /// 足りない名前を自分の置き場から足す（同じ名前は 1 つだけ）。無ければ nil
-    static func header(for url: URL, browserCookies: [String]) -> String? {
-        var jar: [String] = []
-        var seen = Set<String>()
-        for line in browserCookies {
-            for part in line.split(separator: ";") {
-                let kv = part.trimmingCharacters(in: .whitespaces)
-                guard !kv.isEmpty else { continue }
-                let name = kv.split(separator: "=", maxSplits: 1).first.map(String.init) ?? kv
-                if seen.insert(name).inserted { jar.append(kv) }
-            }
-        }
-        for c in HTTPCookieStorage.shared.cookies(for: url) ?? [] where seen.insert(c.name).inserted {
-            jar.append("\(c.name)=\(c.value)")
-        }
-        return jar.isEmpty ? nil : jar.joined(separator: "; ")
-    }
 }

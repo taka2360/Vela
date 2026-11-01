@@ -9,32 +9,79 @@ import ObjectiveC
 /// WebKit はそれを WKWebView.handlesURLScheme で確かめているので、そこだけ「http・https は扱わない」と答えさせる。
 /// こうすると、ページのアドレスは本物の https://… のまま、読み込みは全部 VNetScheme（自作の通信）に来る。
 /// YouTube やログインのように「アドレスが https か」を確かめるページも、そのまま動く。
+///
+/// 受け入れたリスク（README と開発者パネルにも書く）:
+/// ・WebKit の中の作り（handlesURLScheme の差し替え・_willPerformRedirection:）に頼っている。実行時に確かめても、
+///   WebKit が変われば動かなくなる・落ちる可能性は消せない。App Store に出すアプリには使えない
+/// ・守り: 確かめた iOS の版（testedMajorVersions）だけで使う。差し替えた後の確認に失敗したら、元の実装に戻して標準の通信にする。
+///   設定の「VNet を使わない」で、差し替え自体をしないようにできる
 enum HTTPSTakeover {
-    // install() からしか触らないので、画面のスレッド（MainActor）に置く
-    @MainActor private static var tried = false
-    @MainActor private static var ok = false
+    enum Outcome: Equatable {
+        /// https・http を VNetScheme が引き受けられる
+        case installed
+        /// 設定で VNet を使わない
+        case disabledBySetting
+        /// 確かめていない iOS の版（設定で許せば試す）
+        case untestedOS(Int)
+        /// 差し替えられなかった・確認に失敗した（元に戻した）
+        case failed(String)
 
-    /// 1 回だけ行う。うまくいったら true（だめなら vnets:// の作りに戻す）
-    @MainActor static func install() -> Bool {
-        if tried { return ok }
-        tried = true
-        guard swap() else { return false }
-        ok = !WKWebView.handlesURLScheme("https") && !WKWebView.handlesURLScheme("http")
-        return ok
+        var description: String {
+            switch self {
+            case .installed: return "https の横取り: 成功"
+            case .disabledBySetting: return "https の横取り: 設定で使わない"
+            case .untestedOS(let v): return "https の横取り: 確かめていない iOS \(v) なので使わない（設定で試せます）"
+            case .failed(let why): return "https の横取り: 失敗（\(why)）。元に戻しました"
+            }
+        }
     }
 
-    private static func swap() -> Bool {
+    /// 動くことを確かめた iOS の版（大きい番号）
+    static let testedMajorVersions = 16...26
+
+    // 1 回目の結果。@MainActor にはしない（NSObject の override init など、隔離の扱いが iPad の Swift で揺れる所から呼ぶため）。
+    // 代わりにロックで守る。WKWebView.handlesURLScheme は Objective-C の API なので、どのスレッドから呼んでもコンパイルは通る
+    private static let lock = NSLock()
+    private static var result: Outcome?
+
+    /// 1 回だけ行う（2 回目からは 1 回目の結果）。画面のスレッドから呼ぶこと
+    static func install() -> Outcome {
+        lock.lock(); defer { lock.unlock() }
+        if let r = result { return r }
+        let r = tryInstall()
+        result = r
+        return r
+    }
+
+    private static func tryInstall() -> Outcome {
+        if VelaSettings.vnetDisabled { return .disabledBySetting }
+        let major = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+        if !testedMajorVersions.contains(major) && !VelaSettings.allowUntestedOS { return .untestedOS(major) }
         let sel = NSSelectorFromString("handlesURLScheme:")
-        guard let m = class_getClassMethod(WKWebView.self, sel) else { return false }
+        guard let m = class_getClassMethod(WKWebView.self, sel) else { return .failed("handlesURLScheme: が見つかりません") }
+        let original = method_getImplementation(m)
+        let others = ["data", "blob", "about", "vnets"]
+        let before = others.map { WKWebView.handlesURLScheme($0) }
+        swap(m, sel: sel, original: original)
+        // 差し替えが効いているか・ほかのスキームの答えが変わっていないかを確かめる。だめなら元に戻す
+        let ok = !WKWebView.handlesURLScheme("https") && !WKWebView.handlesURLScheme("http")
+            && others.map({ WKWebView.handlesURLScheme($0) }) == before
+        if !ok {
+            _ = method_setImplementation(m, original)
+            return .failed("差し替えた後の確認に失敗")
+        }
+        return .installed
+    }
+
+    private static func swap(_ m: Method, sel: Selector, original: IMP) {
         typealias Orig = @convention(c) (AnyObject, Selector, NSString) -> Bool
-        let orig = unsafeBitCast(method_getImplementation(m), to: Orig.self)
+        let orig = unsafeBitCast(original, to: Orig.self)
         let block: @convention(block) (AnyObject, NSString) -> Bool = { cls, scheme in
             let s = (scheme as String).lowercased()
             if s == "http" || s == "https" { return false }
             return orig(cls, sel, scheme)
         }
-        method_setImplementation(m, imp_implementationWithBlock(unsafeBitCast(block, to: AnyObject.self)))
-        return true
+        _ = method_setImplementation(m, imp_implementationWithBlock(unsafeBitCast(block, to: AnyObject.self)))
     }
 }
 

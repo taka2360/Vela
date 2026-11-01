@@ -1,10 +1,10 @@
 // このファイルは merge_swift.py で自動生成したものです（直接編集しないでください）
-// 元ファイル: MyApp.swift, BrowserView.swift, BrowserModel.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, HTTPClient.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
+// 元ファイル: MyApp.swift, BrowserView.swift, BrowserModel.swift, Persistence.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
 
 import SwiftUI
 import WebKit
-import ObjectiveC
 import Foundation
+import ObjectiveC
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
@@ -127,6 +127,18 @@ final class LogBuffer: @unchecked Sendable {
     }
 }
 
+/// 通信の作り
+enum NetMode: String {
+    /// https・http をそのまま VNetScheme が引き受ける（アドレスは本物の https://…）
+    case vnetDirect = "VNet"
+    /// 予備の vnets://… の作り（開発者向けの実験。CSP などを外すので安全ではない）
+    case vnetsLegacy = "VNet（vnets://・実験）"
+    /// 標準の通信（WebKit 内蔵）
+    case native = "標準"
+
+    var usesVNet: Bool { self != .native }
+}
+
 @MainActor
 final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
     @Published var address = "https://example.com/"
@@ -135,29 +147,51 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
     @Published var pageTitle = ""
     let webView: WKWebView
     let machine = VNetMachine(factory: NWUserNetFactory())
-    /// true: https://… をそのまま自作の通信で読む。false: 予備の vnets://… の作り
-    let direct: Bool
+    /// 通信の作り（起動のときに決める）
+    let mode: NetMode
+    /// https の横取りの結果
+    let takeover: HTTPSTakeover.Outcome
+    /// Cookie の写し（正本は WebKit の置き場）
+    let cookieJar = CookieJar()
+    /// HSTS の記録
+    let hsts = HSTSStore(fileURL: HSTSStore.defaultFileURL())
     private let scheme = VNetScheme()
     private let cookies = CookieBridge()
+    private let actions = PageActionBridge()
+    private var cookieSync: WebCookieSync?
     private let logs = LogBuffer()
     private var timer: Timer?
     private var logTimer: Timer?
 
     override init() {
         let config = WKWebViewConfiguration()
-        direct = HTTPSTakeover.install()
+        let outcome = HTTPSTakeover.install()
+        takeover = outcome
+        if outcome == .installed { mode = .vnetDirect }
+        else if VelaSettings.legacyVNetsFallback && !VelaSettings.vnetDisabled { mode = .vnetsLegacy }
+        else { mode = .native }
         let content = config.userContentController
-        if direct {
+        switch mode {
+        case .vnetDirect:
             config.setURLSchemeHandler(scheme, forURLScheme: "https")
             config.setURLSchemeHandler(scheme, forURLScheme: "http")
-        } else {
+        case .vnetsLegacy:
             config.setURLSchemeHandler(scheme, forURLScheme: "vnet")
             config.setURLSchemeHandler(scheme, forURLScheme: "vnets")
             content.addUserScript(WKUserScript(source: PageScripts.rewriteURLs, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        case .native:
+            break
         }
-        // クッキー: ページの JavaScript が作ったものをアプリにも知らせる
-        content.addUserScript(WKUserScript(source: PageScripts.watchCookies, injectionTime: .atDocumentStart, forMainFrameOnly: false))
-        content.add(cookies, name: PageScripts.cookieHandlerName)
+        if mode.usesVNet {
+            // Cookie: ページの JavaScript が変えたら「合図」だけもらって、WebKit の置き場（正本）を読み直す
+            content.addUserScript(WKUserScript(source: PageScripts.watchCookies, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+            content.add(cookies, name: PageScripts.cookieHandlerName)
+        }
+        // LAN の保護: WebSocket は VNet を通らないので、ページの中でも止める
+        if VelaSettings.localNetworkProtection {
+            content.addUserScript(WKUserScript(source: PageScripts.webSocketGuard, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        }
+        content.add(actions, name: PageScripts.actionHandlerName)
         // 動画: 全画面にせずページの中で再生する・自動再生を許す
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
@@ -168,29 +202,58 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
         // アプリの中のブラウザやロボットだと思われて、エラーや「不審なトラフィック」の画面になりやすい
         webView.customUserAgent = BrowserIdentity.userAgent
         super.init()
-        scheme.machine = machine
-        scheme.pushCookies = { [weak self] lines, done in
+        webView.navigationDelegate = self
+        // 残りの準備は、画面のスレッドで改めて行う。
+        // NSObject の override init は、iPad の Swift だと MainActor の中と見なされないことがあり、
+        // 自分の @MainActor のメソッド（startTimers など）をここから呼ぶとエラーになるため
+        Task { @MainActor in self.setUp() }
+    }
+
+    /// init の続き（画面のスレッドで 1 回だけ）
+    private func setUp() {
+        let lb = logs
+        logs.add(takeover.description)
+        switch mode {
+        case .vnetDirect: logs.add("https・http をそのまま自作の通信で読みます（アドレスは本物の https://…）")
+        case .vnetsLegacy:
+            logs.add("⚠️ 予備の vnets://… の作りで読みます（開発者向けの実験。CSP などを外すので安全ではありません）")
+            blockDirectLoads()
+        case .native: logs.add("標準の通信（WebKit）で読みます。VNet は使いません")
+        }
+        if VelaSettings.localNetworkProtection { installLocalNetworkRules() } else { logs.add("⚠️ LAN の保護は切ってあります") }
+        actions.onAction = { [weak self] body, isMain, origin in
             let model = self
+            Task { @MainActor in model?.handleAction(body, isMainFrame: isMain, origin: origin) }
+        }
+
+        guard mode.usesVNet else { startTimers(); return }
+        // VNet: Cookie の正本は WebKit の置き場。CookieJar はその写し
+        cookieJar.settings = VelaSettings.cookiePolicy
+        cookieJar.log = { s in lb.add(s) }
+        hsts.log = { s in lb.add(s) }
+        let sync = WebCookieSync(store: webView.configuration.websiteDataStore.httpCookieStore, jar: cookieJar)
+        sync.log = { s in lb.add(s) }
+        cookieSync = sync
+        cookies.onSignal = { [weak sync] in
+            let target = sync   // weak の変数は並行の閉包から直接さわれないので、let に受け直す
+            Task { @MainActor in target?.scheduleRefresh() }
+        }
+        scheme.machine = machine
+        scheme.hsts = hsts
+        scheme.pushCookies = { [weak sync] changes, done in
+            let target = sync
             Task { @MainActor in
-                await model?.pushCookies(lines)
+                await target?.apply(changes)
                 done()
             }
         }
-        webView.navigationDelegate = self
-        if direct {
-            logs.add("https・http をそのまま自作の通信で読みます（アドレスは本物の https://…）")
-        } else {
-            logs.add("https を引き受けられませんでした。vnets://… の作りで読みます")
-            blockDirectLoads()
-        }
-        let m = machine
-        let lb = logs
         machine.log = { s in lb.add(s) }
         scheme.log = { s in lb.add(s) }
         cookies.log = { s in lb.add(s) }
+        machine.configurePolicies(cookieJar: cookieJar, hsts: hsts, localNetworkProtection: VelaSettings.localNetworkProtection)
         // 自作の通信で送る User-Agent も同じもの（ページの JavaScript から見えるものと食い違うと、ロボットだと思われる）
-        m.setUserAgent(BrowserIdentity.userAgent)
-        m.boot()
+        machine.setUserAgent(BrowserIdentity.userAgent)
+        machine.boot()
         startTimers()
     }
 
@@ -200,6 +263,19 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
         WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "vnet-only", encodedContentRuleList: rules) { [weak self] list, _ in
             let model = self
             if let list { Task { @MainActor in model?.webView.configuration.userContentController.add(list) } }
+        }
+    }
+
+    /// LAN の保護のルール（標準の通信のタブ・WebSocket・VNet の手前）を WebKit に入れる
+    private func installLocalNetworkRules() {
+        let lb = logs
+        WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "vela-lan-protection", encodedContentRuleList: PageScripts.localNetworkRules) { [weak self] list, error in
+            let model = self
+            if let list {
+                Task { @MainActor in model?.webView.configuration.userContentController.add(list) }
+            } else {
+                lb.add("⚠️ LAN の保護のルールを WebKit に入れられません: \(error.map { "\($0)" } ?? "不明")")
+            }
         }
     }
 
@@ -221,34 +297,53 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
     }
 
     private func refreshStatus() {
+        guard mode.usesVNet else { status = "通信: \(mode.rawValue)"; return }
         let ip = machine.stack.ready ? "IP \(machine.stack.ip.ipString)" : "IP をもらっています…"
-        status = "\(ip)・\(machine.stats())"
+        status = "\(mode.rawValue)・\(ip)・\(machine.stats())"
     }
 
-    /// サーバーから届いたクッキーを、ブラウザ（WebKit）の置き場にも入れる（ページの JavaScript から document.cookie で見えるように）
-    func pushCookies(_ lines: [CookieLine]) async {
-        let store = webView.configuration.websiteDataStore.httpCookieStore
-        for l in lines {
-            guard let real = VNetURL.toReal(l.url) else { continue }
-            for c in CookieSync.parse(l.header, url: real) {
-                if let e = c.expiresDate, e <= Date() { await store.deleteCookie(c) } else { await store.setCookie(c) }
+    /// エラーページのボタン・守りのスクリプトからの知らせ
+    private func handleAction(_ body: [String: Any], isMainFrame: Bool, origin: String) {
+        switch body["action"] as? String {
+        case "allowLocalNetwork":
+            // 確認のページ（メインフレーム）からの、合言葉の合っている知らせだけを受け付ける
+            guard isMainFrame, let nonce = body["nonce"] as? String, let u = scheme.consumeConsent(nonce) else {
+                addLog("🛡 LAN の確認: 受け付けない知らせです（\(origin)）")
+                return
             }
+            addLog("🛡 LAN の確認: ユーザーが許可しました → \(u.absoluteString)")
+            open(u)
+        case "blockedWebSocket":
+            addLog("🛡 LAN の保護: WebSocket を止めました（\(origin) → \(body["url"] as? String ?? "?")）")
+        default:
+            break
         }
+    }
+
+    /// ユーザーの操作として開く（LAN の保護・SameSite の判定で「ユーザーの操作」になる）
+    private func open(_ u: URL) {
+        let target: URL
+        switch mode {
+        case .vnetsLegacy: guard let v = VNetURL.toVNet(u) else { addLog("アドレスが正しくありません"); return }; target = v
+        case .vnetDirect, .native: target = u
+        }
+        if mode.usesVNet { scheme.noteUserNavigation(target) }
+        webView.load(URLRequest(url: target))
     }
 
     func go() {
         var text = address.trimmingCharacters(in: .whitespaces)
         if !text.contains("://") { text = "https://" + text }
-        guard let u = URL(string: text), let v = direct ? Optional(u) : VNetURL.toVNet(u) else { addLog("アドレスが正しくありません"); return }
+        guard let u = URL(string: text) else { addLog("アドレスが正しくありません"); return }
         addLog("―― \(text) を開きます ――")
-        webView.load(URLRequest(url: v))
+        open(u)
     }
 
     // MARK: WKNavigationDelegate
 
     // リンクを押したとき: https:// などのアドレスなら、自作の通信のアドレスに直して開き直す（vnets:// の作りのときだけ）
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
-        if direct { return .allow }
+        if mode != .vnetsLegacy { return .allow }
         if let u = navigationAction.request.url, let s = u.scheme?.lowercased(), s == "http" || s == "https",
            navigationAction.targetFrame?.isMainFrame ?? true, let v = VNetURL.toVNet(u) {
             webView.load(URLRequest(url: v))
@@ -264,6 +359,64 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         pageTitle = webView.title ?? ""
     }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        addLog("✕ 読み込みに失敗: \(error.localizedDescription)")
+    }
+}
+
+// ======================================================================
+// MARK: - Persistence.swift
+// ======================================================================
+
+// MARK: - 設定（UserDefaults に置く）
+//
+// 通信まわりの設定は、アプリを起動し直したときに効く（WebView や通信の作りを、起動のときに決めるため）
+
+enum VelaSettings {
+    private static var d: UserDefaults { .standard }
+
+    private static func bool(_ key: String, _ def: Bool) -> Bool {
+        d.object(forKey: key) == nil ? def : d.bool(forKey: key)
+    }
+
+    // MARK: 通信（VNet）
+
+    /// VNet を使わず、標準の通信（WebKit 内蔵）だけで読む
+    static var vnetDisabled: Bool {
+        get { bool("vnet.disabled", false) } set { d.set(newValue, forKey: "vnet.disabled") }
+    }
+    /// 確かめていない iOS の版でも、https の横取り（非公開 API）を試す
+    static var allowUntestedOS: Bool {
+        get { bool("vnet.allowUntestedOS", false) } set { d.set(newValue, forKey: "vnet.allowUntestedOS") }
+    }
+    /// 開発者向け: 横取りできないとき、標準の通信ではなく予備の vnets:// の作りを使う（安全ではない。CSP などを外すため）
+    static var legacyVNetsFallback: Bool {
+        get { bool("vnet.legacyVNets", false) } set { d.set(newValue, forKey: "vnet.legacyVNets") }
+    }
+
+    // MARK: プライバシー・守り
+
+    /// サードパーティ Cookie をブロックする
+    static var blockThirdPartyCookies: Bool {
+        get { bool("cookies.blockThirdParty", true) } set { d.set(newValue, forKey: "cookies.blockThirdParty") }
+    }
+    /// SameSite が無い Cookie を Lax として扱う
+    static var cookiesLaxByDefault: Bool {
+        get { bool("cookies.laxByDefault", true) } set { d.set(newValue, forKey: "cookies.laxByDefault") }
+    }
+    /// LAN の保護（公開のサイトから LAN の機器へ届かせない）
+    static var localNetworkProtection: Bool {
+        get { bool("lan.protection", true) } set { d.set(newValue, forKey: "lan.protection") }
+    }
+
+    /// 今の設定から作る Cookie の決まり
+    static var cookiePolicy: CookiePolicy.Settings {
+        var s = CookiePolicy.Settings()
+        s.blockThirdParty = blockThirdPartyCookies
+        s.laxByDefault = cookiesLaxByDefault
+        return s
+    }
 }
 
 // ======================================================================
@@ -274,13 +427,40 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
 //
 // https:// と http://（予備の作りでは vnets:// と vnet://）の読み込みが全部ここに来る。
 // WebKit は画面のスレッドから呼ぶ。こちらも pending は画面のスレッドの上でだけ触る
+//
+// 守っていること（NetPolicy.swift の決まりを使う）:
+// ・CORS はサーバーの答えをそのまま渡す（OPTIONS もサーバーに送る）。Vela が許可を作ることはしない
+// ・CSP・X-Frame-Options などの守りのヘッダは消さない（予備の vnets:// の作りだけは、書き換えと合わないので外す）
+// ・リダイレクトの次の要求は RedirectPolicy だけで作る（Authorization を別のオリジンへ持ち越さない・POST を二重に送らない）
+// ・Cookie は CookieJar（WebKit の置き場の写し）と CookiePolicy。届いた Cookie は WebKit の置き場に入れてから、ページに返事を渡す
+// ・HSTS: 記録があれば http を https に上げる。https の応答から記録する（HSTSPolicy の条件のときだけ）
+// ・LAN の保護で「確認が必要」になった移動は、確認のページを出す（ユーザーが押したら、ユーザーの操作として開き直す）
 
 final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     var machine: VNetMachine?
     /// ログ（どのスレッドからでもよい）
     var log: (@Sendable (String) -> Void)?
-    /// 届いたクッキーをブラウザの置き場に入れる。入れ終わったら done を呼ぶこと
-    var pushCookies: (([CookieLine], _ done: @escaping @Sendable () -> Void) -> Void)?
+    /// 届いた Cookie の変更をブラウザ（WebKit）の置き場に入れる。入れ終わったら done を呼ぶこと
+    var pushCookies: (([CookieChange], _ done: @escaping @Sendable () -> Void) -> Void)?
+    /// HSTS の記録（nil なら使わない）
+    var hsts: HSTSStore?
+    /// LAN への移動の確認のページで使う合言葉（nonce）→ 開く URL。ページのボタンはこの合言葉を付けて知らせる。
+    /// 合言葉は確認のページの中にしか無い（確認のページは LAN 側のオリジンで出すので、元の公開のページからは読めない）
+    private var consents: [String: (url: URL, at: Date)] = [:]
+
+    /// 確認のページのボタンから届いた合言葉を確かめて、開く URL を返す（1 回だけ・10 分まで）
+    func consumeConsent(_ nonce: String) -> URL? {
+        guard let c = consents.removeValue(forKey: nonce), Date().timeIntervalSince(c.at) < 600 else { return nil }
+        return c.url
+    }
+
+    private func makeConsentNonce(_ url: URL) -> String {
+        let now = Date()
+        consents = consents.filter { now.timeIntervalSince($0.value.at) < 600 }
+        let n = UUID().uuidString + UUID().uuidString
+        consents[n] = (url, now)
+        return n
+    }
 
     /// 読み込み中の要求
     private struct Pending {
@@ -289,7 +469,6 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         var shownURL: URL
         /// 本当に読みに行くアドレス（https://…）
         var realURL: URL
-        let origin: String?
         let started: Date
         /// WebKit からの要求（移動のときに、次の要求を作るのに使う）
         var request: URLRequest
@@ -297,9 +476,20 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         var redirects = 0
         /// 移動（3xx）を WebKit に伝えられるか。できないときは、自分で追いかけて最後の返事だけ渡す
         var webKitRedirects: Bool
+        /// 要求の文脈（Cookie・LAN・HSTS の判定）
+        var context: RequestContext
+        /// 予備の vnets:// の作りの要求か
+        var vnetsMode: Bool { VNetURL.isVNet(shownURL) }
     }
     private var pending: [ObjectIdentifier: Pending] = [:]
-    static let maxRedirects = 20
+
+    /// ユーザーがアドレス欄などから開いた URL（1 回だけ使える印。ページのリンクや JavaScript の移動と見分ける）
+    private var userNavigation: (url: URL, at: Date)?
+
+    /// アプリが load() する直前に呼ぶ（画面のスレッドから）
+    func noteUserNavigation(_ url: URL) {
+        userNavigation = (VNetURL.toReal(url) ?? url, Date())
+    }
 
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
         start(task)
@@ -313,19 +503,34 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         guard let shown = task.request.url, let real = VNetURL.toReal(shown), let machine else {
             task.didFailWithError(URLError(.badURL)); return
         }
-        let origin = task.request.value(forHTTPHeaderField: "Origin")
-        // 下調べ（CORS の OPTIONS）は、ここで「何でも良い」と答える
-        if task.request.httpMethod == "OPTIONS" {
-            respond(task, url: shown, status: 204, type: "text/plain", body: Data(), origin: origin)
-            return
-        }
         let body = VNetScheme.body(of: task.request)
-        let req = VNetScheme.makeRequest(task.request, url: real, body: body)
+        let ctx = context(for: task.request, real: real)
         let id = ObjectIdentifier(task)
         let webKitRedirects = SchemeTaskRedirect.isAvailable(task)
-        pending[id] = Pending(task: task, shownURL: shown, realURL: real, origin: origin, started: Date(),
-                              request: task.request, body: body, webKitRedirects: webKitRedirects)
-        fetch(id, req, followRedirects: !webKitRedirects, machine: machine)
+        var p = Pending(task: task, shownURL: shown, realURL: real, started: Date(), request: task.request, body: body,
+                        webKitRedirects: webKitRedirects, context: ctx)
+        pending[id] = p
+        // HSTS: 記録のあるホストの http は、https に上げてから読む（WebKit にも移動として伝える）
+        if real.scheme?.lowercased() == "http", let h = SiteUtil.host(of: real), hsts?.shouldUpgrade(h) == true,
+           var c = URLComponents(url: real, resolvingAgainstBaseURL: false) {
+            c.scheme = "https"
+            if c.port == 80 { c.port = nil }
+            if let up = c.url {
+                log?("🔒 HSTS: \(real.absoluteString) → https")
+                if webKitRedirects {
+                    let next = RedirectPolicy.Next(url: up, method: task.request.httpMethod ?? "GET", headers: VNetScheme.headerPairs(task.request),
+                                                   body: body, crossOrigin: true, upgradedByHSTS: true, dropped: [])
+                    redirect(id, p, status: 307, serverHeaders: [("Non-Authoritative-Reason", "HSTS")], type: "text/plain", next: next)
+                    return
+                }
+                p.realURL = up
+                p.context = ctx.redirected(from: real, to: up)
+                pending[id] = p
+                fetch(id, makeRequest(task.request, url: up, body: body, ctx: p.context), followRedirects: true, machine: machine)
+                return
+            }
+        }
+        fetch(id, makeRequest(task.request, url: real, body: body, ctx: ctx), followRedirects: !webKitRedirects, machine: machine)
     }
 
     private func fetch(_ id: ObjectIdentifier, _ req: HTTPRequest, followRedirects: Bool, machine: VNetMachine) {
@@ -337,9 +542,9 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
 
     private func finish(_ id: ObjectIdentifier, _ result: Result<HTTPResult, FetchError>) {
         guard pending[id] != nil else { return }
-        // クッキーが届いていたら、先にブラウザの置き場に入れてから返事を渡す（ページがすぐ document.cookie を読んでも間に合うように）
-        if case .success(let r) = result, !r.cookieLines.isEmpty, let pushCookies {
-            pushCookies(r.cookieLines) { [weak self] in
+        // Cookie が届いていたら、先にブラウザの置き場に入れてから返事を渡す（ページがすぐ document.cookie を読んでも間に合うように）
+        if case .success(let r) = result, !r.cookieChanges.isEmpty, let pushCookies {
+            pushCookies(r.cookieChanges) { [weak self] in
                 let me = self
                 DispatchQueue.main.async { me?.complete(id, result) }
             }
@@ -351,71 +556,132 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     /// 返事を WebKit に渡す（途中で止められていたら何もしない）
     private func complete(_ id: ObjectIdentifier, _ result: Result<HTTPResult, FetchError>) {
         guard let p = pending[id] else { return }
+        if case .success(let r) = result, let sts = r.header("Strict-Transport-Security") {
+            hsts?.record(header: sts, url: r.url, ctx: p.context)
+        }
         // 移動（3xx）: WebKit に「移動した」と伝える（アドレス・相対リンク・オリジン・クッキーが移動先のものになる）
-        if case .success(let r) = result, p.webKitRedirects, HTTPPool.redirectStatuses.contains(r.status),
-           p.redirects < VNetScheme.maxRedirects, let loc = r.header("Location"),
-           let next = URL(string: loc, relativeTo: p.realURL)?.absoluteURL,
-           let s = next.scheme?.lowercased(), s == "http" || s == "https" {
-            redirect(id, p, r, to: next)
-            return
+        if case .success(let r) = result, p.webKitRedirects, RedirectPolicy.statuses.contains(r.status) {
+            let hsts = self.hsts
+            switch RedirectPolicy.next(from: p.realURL, method: p.request.httpMethod ?? "GET", headers: VNetScheme.headerPairs(p.request),
+                                       body: p.body, status: r.status, location: r.header("Location"), redirectCount: p.redirects,
+                                       hsts: { hsts?.shouldUpgrade($0) ?? false }) {
+            case .success(let next):
+                redirect(id, p, status: r.status, serverHeaders: r.headers, type: VNetScheme.contentType(r, real: p.realURL), next: next)
+                return
+            case .failure(.tooMany):
+                pending[id] = nil
+                fail(p, FetchError("リダイレクトが多すぎます", kind: .redirect))
+                return
+            case .failure(let f):
+                log?("↪ \(r.status) を追いかけません（\(f)）。そのまま渡します")
+            }
         }
         pending[id] = nil
         let ms = Int(Date().timeIntervalSince(p.started) * 1000)
         let real = p.realURL
         switch result {
         case .failure(let e):
-            log?("✕ \(real.absoluteString)：\(e.description)")
-            let html = "<html><body style='font:16px -apple-system;padding:20px'><h3>読めませんでした</h3><p>\(real.absoluteString)</p><p>\(e.description)</p></body></html>"
-            respond(p.task, url: p.shownURL, status: 502, type: "text/html; charset=utf-8", body: Data(html.utf8), origin: p.origin)
+            fail(p, e)
         case .success(let r):
             let range = r.header("Content-Range").map { "・\($0)" } ?? ""
-            log?("✓ \(r.status) \(real.absoluteString)（\(r.body.count / 1024)KB・\(ms)ms\(range)）")
+            log?("✓ \(r.status) \(r.url.absoluteString)（\(r.body.count / 1024)KB・\(ms)ms\(range)）")
             var type = VNetScheme.contentType(r, real: real)
             var body = r.body
             // vnets:// の作りのときだけ: HTML と CSS の中の https:// を vnets:// に書き換える（部品も自作の通信で読むため）
             // （https をそのまま引き受けているときは、書き換えなくても全部ここに来る）
-            let viaVNet = VNetURL.isVNet(p.shownURL)
             let lower = type.lowercased()
-            if viaVNet && (lower.contains("text/html") || lower.contains("text/css")) {
+            if p.vnetsMode && (lower.contains("text/html") || lower.contains("text/css")) {
                 body = VNetScheme.rewriteLinks(body)
                 if !lower.contains("charset") { type += "; charset=utf-8" }
             }
-            // 移動した先のアドレスで表示する（相対アドレスがずれないように）
-            let shown = r.url == real ? p.shownURL : (viaVNet ? (VNetURL.toVNet(r.url) ?? p.shownURL) : r.url)
-            respond(p.task, url: shown, status: r.status, type: type, body: body, origin: p.origin, extra: r.headers)
+            // 自分で追いかけた移動の先のアドレスで表示する（相対アドレスがずれないように）
+            let shownReal = VNetURL.toReal(p.shownURL) ?? p.shownURL
+            let shown = r.url == shownReal ? p.shownURL : (p.vnetsMode ? (VNetURL.toVNet(r.url) ?? p.shownURL) : r.url)
+            respond(p.task, url: shown, status: r.status, type: type, body: body, vnetsMode: p.vnetsMode, extra: r.headers)
         }
+    }
+
+    /// 失敗をページにする（LAN への移動の確認なら、確認のページ）
+    private func fail(_ p: Pending, _ e: FetchError) {
+        let real = p.realURL
+        log?("✕ \(real.absoluteString)：\(e.description)")
+        var html: String
+        if e.kind == .localNetworkConsent && p.context.isTopLevel {
+            let nonce = makeConsentNonce(real)
+            html = VNetScheme.page(title: "LAN の機器を開きますか？", lines: [
+                "ページが、LAN（家や会社の中のネットワーク）にある次のアドレスへ移動しようとしています。",
+                real.absoluteString, e.description,
+                "心当たりがなければ開かないでください。"],
+                button: ("開く", "window.webkit.messageHandlers.velaAction.postMessage({action:'allowLocalNetwork',nonce:'\(nonce)'})"))
+        } else {
+            html = VNetScheme.page(title: "読めませんでした", lines: [real.absoluteString, e.description], button: nil)
+        }
+        html += "<!-- vela-error:\(e.kind.rawValue) -->"
+        respond(p.task, url: p.shownURL, status: 502, type: "text/html; charset=utf-8", body: Data(html.utf8), vnetsMode: p.vnetsMode)
+    }
+
+    /// エラー・確認のページ（文字は全部エスケープする）
+    static func page(title: String, lines: [String], button: (String, String)?) -> String {
+        var s = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+        s += "<title>\(htmlEscape(title))</title></head><body style='font:16px -apple-system;padding:24px;max-width:640px'>"
+        s += "<h3>\(htmlEscape(title))</h3>"
+        for l in lines { s += "<p style='word-break:break-all'>\(htmlEscape(l))</p>" }
+        if let (label, js) = button {
+            s += "<button style='font-size:16px;padding:8px 20px' onclick=\"\(htmlEscape(js))\">\(htmlEscape(label))</button>"
+        }
+        return s + "</body></html>"
+    }
+
+    static func htmlEscape(_ s: String) -> String {
+        var o = ""
+        for c in s {
+            switch c {
+            case "&": o += "&amp;"
+            case "<": o += "&lt;"
+            case ">": o += "&gt;"
+            case "\"": o += "&quot;"
+            case "'": o += "&#39;"
+            default: o.append(c)
+            }
+        }
+        return o
     }
 
     // MARK: 移動（リダイレクト）
 
     /// 3xx を WebKit に伝える。WebKit が次の要求を返してきたら、それを読みに行く
-    private func redirect(_ id: ObjectIdentifier, _ p: Pending, _ r: HTTPResult, to next: URL) {
-        let nextShown = VNetURL.isVNet(p.shownURL) ? (VNetURL.toVNet(next) ?? next) : next
-        log?("↪ \(r.status) \(p.realURL.absoluteString) → \(next.absoluteString)")
-        var h = VNetScheme.responseHeaders(type: VNetScheme.contentType(r, real: p.realURL), length: 0, origin: p.origin, extra: r.headers)
+    private func redirect(_ id: ObjectIdentifier, _ p: Pending, status: Int, serverHeaders: [(String, String)], type: String, next: RedirectPolicy.Next) {
+        let nextShown = p.vnetsMode ? (VNetURL.toVNet(next.url) ?? next.url) : next.url
+        let dropped = next.dropped.isEmpty ? "" : "（外したヘッダ: \(next.dropped.joined(separator: ", "))）"
+        log?("↪ \(status) \(p.realURL.absoluteString) → \(next.url.absoluteString)\(dropped)")
+        var h = VNetScheme.responseHeaders(type: type, length: 0, vnetsMode: p.vnetsMode, extra: serverHeaders)
         h["Location"] = nextShown.absoluteString
-        // 次の要求: 303（と POST の 301・302）は GET に変える。前の相手のクッキーは付けない（WebKit が付け直す）
-        var method = p.request.httpMethod ?? "GET"
-        var body = p.body
-        var drop: Set<String> = ["cookie"]
-        if r.status == 303 || ((r.status == 301 || r.status == 302) && method == "POST") {
-            if method != "HEAD" { method = "GET" }
-            body = nil
-            drop.formUnion(["content-type", "content-length", "origin"])
-        }
         let nr = NSMutableURLRequest(url: nextShown)
-        nr.httpMethod = method
-        nr.allHTTPHeaderFields = (p.request.allHTTPHeaderFields ?? [:]).filter { !drop.contains($0.key.lowercased()) }
-        nr.httpBody = body
+        nr.httpMethod = next.method
+        var fields: [String: String] = [:]
+        for (k, v) in next.headers { fields[k] = v }
+        nr.allHTTPHeaderFields = fields
+        nr.httpBody = next.body
         nr.mainDocumentURL = p.request.mainDocumentURL == p.shownURL ? nextShown : p.request.mainDocumentURL
-        guard let resp = HTTPURLResponse(url: p.shownURL, statusCode: r.status, httpVersion: "HTTP/1.1", headerFields: h),
+        let body = next.body
+        guard let resp = HTTPURLResponse(url: p.shownURL, statusCode: status, httpVersion: "HTTP/1.1", headerFields: h),
               SchemeTaskRedirect.perform(p.task, response: resp, request: nr, done: { [weak self] newReq in
                   let me = self
                   DispatchQueue.main.async { me?.afterRedirect(id, newReq, body: body) }
               }) else {
-            // 伝えられなかった: 前のやり方（自分で追いかけて、最後の返事だけ渡す）
-            pending[id]?.webKitRedirects = false
-            if let machine { fetch(id, VNetScheme.makeRequest(p.request, url: p.realURL, body: p.body), followRedirects: true, machine: machine) }
+            // 伝えられなかった: 受け取った 3xx から作った次の要求を、自分で追いかける（元の要求は送り直さない。POST を二重に送らないため）
+            guard var q = pending[id], let machine else { return }
+            q.webKitRedirects = false
+            q.context = q.context.redirected(from: q.realURL, to: next.url)
+            q.realURL = next.url
+            q.redirects += 1
+            pending[id] = q
+            var r = URLRequest(url: next.url)
+            r.httpMethod = next.method
+            r.allHTTPHeaderFields = fields
+            r.mainDocumentURL = p.request.mainDocumentURL == p.shownURL ? next.url : p.request.mainDocumentURL.flatMap { VNetURL.toReal($0) }
+            r.httpShouldHandleCookies = p.request.httpShouldHandleCookies
+            fetch(id, makeRequest(r, url: next.url, body: next.body, ctx: q.context), followRedirects: true, machine: machine)
             return
         }
     }
@@ -431,19 +697,58 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         r.httpMethod = newReq.httpMethod
         r.allHTTPHeaderFields = newReq.allHTTPHeaderFields
         r.mainDocumentURL = newReq.mainDocumentURL
+        r.httpShouldHandleCookies = p.request.httpShouldHandleCookies
         let b = newReq.httpBody ?? body
+        p.context = p.context.redirected(from: p.realURL, to: real)
         p.shownURL = u
         p.realURL = real
         p.request = r
         p.body = b
         p.redirects += 1
         pending[id] = p
-        fetch(id, VNetScheme.makeRequest(r, url: real, body: b), followRedirects: false, machine: machine)
+        fetch(id, makeRequest(r, url: real, body: b, ctx: p.context), followRedirects: false, machine: machine)
     }
 
     // MARK: 要求を作る
 
+    /// WebKit の要求から、文脈（トップのページ・トップレベルの移動か・どこから来たか・ユーザーの操作か）を作る
+    private func context(for r: URLRequest, real: URL) -> RequestContext {
+        let top = r.mainDocumentURL.flatMap { VNetURL.toReal($0) }
+        let isTop = r.mainDocumentURL != nil && r.mainDocumentURL == r.url
+        // どこから来たか: Referer。無ければ Origin（Referrer-Policy: no-referrer でも、POST には Origin が付く。"null" は分からない扱い）
+        let referer = r.value(forHTTPHeaderField: "Referer").flatMap { URL(string: $0) }
+        let originHeader = r.value(forHTTPHeaderField: "Origin").flatMap { $0 == "null" ? nil : URL(string: $0) }
+        let initiator = (referer ?? originHeader).flatMap { VNetURL.toReal($0) }
+        var ctx = RequestContext(topURL: top, isTopLevel: isTop, initiator: initiator)
+        ctx.cookiesAllowed = r.httpShouldHandleCookies
+        // 実機で確かめること: WebKit がスキームハンダの要求に httpShouldHandleCookies を正しく入れてくるか（ページ本体で false なら怪しい）
+        if isTop && !r.httpShouldHandleCookies { log?("🍪 ページ本体の要求が httpShouldHandleCookies=false です（\(real.absoluteString)）") }
+        if isTop, let u = userNavigation, Date().timeIntervalSince(u.at) < 15, VNetScheme.sameIgnoringFragment(u.url, real) {
+            ctx.userInitiated = true
+            userNavigation = nil
+        }
+        return ctx
+    }
+
+    static func sameIgnoringFragment(_ a: URL, _ b: URL) -> Bool {
+        var ca = URLComponents(url: a, resolvingAgainstBaseURL: false), cb = URLComponents(url: b, resolvingAgainstBaseURL: false)
+        ca?.fragment = nil; cb?.fragment = nil
+        return ca?.url?.absoluteString == cb?.url?.absoluteString
+    }
+
+    /// URLRequest のヘッダを（名前, 値）の並びにする
+    static func headerPairs(_ r: URLRequest) -> [(String, String)] {
+        (r.allHTTPHeaderFields ?? [:]).map { ($0.key, $0.value) }
+    }
+
     /// WebKit の要求を、自作の通信の要求にする
+    func makeRequest(_ r: URLRequest, url: URL, body: Data?, ctx: RequestContext) -> HTTPRequest {
+        var req = VNetScheme.makeRequest(r, url: url, body: body)
+        req.context = ctx
+        return req
+    }
+
+    /// WebKit の要求を、自作の通信の要求にする（ヘッダの変換だけ。文脈は makeRequest(_:url:body:ctx:) で付ける）
     static func makeRequest(_ r: URLRequest, url: URL, body: Data?) -> HTTPRequest {
         var req = HTTPRequest(url: url)
         req.method = r.httpMethod ?? "GET"
@@ -479,13 +784,8 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         return req
     }
 
-    /// だいたいの「サイト」（example.co.jp → example.co.jp、www.example.com → example.com）
-    static func siteOf(_ host: String) -> String {
-        let l = host.split(separator: ".")
-        if l.count <= 2 { return host }
-        let n = l[l.count - 1].count == 2 && l[l.count - 2].count <= 3 ? 3 : 2
-        return l.suffix(n).joined(separator: ".")
-    }
+    /// 「サイト」（example.co.jp → example.co.jp、www.example.com → example.com）
+    static func siteOf(_ host: String) -> String { SiteUtil.registrableDomain(host) }
 
     static func body(of r: URLRequest) -> Data? {
         if let b = r.httpBody { return b }
@@ -544,33 +844,35 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         return Data(s.utf8)
     }
 
-    /// 相手の返事のヘッダのうち、WebKit にそのまま渡さないもの（長さ・縮め方は自分で決め直す。安全の決まりは vnets:// と合わない）
+    /// 相手の返事のヘッダのうち、WebKit にそのまま渡さないもの（長さ・縮め方は自分で決め直す。Cookie は CookieJar 経由で WebKit の置き場に入れる）
     static let dropHeaders: Set<String> = ["content-length", "content-encoding", "transfer-encoding", "content-type", "connection",
-                                           "keep-alive", "set-cookie", "set-cookie2", "content-security-policy",
-                                           "content-security-policy-report-only", "strict-transport-security",
-                                           "x-frame-options", "alt-svc", "location"]
+                                           "keep-alive", "set-cookie", "set-cookie2", "alt-svc", "location"]
+    /// 予備の vnets:// の作りのときだけ外すもの（アドレスを書き換えるので、ページの守りの決まりと合わない。この作りは開発者向けの実験で、安全ではない）
+    static let vnetsOnlyDropHeaders: Set<String> = ["content-security-policy", "content-security-policy-report-only", "x-frame-options"]
 
-    /// 返事のヘッダ: 相手のヘッダ（動画に要る Content-Range・Accept-Ranges など）＋ 長さ・種類 ＋ CORS は何でも良い
-    static func responseHeaders(type: String, length: Int, origin: String?, extra: [(String, String)]) -> [String: String] {
+    /// 返事のヘッダ: 相手のヘッダ（CSP・X-Frame-Options・動画に要る Content-Range など）＋ 長さ・種類。
+    /// CORS（Access-Control-*）はサーバーの答えをそのまま渡す（CORSPassthrough）。Vela が許可を足すことはしない
+    static func responseHeaders(type: String, length: Int, vnetsMode: Bool, extra: [(String, String)]) -> [String: String] {
         var h: [String: String] = [:]
         var names: [String: String] = [:]      // 小文字の名前 → h での名前（同じ名前が何行もあれば「, 」でつなぐ）
+        func add(_ k: String, _ v: String) {
+            let lk = k.lowercased()
+            if let ek = names[lk], let old = h[ek] { h[ek] = old + ", " + v } else { names[lk] = k; h[k] = v }
+        }
         for (k, v) in extra {
             let lk = k.lowercased()
             if dropHeaders.contains(lk) || lk.hasPrefix("access-control-") { continue }
-            if let ek = names[lk], let old = h[ek] { h[ek] = old + ", " + v } else { names[lk] = k; h[k] = v }
+            if vnetsMode && vnetsOnlyDropHeaders.contains(lk) { continue }
+            add(k, v)
         }
+        for (k, v) in CORSPassthrough.headers(extra, vnetsMode: vnetsMode) { add(k, v) }
         h["Content-Type"] = type
         h["Content-Length"] = String(length)
-        h["Access-Control-Allow-Origin"] = origin ?? "*"
-        h["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD"
-        h["Access-Control-Allow-Headers"] = "*"
-        h["Access-Control-Expose-Headers"] = "*"
-        if origin != nil { h["Access-Control-Allow-Credentials"] = "true" }
         return h
     }
 
-    private func respond(_ task: WKURLSchemeTask, url: URL, status: Int, type: String, body: Data, origin: String?, extra: [(String, String)] = []) {
-        let h = VNetScheme.responseHeaders(type: type, length: body.count, origin: origin, extra: extra)
+    private func respond(_ task: WKURLSchemeTask, url: URL, status: Int, type: String, body: Data, vnetsMode: Bool, extra: [(String, String)] = []) {
+        let h = VNetScheme.responseHeaders(type: type, length: body.count, vnetsMode: vnetsMode, extra: extra)
         let resp = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: h)!
         task.didReceive(resp)
         task.didReceive(body)
@@ -590,32 +892,79 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
 /// WebKit はそれを WKWebView.handlesURLScheme で確かめているので、そこだけ「http・https は扱わない」と答えさせる。
 /// こうすると、ページのアドレスは本物の https://… のまま、読み込みは全部 VNetScheme（自作の通信）に来る。
 /// YouTube やログインのように「アドレスが https か」を確かめるページも、そのまま動く。
+///
+/// 受け入れたリスク（README と開発者パネルにも書く）:
+/// ・WebKit の中の作り（handlesURLScheme の差し替え・_willPerformRedirection:）に頼っている。実行時に確かめても、
+///   WebKit が変われば動かなくなる・落ちる可能性は消せない。App Store に出すアプリには使えない
+/// ・守り: 確かめた iOS の版（testedMajorVersions）だけで使う。差し替えた後の確認に失敗したら、元の実装に戻して標準の通信にする。
+///   設定の「VNet を使わない」で、差し替え自体をしないようにできる
 enum HTTPSTakeover {
-    // install() からしか触らないので、画面のスレッド（MainActor）に置く
-    @MainActor private static var tried = false
-    @MainActor private static var ok = false
+    enum Outcome: Equatable {
+        /// https・http を VNetScheme が引き受けられる
+        case installed
+        /// 設定で VNet を使わない
+        case disabledBySetting
+        /// 確かめていない iOS の版（設定で許せば試す）
+        case untestedOS(Int)
+        /// 差し替えられなかった・確認に失敗した（元に戻した）
+        case failed(String)
 
-    /// 1 回だけ行う。うまくいったら true（だめなら vnets:// の作りに戻す）
-    @MainActor static func install() -> Bool {
-        if tried { return ok }
-        tried = true
-        guard swap() else { return false }
-        ok = !WKWebView.handlesURLScheme("https") && !WKWebView.handlesURLScheme("http")
-        return ok
+        var description: String {
+            switch self {
+            case .installed: return "https の横取り: 成功"
+            case .disabledBySetting: return "https の横取り: 設定で使わない"
+            case .untestedOS(let v): return "https の横取り: 確かめていない iOS \(v) なので使わない（設定で試せます）"
+            case .failed(let why): return "https の横取り: 失敗（\(why)）。元に戻しました"
+            }
+        }
     }
 
-    private static func swap() -> Bool {
+    /// 動くことを確かめた iOS の版（大きい番号）
+    static let testedMajorVersions = 16...26
+
+    // 1 回目の結果。@MainActor にはしない（NSObject の override init など、隔離の扱いが iPad の Swift で揺れる所から呼ぶため）。
+    // 代わりにロックで守る。WKWebView.handlesURLScheme は Objective-C の API なので、どのスレッドから呼んでもコンパイルは通る
+    private static let lock = NSLock()
+    private static var result: Outcome?
+
+    /// 1 回だけ行う（2 回目からは 1 回目の結果）。画面のスレッドから呼ぶこと
+    static func install() -> Outcome {
+        lock.lock(); defer { lock.unlock() }
+        if let r = result { return r }
+        let r = tryInstall()
+        result = r
+        return r
+    }
+
+    private static func tryInstall() -> Outcome {
+        if VelaSettings.vnetDisabled { return .disabledBySetting }
+        let major = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+        if !testedMajorVersions.contains(major) && !VelaSettings.allowUntestedOS { return .untestedOS(major) }
         let sel = NSSelectorFromString("handlesURLScheme:")
-        guard let m = class_getClassMethod(WKWebView.self, sel) else { return false }
+        guard let m = class_getClassMethod(WKWebView.self, sel) else { return .failed("handlesURLScheme: が見つかりません") }
+        let original = method_getImplementation(m)
+        let others = ["data", "blob", "about", "vnets"]
+        let before = others.map { WKWebView.handlesURLScheme($0) }
+        swap(m, sel: sel, original: original)
+        // 差し替えが効いているか・ほかのスキームの答えが変わっていないかを確かめる。だめなら元に戻す
+        let ok = !WKWebView.handlesURLScheme("https") && !WKWebView.handlesURLScheme("http")
+            && others.map({ WKWebView.handlesURLScheme($0) }) == before
+        if !ok {
+            _ = method_setImplementation(m, original)
+            return .failed("差し替えた後の確認に失敗")
+        }
+        return .installed
+    }
+
+    private static func swap(_ m: Method, sel: Selector, original: IMP) {
         typealias Orig = @convention(c) (AnyObject, Selector, NSString) -> Bool
-        let orig = unsafeBitCast(method_getImplementation(m), to: Orig.self)
+        let orig = unsafeBitCast(original, to: Orig.self)
         let block: @convention(block) (AnyObject, NSString) -> Bool = { cls, scheme in
             let s = (scheme as String).lowercased()
             if s == "http" || s == "https" { return false }
             return orig(cls, sel, scheme)
         }
-        method_setImplementation(m, imp_implementationWithBlock(unsafeBitCast(block, to: AnyObject.self)))
-        return true
+        _ = method_setImplementation(m, imp_implementationWithBlock(unsafeBitCast(block, to: AnyObject.self)))
     }
 }
 
@@ -723,57 +1072,1128 @@ enum PageScripts {
 
     /// 知らせの名前（window.webkit.messageHandlers.<この名前>）
     static let cookieHandlerName = "vnetCookie"
+    /// エラーページのボタン・守りのスクリプトからの知らせ
+    static let actionHandlerName = "velaAction"
 
-    /// JavaScript が作ったクッキー（document.cookie・cookieStore）をアプリにも知らせる。
-    /// アプリは自分の置き場（HTTPCookieStorage）に入れて、自作の通信で送る
+    /// JavaScript が Cookie を変えたこと（document.cookie・cookieStore）を、アプリに「合図」だけ知らせる。
+    /// Cookie の中身は送らない・信じない（HttpOnly や Domain を偽れるため）。アプリは合図を受けて、WebKit の置き場（正本）を読み直す
     static let watchCookies = #"""
     (function () {
       try {
         const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.vnetCookie;
         if (!h) return;
-        const tell = (c) => { try { h.postMessage({ c: String(c), u: location.href }); } catch (e) {} };
+        let queued = false;
+        const tell = () => {
+          if (queued) return;
+          queued = true;
+          setTimeout(() => { queued = false; try { h.postMessage({}); } catch (e) {} }, 50);
+        };
         const d = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
         if (d && d.set) {
           Object.defineProperty(Document.prototype, 'cookie', {
             get: d.get,
-            set(v) { d.set.call(this, v); tell(v); },
+            set(v) { d.set.call(this, v); tell(); },
             configurable: true, enumerable: d.enumerable
           });
         }
         const cs = window.cookieStore;
         if (cs && cs.set) {
           const os = cs.set.bind(cs), od = cs.delete ? cs.delete.bind(cs) : null;
-          cs.set = function (a, b) {
-            const o = typeof a === 'string' ? { name: a, value: b } : (a || {});
-            let s = o.name + '=' + (o.value == null ? '' : o.value) + '; path=' + (o.path || '/');
-            if (o.domain) s += '; domain=' + o.domain;
-            if (o.expires) s += '; expires=' + new Date(o.expires).toUTCString();
-            tell(s);
-            return os(a, b);
-          };
-          if (od) cs.delete = function (a) {
-            const o = typeof a === 'string' ? { name: a } : (a || {});
-            let s = o.name + '=; path=' + (o.path || '/') + '; expires=Thu, 01 Jan 1970 00:00:00 GMT';
-            if (o.domain) s += '; domain=' + o.domain;
-            tell(s);
-            return od(a);
-          };
+          cs.set = function (a, b) { const r = os(a, b); Promise.resolve(r).then(tell, tell); return r; };
+          if (od) cs.delete = function (a) { const r = od(a); Promise.resolve(r).then(tell, tell); return r; };
         }
       } catch (e) {}
     })();
     """#
+
+    /// LAN の保護（WebSocket）: WebSocket は VNet を通らないので、ページの中で止める。
+    /// 公開のサイトのページから、数字の LAN のアドレス・localhost・.local への WebSocket を拒否する。
+    /// 限界: ホスト名で LAN に解決されるものは分からない。スクリプトの守りは、ページに回避される可能性がある
+    static let webSocketGuard = #"""
+    (function () {
+      try {
+        const W = window.WebSocket;
+        if (!W) return;
+        const isLocal = (h) => {
+          h = String(h || '').toLowerCase().replace(/^\[|\]$/g, '');
+          return /^(10|127)\./.test(h) || /^192\.168\./.test(h) || /^169\.254\./.test(h) ||
+                 /^172\.(1[6-9]|2[0-9]|3[01])\./.test(h) || /^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./.test(h) ||
+                 h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') ||
+                 h === '::1' || /^f[cd][0-9a-f]{2}:/.test(h) || /^fe[89ab][0-9a-f]:/.test(h);
+        };
+        let pageLocal = false;
+        try { pageLocal = isLocal(window.top.location.hostname); } catch (e) { pageLocal = isLocal(location.hostname); }
+        if (pageLocal) return;
+        const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.velaAction;
+        const Guarded = function WebSocket(url, protocols) {
+          let host = '';
+          try { host = new URL(url, location.href).hostname; } catch (e) {}
+          if (isLocal(host)) {
+            try { h && h.postMessage({ action: 'blockedWebSocket', url: String(url) }); } catch (e) {}
+            throw new DOMException('Vela: 公開のサイトから LAN への WebSocket は止めました', 'SecurityError');
+          }
+          return protocols === undefined ? new W(url) : new W(url, protocols);
+        };
+        Guarded.prototype = W.prototype;
+        for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) Guarded[k] = W[k];
+        window.WebSocket = Guarded;
+      } catch (e) {}
+    })();
+    """#
+
+    /// LAN の保護（標準の通信のタブと WebSocket 用）: WebKit のルールで、LAN でないページから数字の LAN のアドレスなどへの読み込みを止める。
+    /// トップのページが LAN のもの（ユーザーがアドレス欄で開いた機器のページなど）なら止めない。
+    /// WebKit の正規表現は「|」が使えないので、アドレスの範囲ごとに 1 行にする
+    static let localNetworkPatterns: [String] = [
+        #"^[a-z]+://10\."#, #"^[a-z]+://127\."#, #"^[a-z]+://192\.168\."#, #"^[a-z]+://169\.254\."#,
+        #"^[a-z]+://172\.1[6-9]\."#, #"^[a-z]+://172\.2[0-9]\."#, #"^[a-z]+://172\.3[01]\."#,
+        #"^[a-z]+://localhost[:/]"#, #"^[a-z]+://[a-z0-9.-]*\.local[:/]"#,
+        #"^[a-z]+://\[::1\]"#, #"^[a-z]+://\[f[cd]"#, #"^[a-z]+://\[fe[89ab]"#,
+    ]
+
+    static var localNetworkRules: String {
+        let quoted = localNetworkPatterns.map { "\"" + $0.replacingOccurrences(of: "\\", with: "\\\\") + "\"" }
+        let unless = "[" + quoted.joined(separator: ",") + "]"
+        let rules = quoted.map { #"{"trigger":{"url-filter":\#($0),"unless-top-url":\#(unless)},"action":{"type":"block"}}"# }
+        return "[" + rules.joined(separator: ",") + "]"
+    }
 }
 
-/// ページのスクリプト（PageScripts.watchCookies）から届いたクッキーを、自分の置き場に入れる
+/// ページのスクリプト（PageScripts.watchCookies）からの「Cookie が変わったかも」という合図を受ける。
+/// 中身は受け取らない。合図を受けたら onSignal（WebKit の置き場を読み直す）
 final class CookieBridge: NSObject, WKScriptMessageHandler {
     /// ログ（どのスレッドからでもよい）
     var log: (@Sendable (String) -> Void)?
+    /// 合図を受けたとき（画面のスレッドで呼ばれる）
+    var onSignal: (() -> Void)?
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard let d = message.body as? [String: Any], let c = d["c"] as? String,
-              let us = d["u"] as? String, let u = URL(string: us), let real = VNetURL.toReal(u) else { return }
-        CookieSync.store(c, url: real)
-        let name = c.split(separator: "=", maxSplits: 1).first.map(String.init) ?? "?"
-        log?("🍪 ページ → \(name)（\(real.host ?? "")）")
+        let o = message.frameInfo.securityOrigin
+        log?("🍪 ページの JavaScript が Cookie を変えました（\(o.protocol)://\(o.host)\(o.port == 0 ? "" : ":\(o.port)")）")
+        onSignal?()
+    }
+}
+
+/// エラーページのボタン・守りのスクリプトからの知らせを受ける
+final class PageActionBridge: NSObject, WKScriptMessageHandler {
+    /// (中身, メインフレームか, 送ってきたページのオリジン)。画面のスレッドで呼ばれる
+    var onAction: (([String: Any], Bool, String) -> Void)?
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard let d = message.body as? [String: Any] else { return }
+        let o = message.frameInfo.securityOrigin
+        onAction?(d, message.frameInfo.isMainFrame, "\(o.protocol)://\(o.host)")
+    }
+}
+
+/// WebKit の Cookie の置き場（正本）と CookieJar（写し）をそろえる
+@MainActor
+final class WebCookieSync: NSObject, WKHTTPCookieStoreObserver {
+    let store: WKHTTPCookieStore
+    let jar: CookieJar
+    var log: (@Sendable (String) -> Void)?
+    private var refreshScheduled = false
+    /// WebKit の置き場に入れている途中の数（その間は写しを作り直さない。入れる前の中身で上書きしないため）
+    private var pushing = 0
+    private var refreshAfterPush = false
+
+    init(store: WKHTTPCookieStore, jar: CookieJar) {
+        self.store = store
+        self.jar = jar
+        super.init()
+        store.add(self)
+        refresh()
+    }
+
+    nonisolated func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+        Task { @MainActor [weak self] in self?.scheduleRefresh() }
+    }
+
+    /// 少し待ってから読み直す（続けて変わったときに、何度も読まないように）
+    func scheduleRefresh() {
+        if refreshScheduled { return }
+        refreshScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            let me = self
+            Task { @MainActor in
+                me?.refreshScheduled = false
+                me?.refresh()
+            }
+        }
+    }
+
+    func refresh() {
+        if pushing > 0 { refreshAfterPush = true; return }
+        let s = store, j = jar
+        Task { @MainActor in
+            let all = await s.allCookies()
+            j.replaceAll(all.compactMap { CookieRecord(httpCookie: $0) })
+        }
+    }
+
+    /// VNet が受け取った Cookie の変更を、WebKit の置き場にも入れる
+    func apply(_ changes: [CookieChange]) async {
+        pushing += 1
+        for ch in changes {
+            guard let c = ch.record.httpCookie() else { log?("🍪 WebKit に渡せない Cookie: \(ch.record.name)"); continue }
+            if ch.delete { await store.deleteCookie(c) } else { await store.setCookie(c) }
+        }
+        pushing -= 1
+        if pushing == 0 && refreshAfterPush { refreshAfterPush = false; refresh() }
+    }
+}
+
+// ======================================================================
+// MARK: - NetPolicy.swift
+// ======================================================================
+
+// MARK: - 通信の決まり（セキュリティの判定）
+//
+// 画面や WebKit に頼らない「判定だけ」の部品。Linux のテスト（tools/tests）でも動かす。
+//  SiteUtil           … ホスト名の正規化・「サイト」「オリジン」の判定
+//  RequestContext     … 要求の文脈（トップのページ・トップレベルの移動か・リダイレクトの経路 など）
+//  CookiePolicy       … Cookie を送るか・保存するか（SameSite・サードパーティ・送る順番）
+//  SetCookieParser    … Set-Cookie の 1 行を CookieRecord にする（属性の検査も）
+//  RedirectPolicy     … 3xx から次の要求を作る（ここ以外では作らない）
+//  CORSPassthrough    … サーバーの CORS ヘッダをそのまま通す（Vela が許可を作らない）
+//  LocalNetworkPolicy … Vela 独自のローカルネットワーク（LAN）への接続の制御（Chrome の PNA / LNA とは別物）
+
+// MARK: - サイト・オリジン
+
+enum SiteUtil {
+    /// ホスト名をそろえる（小文字・末尾の「.」を外す・IPv6 の [ ] を外す）。
+    /// IDN（日本語ドメインなど）は、WebKit から届く URL の時点で punycode（xn--…）になっているので、ここでは変換しない
+    static func normalizeHost(_ host: String) -> String {
+        var h = host.lowercased()
+        if h.hasPrefix("[") && h.hasSuffix("]") { h = String(h.dropFirst().dropLast()) }
+        while h.hasSuffix(".") { h.removeLast() }
+        return h
+    }
+
+    static func host(of url: URL) -> String? {
+        guard let h = url.host, !h.isEmpty else { return nil }
+        return normalizeHost(h)
+    }
+
+    /// IPv4 か IPv6 の数字のアドレスか
+    static func isIPLiteral(_ host: String) -> Bool {
+        let h = normalizeHost(host)
+        return IPAddressText.v4(h) != nil || h.contains(":")
+    }
+
+    /// 2 段以上の「公開の末尾」（Public Suffix List の、よく使う所だけ）。ここに無いものは最後の 1 段を末尾とみなす
+    static let multiLevelSuffixes: Set<String> = [
+        // 日本
+        "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp", "ed.jp", "lg.jp", "gr.jp", "ad.jp",
+        "tokyo.jp", "osaka.jp", "kyoto.jp", "aichi.jp", "kanagawa.jp", "hokkaido.jp", "fukuoka.jp", "saitama.jp", "chiba.jp", "hyogo.jp",
+        // ほかの国
+        "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk",
+        "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au",
+        "co.kr", "or.kr", "ne.kr", "go.kr", "ac.kr",
+        "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
+        "com.tw", "org.tw", "net.tw", "edu.tw", "gov.tw",
+        "com.hk", "org.hk", "net.hk", "edu.hk", "gov.hk",
+        "co.nz", "org.nz", "net.nz", "ac.nz", "govt.nz",
+        "com.br", "net.br", "org.br", "gov.br",
+        "com.sg", "edu.sg", "gov.sg", "co.in", "net.in", "org.in", "ac.in", "gov.in",
+        "co.id", "or.id", "ac.id", "go.id", "co.th", "or.th", "ac.th", "go.th", "in.th",
+        "com.my", "com.mx", "com.ar", "co.za", "com.tr", "com.vn", "com.ph", "com.ua", "co.il",
+        // 誰でも下にサイトを作れる所（別のサイトとして扱う）
+        "github.io", "githubusercontent.com", "blogspot.com", "herokuapp.com", "netlify.app", "vercel.app",
+        "pages.dev", "workers.dev", "web.app", "firebaseapp.com", "azurewebsites.net", "cloudfront.net",
+        "appspot.com", "glitch.me", "gitlab.io", "s3.amazonaws.com", "fly.dev", "onrender.com", "repl.co",
+    ]
+
+    /// 公開の末尾そのものか（例: "jp"・"co.jp"・"github.io"）。Cookie の Domain に使えない
+    static func isPublicSuffix(_ domain: String) -> Bool {
+        let d = normalizeHost(domain)
+        if d.isEmpty { return true }
+        if !d.contains(".") { return !isIPLiteral(d) && d != "localhost" }
+        return multiLevelSuffixes.contains(d)
+    }
+
+    /// 「登録できるドメイン」（サイトの単位）。www.example.co.jp → example.co.jp、a.b.example.com → example.com
+    static func registrableDomain(_ host: String) -> String {
+        let h = normalizeHost(host)
+        if isIPLiteral(h) { return h }
+        let labels = h.split(separator: ".").map(String.init)
+        if labels.count <= 2 {
+            // "co.jp" のように末尾そのもの・"example.com"・"localhost"
+            return h
+        }
+        // 長い末尾から順に見る（"s3.amazonaws.com" のような 3 段もある）
+        for n in stride(from: min(3, labels.count - 1), through: 2, by: -1) {
+            let suffix = labels.suffix(n).joined(separator: ".")
+            if multiLevelSuffixes.contains(suffix) { return labels.suffix(n + 1).joined(separator: ".") }
+        }
+        return labels.suffix(2).joined(separator: ".")
+    }
+
+    /// 同じサイトか（スキームは見ない。WebKit の「サードパーティ」の考え方と同じ）
+    static func isSameSite(_ a: URL, _ b: URL) -> Bool {
+        guard let ha = host(of: a), let hb = host(of: b) else { return false }
+        return registrableDomain(ha) == registrableDomain(hb)
+    }
+
+    static func defaultPort(_ scheme: String) -> Int? {
+        switch scheme.lowercased() {
+        case "https", "wss", "vnets": return 443
+        case "http", "ws", "vnet": return 80
+        default: return nil
+        }
+    }
+
+    /// オリジン（"https://example.com" ・ 既定でないポートなら ":8443" も付ける）
+    static func origin(of url: URL) -> String? {
+        guard let s = url.scheme?.lowercased(), let h = host(of: url) else { return nil }
+        let hostText = h.contains(":") ? "[\(h)]" : h
+        if let p = url.port, p != defaultPort(s) { return "\(s)://\(hostText):\(p)" }
+        return "\(s)://\(hostText)"
+    }
+
+    static func isSameOrigin(_ a: URL, _ b: URL) -> Bool {
+        guard let oa = origin(of: a), let ob = origin(of: b) else { return false }
+        return oa == ob
+    }
+
+    static func isSecureScheme(_ url: URL) -> Bool {
+        let s = url.scheme?.lowercased() ?? ""
+        return s == "https" || s == "wss" || s == "vnets"
+    }
+}
+
+/// 数字のアドレスを読む
+enum IPAddressText {
+    /// "192.168.0.1" → [192, 168, 0, 1]
+    static func v4(_ s: String) -> [UInt8]? {
+        let parts = s.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return nil }
+        var out: [UInt8] = []
+        for p in parts {
+            guard !p.isEmpty, p.count <= 3, p.allSatisfy({ $0.isASCII && $0.isNumber }), let v = UInt8(p) else { return nil }
+            out.append(v)
+        }
+        return out
+    }
+
+    /// IPv6 を 8 個の 16 ビットにする（"::" の省略・末尾の IPv4 表記・"%zone" に対応）
+    static func v6(_ text: String) -> [UInt16]? {
+        var s = SiteUtil.normalizeHost(text)
+        if let pct = s.firstIndex(of: "%") { s = String(s[..<pct]) }
+        guard s.contains(":") else { return nil }
+        var tail4: [UInt16] = []
+        if let lastColon = s.lastIndex(of: ":"), let v4 = v4(String(s[s.index(after: lastColon)...])) {
+            tail4 = [UInt16(v4[0]) << 8 | UInt16(v4[1]), UInt16(v4[2]) << 8 | UInt16(v4[3])]
+            s = String(s[...lastColon]) + "0:0"   // IPv4 の分（16 ビット 2 個）を形だけ置いておき、あとで差し替える
+        }
+        let halves = s.components(separatedBy: "::")
+        guard halves.count <= 2 else { return nil }
+        func groups(_ t: String) -> [UInt16]? {
+            if t.isEmpty { return [] }
+            var g: [UInt16] = []
+            for p in t.split(separator: ":", omittingEmptySubsequences: false) {
+                guard !p.isEmpty, p.count <= 4, let v = UInt16(p, radix: 16) else { return nil }
+                g.append(v)
+            }
+            return g
+        }
+        guard let head = groups(halves[0]) else { return nil }
+        var all: [UInt16]
+        if halves.count == 2 {
+            guard let back = groups(halves[1]) else { return nil }
+            let fill = 8 - head.count - back.count
+            guard fill >= 1 else { return nil }
+            all = head + Array(repeating: 0, count: fill) + back
+        } else {
+            all = head
+        }
+        guard all.count == 8 else { return nil }
+        if !tail4.isEmpty { all.removeLast(); all.removeLast(); all += tail4 }
+        return all
+    }
+}
+
+// MARK: - 要求の文脈
+
+/// 要求がどんな場面で出たか。Cookie・リダイレクト・LAN の判定に使う
+struct RequestContext: Sendable {
+    /// トップのページの URL（WebKit の mainDocumentURL）
+    var topURL: URL?
+    /// トップレベルの移動（ページそのものを開く要求）か
+    var isTopLevel = false
+    /// 要求を出したページ（Referer）。トップレベルの移動で、どこから来たかを見るのに使う
+    var initiator: URL?
+    /// リダイレクトの経路で、一度でもクロスサイトになったか（なったら、そのあとはずっとクロスサイト扱い）
+    var crossSiteChain = false
+    /// Cookie を送受信してよいか（URLRequest.httpShouldHandleCookies。Fetch の credentials: omit と同じものではない）
+    var cookiesAllowed = true
+    /// ユーザーがアドレス欄・ブックマークなどから開いた移動か（ページのリンクや JavaScript ではない）
+    var userInitiated = false
+    /// リダイレクトのとき、1 つ前の URL
+    var previousURL: URL?
+    /// どのタブの要求か（ログ用）
+    var tabID = 0
+
+    init(topURL: URL? = nil, isTopLevel: Bool = false, initiator: URL? = nil) {
+        self.topURL = topURL
+        self.isTopLevel = isTopLevel
+        self.initiator = initiator
+    }
+
+    /// リダイレクトで次の URL に進んだときの文脈
+    func redirected(from: URL, to next: URL) -> RequestContext {
+        var c = self
+        if !SiteUtil.isSameSite(from, next) { c.crossSiteChain = true }
+        c.previousURL = from
+        // トップレベルの移動なら、トップのページは移動先になる
+        if isTopLevel { c.topURL = next }
+        return c
+    }
+}
+
+// MARK: - Cookie
+
+/// Cookie 1 つ（WebKit の置き場の写し・Set-Cookie から作ったもの）
+struct CookieRecord: Sendable, Equatable {
+    enum SameSite: String, Sendable { case unspecified, none, lax, strict }
+
+    var name: String
+    var value: String
+    /// 先頭の「.」は外した形（小文字）
+    var domain: String
+    /// Domain 属性が無かった（このホストだけに送る）
+    var hostOnly: Bool
+    var path: String
+    var secure = false
+    var httpOnly = false
+    var sameSite = SameSite.unspecified
+    /// nil ならセッションの間だけ
+    var expires: Date?
+    /// 作られた時刻（送る順番に使う。WebKit の置き場には無いので、写しで覚える）
+    var created: Date
+
+    var key: String { "\(name)\u{1}\(domain)\u{1}\(path)" }
+
+    func isExpired(_ now: Date) -> Bool {
+        if let e = expires { return e <= now }
+        return false
+    }
+
+    /// このホストに送ってよいドメインか
+    func domainMatches(_ host: String) -> Bool {
+        let h = SiteUtil.normalizeHost(host)
+        if hostOnly { return h == domain }
+        if h == domain { return true }
+        return !SiteUtil.isIPLiteral(h) && h.hasSuffix("." + domain)
+    }
+
+    /// このパスに送ってよいか（RFC 6265 5.1.4）
+    func pathMatches(_ requestPath: String) -> Bool {
+        let p = requestPath.isEmpty ? "/" : requestPath
+        if p == path { return true }
+        guard p.hasPrefix(path) else { return false }
+        if path.hasSuffix("/") { return true }
+        return p.dropFirst(path.count).first == "/"
+    }
+}
+
+/// Set-Cookie の 1 行を読む（RFC 6265 / 6265bis）。だめな Cookie は nil と理由
+enum SetCookieParser {
+    static let maxNameValueBytes = 4096
+
+    enum Outcome {
+        case cookie(CookieRecord)
+        case rejected(String)
+    }
+
+    static func parse(_ line: String, url: URL, now: Date = Date()) -> Outcome {
+        guard let host = SiteUtil.host(of: url) else { return .rejected("ホスト名がありません") }
+        var parts = line.split(separator: ";", omittingEmptySubsequences: false).map { String($0) }
+        let pair = parts.removeFirst()
+        var name = "", value = ""
+        if let eq = pair.firstIndex(of: "=") {
+            name = String(pair[..<eq]).trimmingCharacters(in: .whitespaces)
+            value = String(pair[pair.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+        } else {
+            value = pair.trimmingCharacters(in: .whitespaces)
+        }
+        if name.isEmpty && value.isEmpty { return .rejected("名前も値もありません") }
+        if name.utf8.count + value.utf8.count > maxNameValueBytes { return .rejected("大きすぎます") }
+        if (name + value).unicodeScalars.contains(where: { $0.value < 0x20 && $0 != "\t" || $0.value == 0x7F }) {
+            return .rejected("制御文字が入っています")
+        }
+
+        var rec = CookieRecord(name: name, value: value, domain: host, hostOnly: true, path: defaultPath(url), created: now)
+        var maxAge: Int?
+        var expires: Date?
+        for raw in parts {
+            let a = raw.trimmingCharacters(in: .whitespaces)
+            if a.isEmpty { continue }
+            let k: String, v: String
+            if let eq = a.firstIndex(of: "=") {
+                k = String(a[..<eq]).trimmingCharacters(in: .whitespaces).lowercased()
+                v = String(a[a.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+            } else {
+                k = a.lowercased(); v = ""
+            }
+            switch k {
+            case "expires": if let d = HTTPDate.parse(v) { expires = d }
+            case "max-age":
+                if let n = Int(v) { maxAge = n }
+            case "domain":
+                var d = v.lowercased()
+                while d.hasPrefix(".") { d.removeFirst() }
+                d = SiteUtil.normalizeHost(d)
+                if d.isEmpty { continue }
+                if SiteUtil.isPublicSuffix(d) {
+                    if d == host { continue }          // ホストそのものなら、このホストだけの Cookie として受ける
+                    return .rejected("公開の末尾（\(d)）には付けられません")
+                }
+                let probe = CookieRecord(name: "", value: "", domain: d, hostOnly: false, path: "/", created: now)
+                guard probe.domainMatches(host) else { return .rejected("Domain=\(d) はこのホスト（\(host)）に合いません") }
+                rec.domain = d
+                rec.hostOnly = SiteUtil.isIPLiteral(host)   // IP のときは Domain があってもそのアドレスだけ
+            case "path":
+                if v.hasPrefix("/") { rec.path = v }
+            case "secure": rec.secure = true
+            case "httponly": rec.httpOnly = true
+            case "samesite":
+                switch v.lowercased() {
+                case "strict": rec.sameSite = .strict
+                case "lax": rec.sameSite = .lax
+                case "none": rec.sameSite = .none
+                default: rec.sameSite = .unspecified
+                }
+            default: break
+            }
+        }
+        if let m = maxAge { rec.expires = m <= 0 ? Date(timeIntervalSince1970: 0) : now.addingTimeInterval(TimeInterval(m)) }
+        else if let e = expires { rec.expires = e }
+
+        let secureURL = SiteUtil.isSecureScheme(url)
+        if rec.secure && !secureURL { return .rejected("Secure の Cookie は https からしか作れません") }
+        if rec.sameSite == .none && !rec.secure { return .rejected("SameSite=None には Secure が必要です") }
+        if name.hasPrefix("__Secure-") && !(rec.secure && secureURL) { return .rejected("__Secure- には Secure が必要です") }
+        if name.hasPrefix("__Host-") && !(rec.secure && secureURL && rec.hostOnly && rec.path == "/") {
+            return .rejected("__Host- には Secure・Domain なし・Path=/ が必要です")
+        }
+        return .cookie(rec)
+    }
+
+    /// 既定の Path（RFC 6265 5.1.4: 最後の「/」の手前まで）
+    static func defaultPath(_ url: URL) -> String {
+        let p = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? url.path
+        guard p.hasPrefix("/"), let last = p.lastIndex(of: "/"), last != p.startIndex else { return "/" }
+        return String(p[..<last])
+    }
+}
+
+/// http の日付（Expires）を読む
+enum HTTPDate {
+    private static let formats = ["EEE, dd MMM yyyy HH:mm:ss zzz", "EEEE, dd-MMM-yy HH:mm:ss zzz", "EEE, dd-MMM-yyyy HH:mm:ss zzz",
+                                  "EEE MMM d HH:mm:ss yyyy", "EEE, dd MMM yy HH:mm:ss zzz", "EEE, dd-MMM-yy HH:mm:ss zzz",
+                                  "dd MMM yyyy HH:mm:ss zzz"]
+    private static let formatters: [DateFormatter] = formats.map { f in
+        let d = DateFormatter()
+        d.locale = Locale(identifier: "en_US_POSIX")
+        d.timeZone = TimeZone(identifier: "GMT")
+        d.dateFormat = f
+        return d
+    }
+    private static let lock = NSLock()
+
+    static func parse(_ s: String) -> Date? {
+        let t = s.trimmingCharacters(in: .whitespaces)
+        lock.lock(); defer { lock.unlock() }
+        for f in formatters { if let d = f.date(from: t) { return d } }
+        return nil
+    }
+}
+
+enum CookiePolicy {
+    struct Settings: Sendable, Equatable {
+        /// サードパーティ Cookie を保存も送信もしない（Safari の ITP や Storage Access API の例外までは再現しない）
+        var blockThirdParty = true
+        /// SameSite が無い Cookie を Lax として扱う
+        var laxByDefault = true
+        /// Lax-by-default の例外: 作られてからこの秒数の間は、クロスサイトのトップレベルの POST にも付ける（0 で例外なし）
+        var laxPostGrace: TimeInterval = 120
+        init() {}
+    }
+
+    static let safeMethods: Set<String> = ["GET", "HEAD", "OPTIONS", "TRACE"]
+
+    /// この要求はクロスサイトか（SameSite の判定用）
+    static func isCrossSite(_ url: URL, method: String, ctx: RequestContext) -> Bool {
+        if ctx.crossSiteChain { return true }
+        if ctx.isTopLevel {
+            // どこから来たかで決める。分からないとき: 安全なメソッドならユーザーの操作とみなす、それ以外はクロスサイト扱い
+            if let i = ctx.initiator { return !SiteUtil.isSameSite(i, url) }
+            if ctx.userInitiated { return false }
+            return !safeMethods.contains(method.uppercased())
+        }
+        if let t = ctx.topURL { return !SiteUtil.isSameSite(t, url) }
+        if let i = ctx.initiator { return !SiteUtil.isSameSite(i, url) }
+        return false
+    }
+
+    /// サードパーティの要求か（ページの中の部品・iframe が、トップと別のサイトのもの）
+    static func isThirdParty(_ url: URL, ctx: RequestContext) -> Bool {
+        if ctx.isTopLevel { return false }
+        if ctx.crossSiteChain { return true }
+        guard let t = ctx.topURL else { return false }
+        return !SiteUtil.isSameSite(t, url)
+    }
+
+    /// 1 つの Cookie を送るか。送らないなら理由
+    static func sendDecision(_ c: CookieRecord, url: URL, method: String, ctx: RequestContext,
+                             settings: Settings, now: Date = Date()) -> String? {
+        if !ctx.cookiesAllowed { return "Cookie を扱わない要求" }
+        if c.isExpired(now) { return "期限切れ" }
+        guard let host = SiteUtil.host(of: url), c.domainMatches(host) else { return "ドメインが合わない" }
+        let path = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? url.path
+        if !c.pathMatches(path) { return "パスが合わない" }
+        if c.secure && !SiteUtil.isSecureScheme(url) { return "Secure なのに https でない" }
+        if settings.blockThirdParty && isThirdParty(url, ctx: ctx) { return "サードパーティ Cookie をブロック" }
+        guard isCrossSite(url, method: method, ctx: ctx) else { return nil }
+        let topLevelSafe = ctx.isTopLevel && safeMethods.contains(method.uppercased())
+        switch c.sameSite {
+        case .strict:
+            return "SameSite=Strict でクロスサイト"
+        case .lax:
+            return topLevelSafe ? nil : "SameSite=Lax でクロスサイト"
+        case .none:
+            return nil
+        case .unspecified:
+            if !settings.laxByDefault { return nil }
+            if topLevelSafe { return nil }
+            if ctx.isTopLevel && method.uppercased() == "POST" && settings.laxPostGrace > 0
+                && now.timeIntervalSince(c.created) <= settings.laxPostGrace { return nil }
+            return "SameSite なし（Lax 扱い）でクロスサイト"
+        }
+    }
+
+    /// 送る Cookie を順番に並べる（パスが長い順 → 作られた順）
+    static func cookiesToSend(_ jar: [CookieRecord], url: URL, method: String, ctx: RequestContext,
+                              settings: Settings, now: Date = Date()) -> (send: [CookieRecord], skipped: [(String, String)]) {
+        var send: [CookieRecord] = []
+        var skipped: [(String, String)] = []
+        for c in jar {
+            if let why = sendDecision(c, url: url, method: method, ctx: ctx, settings: settings, now: now) {
+                // ドメイン・パスが合わないものはログに出さない（関係ない Cookie なので）
+                if why != "ドメインが合わない" && why != "パスが合わない" && why != "期限切れ" { skipped.append((c.name, why)) }
+            } else {
+                send.append(c)
+            }
+        }
+        send.sort { a, b in a.path.count != b.path.count ? a.path.count > b.path.count : a.created < b.created }
+        return (send, skipped)
+    }
+
+    static func header(_ cookies: [CookieRecord]) -> String? {
+        if cookies.isEmpty { return nil }
+        return cookies.map { $0.name.isEmpty ? $0.value : "\($0.name)=\($0.value)" }.joined(separator: "; ")
+    }
+
+    /// 届いた Cookie を保存してよいか。だめなら理由
+    static func storeDecision(_ c: CookieRecord, url: URL, method: String, ctx: RequestContext, settings: Settings) -> String? {
+        if !ctx.cookiesAllowed { return "Cookie を扱わない要求" }
+        if settings.blockThirdParty && isThirdParty(url, ctx: ctx) { return "サードパーティ Cookie をブロック" }
+        // クロスサイトの部品の応答からは、SameSite=Lax / Strict の Cookie を作らせない（6265bis）
+        if !ctx.isTopLevel && isCrossSite(url, method: method, ctx: ctx) && (c.sameSite == .lax || c.sameSite == .strict) {
+            return "クロスサイトの部品からの SameSite=\(c.sameSite.rawValue)"
+        }
+        return nil
+    }
+}
+
+// MARK: - リダイレクト
+
+enum RedirectPolicy {
+    static let statuses: Set<Int> = [301, 302, 303, 307, 308]
+    static let maxRedirects = 20
+    /// 本体に関するヘッダ（メソッドが GET に変わったら外す）
+    static let bodyHeaders: Set<String> = ["content-type", "content-length", "content-encoding", "content-language", "content-location"]
+    /// オリジンが変わったら外す
+    static let credentialHeaders: Set<String> = ["authorization", "proxy-authorization", "cookie"]
+
+    struct Next: Sendable {
+        var url: URL
+        var method: String
+        var headers: [(String, String)]
+        var body: Data?
+        var crossOrigin: Bool
+        var upgradedByHSTS: Bool
+        /// 外したヘッダの名前（ログ用）
+        var dropped: [String]
+    }
+
+    enum Failure: Error, Equatable, Sendable {
+        case noLocation, badLocation(String), unsupportedScheme(String), tooMany
+    }
+
+    /// 3xx の応答から、次の要求を作る
+    /// - hsts: そのホストを https に上げるべきか
+    static func next(from url: URL, method: String, headers: [(String, String)], body: Data?, status: Int,
+                     location: String?, redirectCount: Int, hsts: (String) -> Bool = { _ in false }) -> Result<Next, Failure> {
+        if redirectCount >= maxRedirects { return .failure(.tooMany) }
+        guard let loc = location?.trimmingCharacters(in: .whitespaces), !loc.isEmpty else { return .failure(.noLocation) }
+        guard var nextURL = URL(string: loc, relativeTo: url)?.absoluteURL else { return .failure(.badLocation(loc)) }
+        let scheme = nextURL.scheme?.lowercased() ?? ""
+        guard scheme == "http" || scheme == "https" else { return .failure(.unsupportedScheme(scheme)) }
+        var upgraded = false
+        if scheme == "http", let h = SiteUtil.host(of: nextURL), hsts(h), var c = URLComponents(url: nextURL, resolvingAgainstBaseURL: false) {
+            c.scheme = "https"
+            if c.port == 80 { c.port = nil }
+            if let u = c.url { nextURL = u; upgraded = true }
+        }
+
+        var m = method.uppercased()
+        var b = body
+        var drop = Set<String>()
+        if status == 303 && m != "HEAD" || (status == 301 || status == 302) && m == "POST" {
+            m = "GET"
+            b = nil
+            drop.formUnion(bodyHeaders)
+        }
+        let crossOrigin = !SiteUtil.isSameOrigin(url, nextURL)
+        // Cookie は移動先で CookiePolicy がもう一度決める（前の相手のものを持ち越さない）
+        drop.insert("cookie")
+        if crossOrigin { drop.formUnion(credentialHeaders) }
+
+        var out: [(String, String)] = []
+        var dropped: [String] = []
+        for (k, v) in headers {
+            let lk = k.lowercased()
+            if lk == "host" { continue }
+            if drop.contains(lk) { dropped.append(k); continue }
+            switch lk {
+            case "origin":
+                // クロスオリジンに移ったら、元のオリジンは「null」にする（Fetch の仕様）
+                if crossOrigin, let target = SiteUtil.origin(of: nextURL), v != target { out.append((k, "null")) } else { out.append((k, v)) }
+            case "referer":
+                guard let ref = URL(string: v) else { dropped.append(k); continue }
+                if SiteUtil.isSecureScheme(ref) && !SiteUtil.isSecureScheme(nextURL) { dropped.append(k); continue }  // https → http では送らない
+                if !SiteUtil.isSameOrigin(ref, nextURL), let o = SiteUtil.origin(of: ref) { out.append((k, o + "/")) }  // 別オリジンにはオリジンだけ
+                else { out.append((k, v)) }
+            default:
+                out.append((k, v))
+            }
+        }
+        return .success(Next(url: nextURL, method: m, headers: out, body: b, crossOrigin: crossOrigin, upgradedByHSTS: upgraded, dropped: dropped))
+    }
+}
+
+// MARK: - CORS
+
+/// サーバーの Access-Control-* をそのまま通す。Vela が自分で許可を作ることはしない
+enum CORSPassthrough {
+    /// vnetsMode: 予備の vnets:// 方式（開発者向け）。そのときだけ、許可されたオリジンの https:// を vnets:// に読み替える
+    static func headers(_ server: [(String, String)], vnetsMode: Bool) -> [(String, String)] {
+        server.compactMap { k, v in
+            let lk = k.lowercased()
+            guard lk.hasPrefix("access-control-") else { return nil }
+            if vnetsMode && lk == "access-control-allow-origin" {
+                if v.lowercased().hasPrefix("https://") { return (k, "vnets://" + v.dropFirst(8)) }
+                if v.lowercased().hasPrefix("http://") { return (k, "vnet://" + v.dropFirst(7)) }
+            }
+            return (k, v)
+        }
+    }
+}
+
+// MARK: - ローカルネットワーク（LAN）
+
+/// アドレスの種類
+enum IPClass: String, Sendable {
+    case publicAddress = "公開"
+    case privateAddress = "LAN"
+    case loopback = "ループバック"
+    case linkLocal = "リンクローカル"
+    /// VNet の中（10.0.2.x。ルーター・DNS など）
+    case vnetInternal = "VNet 内部"
+    case unspecified = "未指定"
+
+    /// LAN 側（公開でない）か
+    var isLocal: Bool { self != .publicAddress }
+}
+
+/// Vela 独自のローカルネットワークへの接続の制御（Chrome の Private Network Access / Local Network Access とは別物）
+enum LocalNetworkPolicy {
+    static func classify(_ ip: [UInt8]) -> IPClass {
+        guard ip.count == 4 else { return .publicAddress }
+        switch (ip[0], ip[1]) {
+        case (0, _): return .unspecified
+        case (10, 0) where ip[2] == 2: return .vnetInternal
+        case (10, _): return .privateAddress
+        case (127, _): return .loopback
+        case (169, 254): return .linkLocal
+        case (172, 16...31): return .privateAddress
+        case (192, 168): return .privateAddress
+        case (100, 64...127): return .privateAddress          // CGNAT（100.64/10）
+        default: return ip[0] >= 224 ? .unspecified : .publicAddress   // マルチキャストなど
+        }
+    }
+
+    static func classify(v6 g: [UInt16]) -> IPClass {
+        guard g.count == 8 else { return .publicAddress }
+        if g.allSatisfy({ $0 == 0 }) { return .unspecified }
+        if g[0..<7].allSatisfy({ $0 == 0 }) && g[7] == 1 { return .loopback }
+        if g[0..<5].allSatisfy({ $0 == 0 }) && g[5] == 0xFFFF {        // ::ffff:a.b.c.d
+            return classify([UInt8(g[6] >> 8), UInt8(g[6] & 0xFF), UInt8(g[7] >> 8), UInt8(g[7] & 0xFF)])
+        }
+        if g[0] & 0xFE00 == 0xFC00 { return .privateAddress }           // fc00::/7（ULA）
+        if g[0] & 0xFFC0 == 0xFE80 { return .linkLocal }                // fe80::/10
+        if g[0] & 0xFF00 == 0xFF00 { return .unspecified }              // マルチキャスト
+        return .publicAddress
+    }
+
+    /// ホスト名だけで分かるときの種類（数字のアドレス・localhost・.local）。名前を引かないと分からないなら nil
+    static func classify(host: String) -> IPClass? {
+        let h = SiteUtil.normalizeHost(host)
+        if let v4 = IPAddressText.v4(h) { return classify(v4) }
+        if let v6 = IPAddressText.v6(h) { return classify(v6: v6) }
+        if h == "localhost" || h.hasSuffix(".localhost") { return .loopback }
+        if h.hasSuffix(".local") || h.hasSuffix(".home.arpa") { return .privateAddress }
+        return nil
+    }
+
+    enum Decision: Equatable, Sendable {
+        case allow
+        case block(String)
+        /// トップレベルの移動: ユーザーに確かめてから
+        case askUser(String)
+    }
+
+    /// target: 接続先のアドレスの種類。topClass: トップのページの種類。fromClass: 1 つ前（リダイレクト元・移動を起こしたページ）の種類
+    static func decide(target: IPClass, ctx: RequestContext, topClass: IPClass?, fromClass: IPClass?) -> Decision {
+        guard target.isLocal else { return .allow }
+        if target == .vnetInternal || target == .unspecified { return .block("\(target.rawValue)のアドレスには接続しません") }
+        if ctx.isTopLevel {
+            if ctx.userInitiated && ctx.previousURL == nil { return .allow }     // アドレス欄から直接
+            if let f = fromClass, f.isLocal { return .allow }                     // LAN のページから LAN へ
+            if ctx.previousURL != nil && fromClass == .publicAddress {
+                return .block("公開のサイトから LAN（\(target.rawValue)）へのリダイレクト")
+            }
+            return .askUser("ページが LAN（\(target.rawValue)）へ移動しようとしています")
+        }
+        if let t = topClass, t.isLocal { return .allow }                          // LAN のページの部品
+        if ctx.previousURL != nil { return .block("公開のサイトから LAN（\(target.rawValue)）へのリダイレクト") }
+        return .block("公開のサイトから LAN（\(target.rawValue)）の部品を読み込もうとしました")
+    }
+}
+
+// ======================================================================
+// MARK: - CookieJar.swift
+// ======================================================================
+
+// MARK: - Cookie の写し（正本は WebKit の WKHTTPCookieStore）
+//
+// ・正本は WebKit の置き場だけ。ここはその写しで、VNet が要求を送るとき（vnet-guest のキュー）に、待たずに読めるようにするためのもの
+// ・WebKit の置き場が変わったら（WKHTTPCookieStoreObserver）、写しを作り直す（replaceAll）。この同期は WebCookieSync（PageScripts.swift）がやる
+// ・VNet の応答の Set-Cookie は、CookiePolicy で許されたものだけを写しに入れて、変更（CookieChange）として返す。
+//   呼んだ側が WebKit の置き場にも入れる（入れ終わってから、ページに返事を渡す）
+// ・ページの JavaScript から届く「Cookie の文字列」は、一切ここに入れない（HttpOnly や Domain を偽れるため）
+
+/// 写しの変更（WebKit の置き場にも同じことをする）
+struct CookieChange: Sendable {
+    var record: CookieRecord
+    /// true なら消す
+    var delete: Bool
+}
+
+final class CookieJar: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cookies: [String: CookieRecord] = [:]
+    private var _settings = CookiePolicy.Settings()
+    /// ログ（どのスレッドからでもよい）
+    var log: (@Sendable (String) -> Void)?
+
+    init() {}
+
+    var settings: CookiePolicy.Settings {
+        get { lock.lock(); defer { lock.unlock() }; return _settings }
+        set { lock.lock(); _settings = newValue; lock.unlock() }
+    }
+
+    var count: Int { lock.lock(); defer { lock.unlock() }; return cookies.count }
+
+    func snapshot() -> [CookieRecord] {
+        lock.lock(); defer { lock.unlock() }
+        return Array(cookies.values)
+    }
+
+    /// 送る Cookie ヘッダ（送らないものがあれば理由も返す）
+    func header(for url: URL, method: String, ctx: RequestContext, now: Date = Date()) -> (header: String?, skipped: [(String, String)]) {
+        lock.lock()
+        let all = Array(cookies.values)
+        let s = _settings
+        lock.unlock()
+        let (send, skipped) = CookiePolicy.cookiesToSend(all, url: url, method: method, ctx: ctx, settings: s, now: now)
+        return (CookiePolicy.header(send), skipped)
+    }
+
+    /// 応答の Set-Cookie を受け取る。許されたものを写しに入れ、変更を返す
+    func receive(_ lines: [String], url: URL, method: String, ctx: RequestContext, now: Date = Date()) -> [CookieChange] {
+        var changes: [CookieChange] = []
+        let s = settings
+        for line in lines {
+            switch SetCookieParser.parse(line, url: url, now: now) {
+            case .rejected(let why):
+                log?("🍪✕ 受け取らない（\(SiteUtil.host(of: url) ?? "")）: \(why)")
+            case .cookie(var rec):
+                if let why = CookiePolicy.storeDecision(rec, url: url, method: method, ctx: ctx, settings: s) {
+                    log?("🍪✕ 保存しない \(rec.name)（\(rec.domain)）: \(why)")
+                    continue
+                }
+                lock.lock()
+                if rec.isExpired(now) {
+                    let old = cookies.removeValue(forKey: rec.key)
+                    lock.unlock()
+                    changes.append(CookieChange(record: old ?? rec, delete: true))
+                    continue
+                }
+                // 置き換えるときは、最初に作られた時刻を引き継ぐ（RFC 6265 5.3 の 11.3）
+                if let old = cookies[rec.key] { rec.created = old.created }
+                cookies[rec.key] = rec
+                lock.unlock()
+                changes.append(CookieChange(record: rec, delete: false))
+            }
+        }
+        return changes
+    }
+
+    /// WebKit の置き場の中身で写しを作り直す。作られた時刻と、WebKit が覚えていない SameSite は、前の写しから引き継ぐ
+    func replaceAll(_ records: [CookieRecord], now: Date = Date()) {
+        lock.lock()
+        var next: [String: CookieRecord] = [:]
+        for var r in records where !r.isExpired(now) {
+            if let old = cookies[r.key] {
+                r.created = old.created
+                if r.sameSite == .unspecified { r.sameSite = old.sameSite }
+            }
+            next[r.key] = r
+        }
+        cookies = next
+        lock.unlock()
+    }
+
+    func removeAll() {
+        lock.lock(); cookies = [:]; lock.unlock()
+    }
+}
+
+// MARK: - HTTPCookie との変換
+
+extension CookieRecord {
+    private static let httpOnlyKey = HTTPCookiePropertyKey("HttpOnly")
+    private static let sameSiteKey = HTTPCookiePropertyKey("SameSite")
+
+    /// WebKit の置き場の HTTPCookie から作る（作られた時刻は分からないので now）
+    init?(httpCookie c: HTTPCookie, now: Date = Date()) {
+        var d = c.domain.lowercased()
+        let hostOnly = !d.hasPrefix(".")
+        while d.hasPrefix(".") { d.removeFirst() }
+        if d.isEmpty { return nil }
+        var ss = SameSite.unspecified
+        #if canImport(Darwin)
+        if let p = c.sameSitePolicy {
+            if p == .sameSiteStrict { ss = .strict } else if p == .sameSiteLax { ss = .lax } else if p.rawValue.lowercased() == "none" { ss = .none }
+        }
+        #else
+        if let p = c.properties?[CookieRecord.sameSiteKey] as? String {
+            switch p.lowercased() { case "strict": ss = .strict; case "lax": ss = .lax; case "none": ss = .none; default: break }
+        }
+        #endif
+        self.init(name: c.name, value: c.value, domain: SiteUtil.normalizeHost(d), hostOnly: hostOnly, path: c.path.isEmpty ? "/" : c.path,
+                  secure: c.isSecure, httpOnly: c.isHTTPOnly, sameSite: ss, expires: c.expiresDate, created: now)
+    }
+
+    /// WebKit の置き場に入れる HTTPCookie にする
+    func httpCookie() -> HTTPCookie? {
+        var p: [HTTPCookiePropertyKey: Any] = [.name: name, .value: value, .path: path]
+        if hostOnly {
+            // Domain 属性なし（このホストだけ）: 先頭に「.」を付けない
+            p[.domain] = domain
+        } else {
+            p[.domain] = "." + domain
+        }
+        if secure { p[.secure] = "TRUE" }
+        if let e = expires { p[.expires] = e } else { p[.discard] = "TRUE" }
+        if httpOnly { p[CookieRecord.httpOnlyKey] = "TRUE" }
+        #if canImport(Darwin)
+        switch sameSite {
+        case .strict: p[.sameSitePolicy] = HTTPCookieStringPolicy.sameSiteStrict
+        case .lax: p[.sameSitePolicy] = HTTPCookieStringPolicy.sameSiteLax
+        case .none, .unspecified: break
+        }
+        #else
+        switch sameSite {
+        case .strict: p[CookieRecord.sameSiteKey] = "strict"
+        case .lax: p[CookieRecord.sameSiteKey] = "lax"
+        case .none, .unspecified: break
+        }
+        #endif
+        return HTTPCookie(properties: p)
+    }
+}
+
+// ======================================================================
+// MARK: - HSTSStore.swift
+// ======================================================================
+
+// MARK: - HSTS（「このサイトは https だけで開く」の記録）
+//
+// 決まり（README と開発者パネルにも書く）:
+//  ・VNet が受け取った https の応答で、トップレベルかファーストパーティ（トップと同じサイト）のものからだけ登録する
+//    （サードパーティの応答・http の応答・数字のアドレスのホストは無視する。サードパーティから登録させると、追跡に使えてしまう）
+//  ・max-age で期限を決める。max-age=0 は消す。includeSubDomains に対応
+//  ・ホスト名は SiteUtil.normalizeHost でそろえる
+//  ・Application Support に保存する（期限切れは読み込むときに消す。最大 maxEntries 件。あふれたら期限の近いものから消す）
+//  ・使い道: http:// への移動とリダイレクトを https に上げる
+
+struct HSTSEntry: Codable, Equatable, Sendable {
+    var host: String
+    var expires: Date
+    var includeSubDomains: Bool
+}
+
+enum HSTSPolicy {
+    /// Strict-Transport-Security の値を読む。読めなければ nil
+    static func parse(_ header: String) -> (maxAge: Int, includeSubDomains: Bool)? {
+        var maxAge: Int?
+        var sub = false
+        var seen = Set<String>()
+        for raw in header.split(separator: ";") {
+            let d = raw.trimmingCharacters(in: .whitespaces)
+            if d.isEmpty { continue }
+            let k: String, v: String
+            if let eq = d.firstIndex(of: "=") {
+                k = d[..<eq].trimmingCharacters(in: .whitespaces).lowercased()
+                v = d[d.index(after: eq)...].trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            } else {
+                k = d.lowercased(); v = ""
+            }
+            if !seen.insert(k).inserted { return nil }     // 同じ指示が 2 回あるものは無効（RFC 6797）
+            switch k {
+            case "max-age":
+                guard let n = Int(v), n >= 0 else { return nil }
+                maxAge = n
+            case "includesubdomains": sub = true
+            default: break
+            }
+        }
+        guard let m = maxAge else { return nil }
+        return (m, sub)
+    }
+
+    /// この応答から登録してよいか
+    static func mayRecord(url: URL, ctx: RequestContext) -> Bool {
+        guard url.scheme?.lowercased() == "https", let h = SiteUtil.host(of: url), !SiteUtil.isIPLiteral(h) else { return false }
+        if ctx.isTopLevel { return true }
+        guard let top = ctx.topURL else { return false }
+        return SiteUtil.isSameSite(top, url)
+    }
+}
+
+/// HSTS の記録（どのスレッドからでも使える）
+final class HSTSStore: @unchecked Sendable {
+    static let maxEntries = 5000
+    private let lock = NSLock()
+    private var entries: [String: HSTSEntry] = [:]
+    private let fileURL: URL?
+    private var saveScheduled = false
+    private let saveQueue = DispatchQueue(label: "vela-hsts-save")
+    /// ログ（どのスレッドからでもよい）
+    var log: (@Sendable (String) -> Void)?
+
+    /// fileURL が nil なら保存しない（テスト用）
+    init(fileURL: URL?, now: Date = Date()) {
+        self.fileURL = fileURL
+        if let f = fileURL, let d = try? Data(contentsOf: f), let list = try? JSONDecoder().decode([HSTSEntry].self, from: d) {
+            for e in list where e.expires > now { entries[e.host] = e }
+        }
+    }
+
+    /// 既定の置き場（Application Support/Vela/hsts.json）
+    static func defaultFileURL() -> URL? {
+        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+        let dir = base.appendingPathComponent("Vela", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("hsts.json")
+    }
+
+    /// このホストを https に上げるべきか
+    func shouldUpgrade(_ host: String, now: Date = Date()) -> Bool {
+        let h = SiteUtil.normalizeHost(host)
+        if SiteUtil.isIPLiteral(h) { return false }
+        lock.lock(); defer { lock.unlock() }
+        if let e = entries[h], e.expires > now { return true }
+        // 親のドメインが includeSubDomains で登録されているか
+        var labels = h.split(separator: ".")
+        while labels.count > 1 {
+            labels.removeFirst()
+            if let e = entries[labels.joined(separator: ".")], e.includeSubDomains, e.expires > now { return true }
+        }
+        return false
+    }
+
+    /// 応答の Strict-Transport-Security を記録する（mayRecord を満たすときだけ）
+    func record(header: String, url: URL, ctx: RequestContext, now: Date = Date()) {
+        guard HSTSPolicy.mayRecord(url: url, ctx: ctx), let h = SiteUtil.host(of: url) else { return }
+        guard let (maxAge, sub) = HSTSPolicy.parse(header) else { log?("HSTS の値が読めません（\(h)）: \(header)"); return }
+        lock.lock()
+        var changed = false
+        if maxAge == 0 {
+            changed = entries.removeValue(forKey: h) != nil
+        } else {
+            let e = HSTSEntry(host: h, expires: now.addingTimeInterval(TimeInterval(maxAge)), includeSubDomains: sub)
+            let old = entries[h]
+            entries[h] = e
+            // 期限が少し延びただけなら保存しない（毎回書くと重い）
+            changed = old == nil || old!.includeSubDomains != sub || abs(old!.expires.timeIntervalSince(e.expires)) > 86400
+            if entries.count > HSTSStore.maxEntries {
+                let drop = entries.values.sorted { $0.expires < $1.expires }.prefix(entries.count - HSTSStore.maxEntries)
+                for d in drop { entries[d.host] = nil }
+            }
+        }
+        lock.unlock()
+        if changed {
+            log?(maxAge == 0 ? "HSTS を消しました: \(h)" : "HSTS を記録: \(h)（\(maxAge / 86400) 日\(sub ? "・サブドメインも" : "")）")
+            scheduleSave()
+        }
+    }
+
+    func all() -> [HSTSEntry] {
+        lock.lock(); defer { lock.unlock() }
+        return entries.values.sorted { $0.host < $1.host }
+    }
+
+    func remove(_ host: String) {
+        lock.lock(); entries[SiteUtil.normalizeHost(host)] = nil; lock.unlock()
+        scheduleSave()
+    }
+
+    func removeAll() {
+        lock.lock(); entries = [:]; lock.unlock()
+        scheduleSave()
+    }
+
+    /// まとめて 2 秒後に書く
+    private func scheduleSave() {
+        guard fileURL != nil else { return }
+        lock.lock()
+        if saveScheduled { lock.unlock(); return }
+        saveScheduled = true
+        lock.unlock()
+        saveQueue.asyncAfter(deadline: .now() + 2) { [weak self] in self?.saveNow() }
+    }
+
+    func saveNow() {
+        guard let f = fileURL else { return }
+        lock.lock()
+        saveScheduled = false
+        let list = Array(entries.values)
+        lock.unlock()
+        if let d = try? JSONEncoder().encode(list) { try? d.write(to: f, options: .atomic) }
     }
 }
 
@@ -788,7 +2208,8 @@ final class CookieBridge: NSObject, WKScriptMessageHandler {
 // ・同じ相手には同時に 6 本まで（ブラウザと同じ）。それ以上は空くまで待つ
 // ・名前（DNS）の答えを覚えておく
 // ・gzip・br で縮めて送ってもらう（HTML・JavaScript・CSS が数分の 1 になる）
-// ほかに: クッキーを覚えて送る・リダイレクトを追いかける・POST も送れる
+// ほかに: クッキーを送る（CookieJar と CookiePolicy で判定）・リダイレクトを追いかける（RedirectPolicy）・POST も送れる
+// 守り: 名前を引いた後、LAN への接続を LocalNetworkPolicy で判定する（DNS リバインディングも、ここで止める）
 // 「ロボットだ」と思われないよう、ヘッダは Safari と同じものを、毎回同じ順番で送る
 // 返事が来ないまま止まった接続は、時間切れで切る（でないと、その相手への読み込みがずっと止まる）
 
@@ -797,6 +2218,8 @@ struct HTTPRequest: Sendable {
     var url: URL
     var headers: [(String, String)] = []
     var body: Data?
+    /// どんな場面の要求か（Cookie・リダイレクト・LAN の判定に使う）
+    var context = RequestContext()
 }
 
 struct HTTPResult: Sendable {
@@ -804,16 +2227,25 @@ struct HTTPResult: Sendable {
     var headers: [(String, String)]
     var body: Data
     var url: URL
-    /// 届いた Set-Cookie（リダイレクトの途中の分も）。ブラウザ（WebKit）のクッキーの置き場にも入れるため
-    var cookieLines: [CookieLine] = []
+    /// CookieJar に入れた Cookie の変更（リダイレクトの途中の分も）。ブラウザ（WebKit）の Cookie の置き場にも同じことをする
+    var cookieChanges: [CookieChange] = []
     func header(_ name: String) -> String? { headers.value(for: name) }
 }
 
 struct FetchError: Error, Sendable, CustomStringConvertible {
+    /// 失敗の種類（エラーページの説明・標準の通信へ切り替える案内に使う）
+    enum Kind: String, Sendable {
+        case other, dns, timeout, tls, connect, reset, malformed, tooLarge, redirect, notReady, cancelled
+        /// TLS の版が合わない（相手が TLS 1.3 だけなど。VNet の TLS は 1.2 まで）
+        case tlsVersion
+        /// 決まり（LAN の保護など）で止めた
+        case blocked
+        /// ページが LAN へ移動しようとした。ユーザーが許可すれば開ける
+        case localNetworkConsent
+    }
     let description: String
-    /// TLS 1.3 での握手に失敗した（1.2 に下げてやり直せる）
-    var tlsRetryable = false
-    init(_ description: String, tlsRetryable: Bool = false) { self.description = description; self.tlsRetryable = tlsRetryable }
+    var kind: Kind
+    init(_ description: String, kind: Kind = .other) { self.description = description; self.kind = kind }
 }
 
 // MARK: - 1 本の接続
@@ -838,22 +2270,24 @@ final class HTTPConn: @unchecked Sendable {
     private var tcp: GuestTCP?
     private var tls: TLSStream?
     private var ready = false
+    /// TCP がつながったか（失敗の種類を「つながらない」と「途中で切れた」に分ける）
+    private var tcpConnected = false
     private var queued: Data?
     private var parser: ResponseParser?
     private var onDone: Completion?
 
     init(key: String) { self.key = key }
 
-    func open(stack: GuestStack, ip: [UInt8], port: UInt16, host: String, https: Bool, allowTLS13: Bool = true) {
+    func open(stack: GuestStack, ip: [UInt8], port: UInt16, host: String, https: Bool) {
         queue = stack.queue
         guard https else {
             tcp = stack.connect(ip, port, handler: .init(
-                connected: { [weak self] in self?.becameReady() },
+                connected: { [weak self] in self?.tcpConnected = true; self?.becameReady() },
                 data: { [weak self] d in self?.got(d) },
                 closed: { [weak self] err in self?.ended(err) }))
             return
         }
-        guard let t = TLSStream(host: host, port: port, allowTLS13: allowTLS13) else { fail("TLS を用意できません"); return }
+        guard let t = TLSStream(host: host, port: port) else { fail("TLS を用意できません", kind: .tls); return }
         tls = t
         t.onReady = { [weak self, weak t] in
             stack.trace?("TLS つながった（\(host)・\(t?.version ?? "")）")
@@ -862,7 +2296,7 @@ final class HTTPConn: @unchecked Sendable {
         t.onData = { [weak self] d in self?.got(d) }
         t.onClosed = { [weak self] err in self?.ended(err) }
         tcp = stack.connect(ip, port, handler: .init(
-            connected: { [weak self] in guard let self, let tc = self.tcp else { return }; self.tls?.attach(tc) },
+            connected: { [weak self] in guard let self, let tc = self.tcp else { return }; self.tcpConnected = true; self.tls?.attach(tc) },
             data: { [weak self] d in self?.lastActivity = Date(); self?.tls?.tcpData(d) },
             closed: { [weak self] err in self?.tls?.tcpClosed(err) }))
     }
@@ -870,7 +2304,7 @@ final class HTTPConn: @unchecked Sendable {
     /// 要求を 1 つ送る（返事を読み終わったら done）
     func send(_ bytes: Data, isHead: Bool, done: @escaping Completion) {
         uses += 1
-        if !alive { done(.failure(FetchError("接続が閉じています")), false, true); return }
+        if !alive { done(.failure(FetchError("接続が閉じています", kind: .reset)), false, true); return }
         parser = ResponseParser(isHead: isHead)
         onDone = done
         lastActivity = Date()
@@ -885,7 +2319,7 @@ final class HTTPConn: @unchecked Sendable {
             guard let self, self.serial == s, self.onDone != nil else { return }
             if Date().timeIntervalSince(self.lastActivity) < HTTPConn.timeout { self.watch(s); return }
             self.alive = false
-            self.finishCurrent(.failure(FetchError("時間切れ（\(Int(HTTPConn.timeout)) 秒なにも届きません）")), reusable: false)
+            self.finishCurrent(.failure(FetchError("時間切れ（\(Int(HTTPConn.timeout)) 秒なにも届きません）", kind: .timeout)), reusable: false)
             self.tcp?.abort()
         }
     }
@@ -916,15 +2350,14 @@ final class HTTPConn: @unchecked Sendable {
         guard let p = parser else { return }
         if p.closed() { finishCurrent(.success(p), reusable: false) }
         else if let t = tls, t.handshakeError != 0 {
-            let retry = t.triedTLS13 && !t.failedOnCertificate
-            finishCurrent(.failure(FetchError(err ?? "TLS の握手に失敗", tlsRetryable: retry)), reusable: false)
+            finishCurrent(.failure(FetchError(err ?? "TLS の握手に失敗", kind: t.versionMismatch ? .tlsVersion : .tls)), reusable: false)
         }
-        else { finishCurrent(.failure(FetchError(err ?? "途中で切れました")), reusable: false, gotNothing: p.received == 0) }
+        else { finishCurrent(.failure(FetchError(err ?? "途中で切れました", kind: tcpConnected ? .reset : .connect)), reusable: false, gotNothing: p.received == 0) }
     }
 
-    private func fail(_ s: String) {
+    private func fail(_ s: String, kind: FetchError.Kind = .other) {
         alive = false
-        finishCurrent(.failure(FetchError(s)), reusable: false, gotNothing: true)
+        finishCurrent(.failure(FetchError(s, kind: kind)), reusable: false, gotNothing: true)
     }
 
     private func finishCurrent(_ r: Result<ResponseParser, FetchError>, reusable: Bool, gotNothing: Bool = false) {
@@ -943,83 +2376,124 @@ final class HTTPPool: @unchecked Sendable {
     /// ブラウザ（WebKit）が User-Agent を付けてこなかったときに使う
     var userAgent = BrowserIdentity.userAgent
     let maxPerHost = 6
-    let maxRedirects = 8
-    static let redirectStatuses: Set<Int> = [301, 302, 303, 307, 308]
     private var idle: [String: [HTTPConn]] = [:]
     private var busy: [String: Int] = [:]
     private var waiting: [String: [() -> Void]] = [:]
     private var dnsCache: [String: (ip: [UInt8], at: Date)] = [:]
-    /// TLS 1.3 で握手できなかった相手（次から 1.2 で）
-    private var tls12Only = Set<String>()
+    /// 名前を引いて分かったアドレスの種類（トップのページが LAN のものかを見るのに使う）
+    private var hostClass: [String: IPClass] = [:]
     /// 使っていない接続を、これより長く置いておかない（相手はたいてい黙って閉じている）
     let idleLimit: TimeInterval = 50
     private(set) var reused = 0, opened = 0
+    /// Cookie の写し（正本は WebKit）。nil なら Cookie を送らない・受け取らない
+    var cookieJar: CookieJar?
+    /// HSTS の記録（リダイレクトを https に上げる）
+    var hsts: HSTSStore?
+    /// LAN の保護（LocalNetworkPolicy）を使うか
+    var localNetworkProtection = true
+    /// 判定のログ（Cookie を送らなかった理由・LAN を止めた理由など）
+    var policyLog: ((String) -> Void)?
 
     init(stack: GuestStack) {
         self.stack = stack
-        HTTPCookieStorage.shared.cookieAcceptPolicy = .always
     }
 
     /// 送って返事を受け取る（リダイレクトは追いかける）
     /// followRedirects が false なら 3xx もそのまま返す（移動はブラウザ（WebKit）に任せるとき）
-    func send(_ req: HTTPRequest, followRedirects: Bool = true, redirects: Int = 0, carried: [CookieLine] = [], done: @escaping (Result<HTTPResult, FetchError>) -> Void) {
+    func send(_ req: HTTPRequest, followRedirects: Bool = true, redirects: Int = 0, carried: [CookieChange] = [], done: @escaping (Result<HTTPResult, FetchError>) -> Void) {
         sendOnce(req, retry: true) { [weak self] r in
             guard let self else { return }
             guard case .success(var res) = r else { done(r); return }
-            if followRedirects, HTTPPool.redirectStatuses.contains(res.status), redirects < self.maxRedirects,
-               let loc = res.header("Location"), let next = URL(string: loc, relativeTo: req.url)?.absoluteURL {
-                var n = req
-                n.url = next
-                if res.status == 303 || ((res.status == 301 || res.status == 302) && req.method == "POST") {
-                    n.method = "GET"
-                    n.body = nil
-                    n.headers.removeAll(named: ["content-type", "content-length", "origin"])
+            if followRedirects, RedirectPolicy.statuses.contains(res.status) {
+                let hsts = self.hsts
+                switch RedirectPolicy.next(from: req.url, method: req.method, headers: req.headers, body: req.body, status: res.status,
+                                           location: res.header("Location"), redirectCount: redirects,
+                                           hsts: { hsts?.shouldUpgrade($0) ?? false }) {
+                case .success(let nx):
+                    var n = req
+                    n.url = nx.url
+                    n.method = nx.method
+                    n.headers = nx.headers
+                    n.body = nx.body
+                    n.context = req.context.redirected(from: req.url, to: nx.url)
+                    let dropped = nx.dropped.isEmpty ? "" : "（外したヘッダ: \(nx.dropped.joined(separator: ", "))）"
+                    self.stack.trace?("↪ \(res.status) → \(nx.url.absoluteString)\(nx.upgradedByHSTS ? "（HSTS で https に）" : "")\(dropped)")
+                    self.send(n, followRedirects: true, redirects: redirects + 1, carried: carried + res.cookieChanges, done: done)
+                    return
+                case .failure(let f):
+                    // 追いかけられない 3xx（Location が無い・javascript: など）は、そのまま返す。回数の上限は失敗にする
+                    if f == .tooMany { done(.failure(FetchError("リダイレクトが多すぎます", kind: .redirect))); return }
+                    self.stack.trace?("↪ \(res.status) を追いかけません: \(f)")
                 }
-                // ブラウザが付けてきたクッキーは前の相手のもの。移動先には自分の置き場から付け直す
-                n.headers.removeAll(named: ["cookie"])
-                self.stack.trace?("↪ \(res.status) → \(next.absoluteString)")
-                self.send(n, redirects: redirects + 1, carried: carried + res.cookieLines, done: done)
-                return
             }
-            res.cookieLines = carried + res.cookieLines
+            res.cookieChanges = carried + res.cookieChanges
             done(.success(res))
         }
     }
 
     private func sendOnce(_ req: HTTPRequest, retry: Bool, done: @escaping (Result<HTTPResult, FetchError>) -> Void) {
-        guard let host = req.url.host, let scheme = req.url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+        guard let rawHost = req.url.host, let scheme = req.url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
             done(.failure(FetchError("http か https のアドレスではありません"))); return
         }
+        let host = SiteUtil.normalizeHost(rawHost)
         let https = scheme == "https"
-        if https && !TLSStream.isSupported { done(.failure(FetchError("この環境では https を使えません"))); return }
+        if https && !TLSStream.isSupported { done(.failure(FetchError("この環境では https を使えません", kind: .tls))); return }
         let port = UInt16(req.url.port ?? (https ? 443 : 80))
         let key = "\(scheme)://\(host):\(port)"
-        let bytes = requestBytes(req, host: host)
-        let run: (HTTPConn) -> Void = { [weak self] c in
-            c.send(bytes, isHead: req.method == "HEAD") { r, reusable, gotNothing in
-                guard let self else { return }
-                self.release(c, reusable: reusable)
-                switch r {
-                case .success(let p):
-                    done(.success(self.result(p, url: req.url)))
-                case .failure(let e):
-                    // TLS 1.3 で握手できなかった: 1.2 でもう一度（この相手は次から 1.2）
-                    if e.tlsRetryable && !self.tls12Only.contains(key) {
-                        self.tls12Only.insert(key)
-                        self.stack.trace?("TLS 1.3 で握手できなかったので 1.2 でやり直します（\(host)）")
-                        self.sendOnce(req, retry: retry, done: done)
+        // 先に名前を引いて、LAN への接続かを判定する（接続を使い回すときも、要求ごとに判定する）
+        resolve(host) { [weak self] ip in
+            guard let self else { return }
+            guard let ip else { done(.failure(FetchError("名前が見つかりません: \(host)", kind: .dns))); return }
+            if let e = self.checkLocalNetwork(req, host: host, ip: ip) { done(.failure(e)); return }
+            let bytes = self.requestBytes(req, host: host)
+            let run: (HTTPConn) -> Void = { [weak self] c in
+                c.send(bytes, isHead: req.method == "HEAD") { r, reusable, gotNothing in
+                    guard let self else { return }
+                    self.release(c, reusable: reusable)
+                    switch r {
+                    case .success(let p):
+                        done(.success(self.result(p, req: req)))
+                    case .failure(let e):
+                        // 使い回した接続が、相手に閉じられていた: 新しい接続でもう一度
+                        if retry && gotNothing && c.uses > 1 { self.sendOnce(req, retry: false, done: done) }
+                        else { done(.failure(e)) }
                     }
-                    // 使い回した接続が、相手に閉じられていた: 新しい接続でもう一度
-                    else if retry && gotNothing && c.uses > 1 { self.sendOnce(req, retry: false, done: done) }
-                    else { done(.failure(e)) }
                 }
             }
+            self.acquire(key: key, host: host, ip: ip, port: port, https: https, run: run)
         }
-        acquire(key: key, host: host, port: port, https: https, run: run, fail: { done(.failure($0)) })
+    }
+
+    /// LAN への接続を判定する。止めるならエラーを返す
+    private func checkLocalNetwork(_ req: HTTPRequest, host: String, ip: [UInt8]) -> FetchError? {
+        let target = LocalNetworkPolicy.classify(ip)
+        hostClass[host] = target
+        // VNet の中のアドレス（ルーター・DNS）には、設定に関係なく接続しない
+        if !localNetworkProtection && target != .vnetInternal { return nil }
+        let ctx = req.context
+        let topClass = ctx.topURL.flatMap { classOf($0) }
+        let from = ctx.previousURL ?? ctx.initiator
+        let fromClass = from.flatMap { classOf($0) }
+        switch LocalNetworkPolicy.decide(target: target, ctx: ctx, topClass: topClass, fromClass: fromClass) {
+        case .allow:
+            return nil
+        case .block(let why):
+            policyLog?("🛡 LAN の保護: \(req.url.absoluteString)（\(ip.ipString)）を止めました: \(why)")
+            return FetchError("\(why)（\(host) → \(ip.ipString)）", kind: .blocked)
+        case .askUser(let why):
+            policyLog?("🛡 LAN の保護: \(req.url.absoluteString)（\(ip.ipString)）は確認が必要です: \(why)")
+            return FetchError("\(why)（\(host) → \(ip.ipString)）", kind: .localNetworkConsent)
+        }
+    }
+
+    /// URL のホストのアドレスの種類（数字のアドレスならそのまま。名前なら、引いたことがあればその結果。分からなければ公開とみなす）
+    private func classOf(_ u: URL) -> IPClass? {
+        guard let h = SiteUtil.host(of: u) else { return nil }
+        return LocalNetworkPolicy.classify(host: h) ?? hostClass[h] ?? .publicAddress
     }
 
     /// 空いている接続を使う。無ければ作る（6 本までなら）。いっぱいなら空くまで待つ
-    private func acquire(key: String, host: String, port: UInt16, https: Bool, run: @escaping (HTTPConn) -> Void, fail: @escaping (FetchError) -> Void) {
+    private func acquire(key: String, host: String, ip: [UInt8], port: UInt16, https: Bool, run: @escaping (HTTPConn) -> Void) {
         while var list = idle[key], let c = list.popLast() {
             idle[key] = list
             if c.alive && Date().timeIntervalSince(c.idleSince) > idleLimit { c.close(); continue }
@@ -1032,23 +2506,15 @@ final class HTTPPool: @unchecked Sendable {
         }
         if busy[key, default: 0] >= maxPerHost {
             waiting[key, default: []].append { [weak self] in
-                self?.acquire(key: key, host: host, port: port, https: https, run: run, fail: fail)
+                self?.acquire(key: key, host: host, ip: ip, port: port, https: https, run: run)
             }
             return
         }
         busy[key, default: 0] += 1
-        resolve(host) { [weak self] ip in
-            guard let self else { return }
-            guard let ip else {
-                self.release(key: key)
-                fail(FetchError("名前が見つかりません: \(host)"))
-                return
-            }
-            let c = HTTPConn(key: key)
-            self.opened += 1
-            c.open(stack: self.stack, ip: ip, port: port, host: host, https: https, allowTLS13: !self.tls12Only.contains(key))
-            run(c)
-        }
+        let c = HTTPConn(key: key)
+        opened += 1
+        c.open(stack: stack, ip: ip, port: port, host: host, https: https)
+        run(c)
     }
 
     /// 使い終わった接続を戻す（使い回せなければ閉じる）。待っている要求があれば 1 つ進める
@@ -1098,9 +2564,7 @@ final class HTTPPool: @unchecked Sendable {
         h.append(("User-Agent", req.headers.value(for: "User-Agent") ?? userAgent))
         // 途中から読む（Range。動画など）ときは縮めてもらわない。縮めると「何バイト目」がずれる
         h.append(("Accept-Encoding", req.headers.value(for: "Range") == nil ? ContentDecoding.acceptEncoding : "identity"))
-        if let cookie = CookieSync.header(for: req.url, browserCookies: req.headers.values(for: "Cookie")) {
-            h.append(("Cookie", cookie))
-        }
+        if let cookie = cookieHeader(req) { h.append(("Cookie", cookie)) }
         if let b = req.body { h.append(("Content-Length", String(b.count))) }
         else if req.method == "POST" || req.method == "PUT" || req.method == "PATCH" { h.append(("Content-Length", "0")) }
         h.append(("Connection", "keep-alive"))
@@ -1119,11 +2583,29 @@ final class HTTPPool: @unchecked Sendable {
         return d
     }
 
-    /// 返事をまとめる（クッキーを覚える・縮めた中身を戻す）
-    private func result(_ p: ResponseParser, url: URL) -> HTTPResult {
+    /// 送る Cookie。WebKit が付けてきたものがあれば、それをそのまま使う（WebKit が自分の決まりで選んだもの）。
+    /// 無ければ CookieJar（WebKit の置き場の写し）から、CookiePolicy で許されたものだけ
+    private func cookieHeader(_ req: HTTPRequest) -> String? {
+        if !req.context.cookiesAllowed { return nil }
+        let fromWebKit = req.headers.values(for: "Cookie").filter { !$0.isEmpty }
+        if !fromWebKit.isEmpty { return fromWebKit.joined(separator: "; ") }
+        guard let jar = cookieJar else { return nil }
+        let (header, skipped) = jar.header(for: req.url, method: req.method, ctx: req.context)
+        if !skipped.isEmpty, let log = policyLog {
+            log("🍪 送らない（\(req.url.host ?? "")）: " + skipped.map { "\($0.0)＝\($0.1)" }.joined(separator: "、"))
+        }
+        return header
+    }
+
+    /// 返事をまとめる（Cookie を CookieJar に入れる・縮めた中身を戻す）
+    private func result(_ p: ResponseParser, req: HTTPRequest) -> HTTPResult {
+        let url = req.url
         var headers = p.headers
-        let lines = headers.values(for: "Set-Cookie").map { CookieLine(header: $0, url: url) }
-        for l in lines { CookieSync.store(l.header, url: url) }
+        let lines = headers.values(for: "Set-Cookie")
+        var changes: [CookieChange] = []
+        if !lines.isEmpty, let jar = cookieJar {
+            changes = jar.receive(lines, url: url, method: req.method, ctx: req.context)
+        }
         var body = Data(p.body)
         if let enc = headers.value(for: "Content-Encoding"), !body.isEmpty {
             if let g = ContentDecoding.decode(body, encoding: enc) {
@@ -1134,7 +2616,7 @@ final class HTTPPool: @unchecked Sendable {
             }
         }
         headers.removeAll(named: ["transfer-encoding"])
-        return HTTPResult(status: p.status, headers: headers, body: body, url: url, cookieLines: lines)
+        return HTTPResult(status: p.status, headers: headers, body: body, url: url, cookieChanges: changes)
     }
 }
 
@@ -1262,7 +2744,9 @@ final class ResponseParser {
 // MARK: - HTTPSupport.swift
 // ======================================================================
 
-// MARK: - http の小さな道具（ヘッダ・gzip・クッキー）
+// MARK: - http の小さな道具（ヘッダ・gzip・ブラウザらしさ）
+//
+// Cookie は CookieJar.swift（WebKit の置き場の写し）と NetPolicy.swift の CookiePolicy に移した
 
 /// ヘッダ（名前, 値）の並び。名前の大文字小文字は区別しない
 extension Array where Element == (String, String) {
@@ -1403,56 +2887,6 @@ enum BrowserIdentity {
     }()
 }
 
-// MARK: クッキー
-
-/// Set-Cookie の 1 行と、それが来たアドレス
-struct CookieLine: Sendable {
-    let header: String
-    let url: URL
-}
-
-/// クッキーを自分の置き場（HTTPCookieStorage）に入れる・送る。
-/// 期限切れのものは消す（サーバーも JavaScript も「消す」を期限切れで伝える）
-enum CookieSync {
-    static func parse(_ line: String, url: URL) -> [HTTPCookie] {
-        HTTPCookie.cookies(withResponseHeaderFields: ["Set-Cookie": line], for: url)
-    }
-
-    static func store(_ line: String, url: URL) {
-        let st = HTTPCookieStorage.shared
-        for c in parse(line, url: url) {
-            if let e = c.expiresDate, e <= Date() {
-                let d = c.domain.hasPrefix(".") ? String(c.domain.dropFirst()) : c.domain
-                for old in st.cookies ?? [] where old.name == c.name && old.path == c.path
-                    && (old.domain == d || old.domain == "." + d) {
-                    st.deleteCookie(old)
-                }
-            } else {
-                st.setCookie(c)
-            }
-        }
-    }
-
-    /// 送る Cookie ヘッダの中身。ブラウザ（WebKit）が付けてきたものを先に、
-    /// 足りない名前を自分の置き場から足す（同じ名前は 1 つだけ）。無ければ nil
-    static func header(for url: URL, browserCookies: [String]) -> String? {
-        var jar: [String] = []
-        var seen = Set<String>()
-        for line in browserCookies {
-            for part in line.split(separator: ";") {
-                let kv = part.trimmingCharacters(in: .whitespaces)
-                guard !kv.isEmpty else { continue }
-                let name = kv.split(separator: "=", maxSplits: 1).first.map(String.init) ?? kv
-                if seen.insert(name).inserted { jar.append(kv) }
-            }
-        }
-        for c in HTTPCookieStorage.shared.cookies(for: url) ?? [] where seen.insert(c.name).inserted {
-            jar.append("\(c.name)=\(c.value)")
-        }
-        return jar.isEmpty ? nil : jar.joined(separator: "; ")
-    }
-}
-
 // ======================================================================
 // MARK: - TLSClient.swift
 // ======================================================================
@@ -1463,8 +2897,11 @@ enum CookieSync {
 // そこで、古いけれど今も使える Apple の「SecureTransport」（SSLCreateContext など）を使う。
 // これは「読む・書く」を自分で用意できるので、GuestTCP の上で TLS 1.2 を話せる。
 // 証明書は iPad と同じ仕組みで確かめる（相手の名前も確かめる）。
-// ブラウザらしく見えるよう: ALPN（http/1.1）を名乗る・TLS 1.3 を試す（だめなら呼ぶ側が 1.2 でやり直す）・
-// 前の暗号の約束を使い回す（セッション再開。握手が速くなる）
+// ブラウザらしく見えるよう: ALPN（http/1.1）を名乗る・前の暗号の約束を使い回す（セッション再開。握手が速くなる）
+//
+// 注意（技術的負債）: SecureTransport は 2019 年から非推奨で、TLS 1.3 には対応しない（Apple TN3151）。
+// なので VNet の TLS は 1.2 まで。TLS 1.3 だけのサーバーは版が合わずに失敗する（versionMismatch）。そのときは標準の通信で開く。
+// 自作の TCP の上では Network.framework の TLS を使えないので、TLS エンジンの移行は別の課題にしている
 //
 // 使い方: TLSStream(host:) を作る → TCP がつながったら attach → onReady で write → onData で中身が届く → onClosed
 // SecureTransport が無い環境では TLSStream(host:) が nil を返す（https は使えない）
@@ -1484,30 +2921,31 @@ final class TLSStream: @unchecked Sendable {
     private var done = false
     /// 握手に失敗したときの番号（0 なら握手の失敗ではない）
     private(set) var handshakeError: OSStatus = 0
-    /// TLS 1.3 まで試したか
-    private(set) var triedTLS13 = false
     /// 決まった版（"TLS 1.2" など）
     private(set) var version = ""
     var onReady: (() -> Void)?
     var onData: ((Data) -> Void)?
     var onClosed: ((String?) -> Void)?
 
-    init?(host: String, port: UInt16 = 443, allowTLS13: Bool = true) {
+    init?(host: String, port: UInt16 = 443) {
         self.host = host
         guard let c = SSLCreateContext(nil, .clientSide, .streamType) else { return nil }
         ctx = c
         SSLSetIOFuncs(ctx, tlsRead, tlsWrite)
         SSLSetProtocolVersionMin(ctx, .tlsProtocol12)
-        if allowTLS13 && SSLSetProtocolVersionMax(ctx, .tlsProtocol13) == errSecSuccess { triedTLS13 = true }
-        else { SSLSetProtocolVersionMax(ctx, .tlsProtocol12) }
+        SSLSetProtocolVersionMax(ctx, .tlsProtocol12)      // SecureTransport は 1.3 を話せない
         _ = host.withCString { SSLSetPeerDomainName(ctx, $0, strlen($0)) }
         SSLSetALPNProtocols(ctx, ["http/1.1"] as CFArray)
-        let peer = Array("\(host):\(port):\(triedTLS13 ? 13 : 12)".utf8)
+        let peer = Array("\(host):\(port)".utf8)
         _ = peer.withUnsafeBytes { SSLSetPeerID(ctx, $0.baseAddress, $0.count) }
     }
 
-    /// 証明書の問題での失敗か（版を下げてやり直しても無駄）
+    /// 証明書の問題での失敗か
     var failedOnCertificate: Bool { handshakeError <= -9807 && handshakeError >= -9815 }
+
+    /// 版や暗号の組み合わせが合わずに失敗したか（相手が TLS 1.3 だけなど）
+    /// -9836: errSSLPeerProtocolVersion（相手が版を断った）、-9831: errSSLPeerHandshakeFail、-9801: errSSLNegotiation、-9830: errSSLIllegalParam
+    var versionMismatch: Bool { [-9836, -9831, -9801].contains(handshakeError) }
 
     /// TCP がつながったら呼ぶ
     func attach(_ t: GuestTCP) {
@@ -1531,9 +2969,24 @@ final class TLSStream: @unchecked Sendable {
 
     /// 暗号にして送る（つながる前なら、つながってから送る）
     func write(_ d: Data) {
+        if done { return }
         if handshaking { pendingWrite.append(d); return }
-        var processed = 0
-        _ = d.withUnsafeBytes { SSLWrite(ctx, $0.baseAddress, d.count, &processed) }
+        // 書き込みの関数（tlsWrite）は全部を TCP に渡すので、普通は 1 回で全部書ける。
+        // それでも、書けた分を確かめて残りを書く。エラーなら閉じる（黙って捨てない）
+        var offset = 0
+        while offset < d.count {
+            var processed = 0
+            let st = d.withUnsafeBytes { buf -> OSStatus in
+                SSLWrite(ctx, buf.baseAddress! + offset, d.count - offset, &processed)
+            }
+            offset += processed
+            if st == errSSLWouldBlock && processed > 0 { continue }
+            if st != errSecSuccess {
+                finish("TLS の書き込みに失敗（\(st)）")
+                return
+            }
+            if processed == 0 { finish("TLS の書き込みが進みません"); return }
+        }
     }
 
     private func finish(_ error: String?) {
@@ -1551,7 +3004,8 @@ final class TLSStream: @unchecked Sendable {
             if st == errSSLWouldBlock { return }
             if st != errSecSuccess {
                 handshakeError = st
-                finish("TLS の握手に失敗（\(st)）" + (st == errSSLXCertChainInvalid || st == -9807 ? "：証明書を確かめられません" : ""))
+                finish("TLS の握手に失敗（\(st)）" + (failedOnCertificate ? "：証明書を確かめられません"
+                                                   : versionMismatch ? "：TLS の版が合いません（VNet は TLS 1.2 まで）" : ""))
                 return
             }
             handshaking = false
@@ -1605,13 +3059,13 @@ private func tlsWrite(_ conn: SSLConnectionRef, _ data: UnsafeRawPointer, _ leng
 final class TLSStream: @unchecked Sendable {
     static let isSupported = false
     let handshakeError: Int32 = 0
-    let triedTLS13 = false
     let version = ""
     var failedOnCertificate: Bool { false }
+    var versionMismatch: Bool { false }
     var onReady: (() -> Void)?
     var onData: ((Data) -> Void)?
     var onClosed: ((String?) -> Void)?
-    init?(host: String, port: UInt16 = 443, allowTLS13: Bool = true) { return nil }
+    init?(host: String, port: UInt16 = 443) { return nil }
     func attach(_ t: GuestTCP) {}
     func tcpData(_ d: Data) {}
     func tcpClosed(_ error: String?) {}
@@ -2477,6 +3931,16 @@ final class VNetMachine: @unchecked Sendable {
 
     /// ブラウザの User-Agent を使う
     func setUserAgent(_ ua: String) { queue.async { self.pool.userAgent = ua } }
+
+    /// 守りの決まり（Cookie の写し・HSTS・LAN の保護）を渡す。pool は queue の上でしか触らない
+    func configurePolicies(cookieJar: CookieJar, hsts: HSTSStore, localNetworkProtection: Bool) {
+        queue.async {
+            self.pool.cookieJar = cookieJar
+            self.pool.hsts = hsts
+            self.pool.localNetworkProtection = localNetworkProtection
+            self.pool.policyLog = { [weak self] s in self?.log?(s) }
+        }
+    }
 
     func stats() -> String {
         "フレーム 送 \(framesOut)（\(bytesOut / 1024)KB）・受 \(framesIn)（\(bytesIn / 1024)KB）・接続 新 \(pool.opened) 使い回し \(pool.reused)"
