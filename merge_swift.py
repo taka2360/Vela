@@ -2,7 +2,7 @@
 """このフォルダの .swift ファイルを 1 つにまとめる（Swift Playgrounds 用）。
 
 使い方:
-  python merge_swift.py                  # → VNetBrowserAll.swift（@main 付き。Playgrounds の「App」用）
+  python merge_swift.py                  # → VelaAll.swift（@main 付き。Playgrounds の「App」用）
   python merge_swift.py -o out.swift     # 出力先を変える
   python merge_swift.py --playground     # @main を外し、PlaygroundSupport のライブビューで動かす版
                                          # （Xcode / Playgrounds の「.playground」ページ用）
@@ -82,7 +82,7 @@ def main():
             pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-d", "--dir", default=Path(__file__).resolve().parent, type=Path, help="入力フォルダ")
-    ap.add_argument("-o", "--output", default="VNetBrowserAll.swift", help="出力ファイル名")
+    ap.add_argument("-o", "--output", default="VelaAll.swift", help="出力ファイル名")
     ap.add_argument("--playground", action="store_true",
                     help="@main を外して PlaygroundSupport のライブビューで BrowserView を出す")
     args = ap.parse_args()

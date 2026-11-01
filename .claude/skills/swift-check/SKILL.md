@@ -1,6 +1,6 @@
 ---
 name: swift-check
-description: VNetBrowser の .swift が iPad の Swift Playgrounds（Swift 5.8）でコンパイルエラーにならないか、WSL の Swift 5.8.1 とスタブで型チェックする。"swift-check"、"swiftチェック"、"コンパイルできるか"、"エラーが出ないか"、.swift を直した後の確認に使う。
+description: Vela の .swift が iPad の Swift Playgrounds（Swift 5.8）でコンパイルエラーにならないか、WSL の Swift 5.8.1 とスタブで型チェックする。"swift-check"、"swiftチェック"、"コンパイルできるか"、"エラーが出ないか"、.swift を直した後の確認に使う。
 ---
 
 # swift-check
@@ -10,7 +10,7 @@ description: VNetBrowser の .swift が iPad の Swift Playgrounds（Swift 5.8�
    powershell -NoProfile -ExecutionPolicy Bypass -File tools\swiftcheck\swiftcheck.ps1 $ARGUMENTS
    ```
    引数なし = ルートの .swift 全部（*All.swift 以外）。ファイルやフォルダを渡すとそれだけ。
-   `VNetBrowserAll.swift` を直した・作り直したときは、それも別に調べる。
+   `VelaAll.swift` を直した・作り直したときは、それも別に調べる。
 2. 最後の行の `結果: OK / NG` を見る。
 3. NG のとき:
    - 「==== エラー ====」を 1 件ずつ読み、ソースを直して、もう一度実行する

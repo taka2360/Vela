@@ -1,7 +1,7 @@
-# VNetBrowser
+# Vela
 
 iPad の Swift Playgrounds（App、Swift 5.8）で動かす実験ブラウザ。ルートの `*.swift` 19 本を Playgrounds に入れて使う。
-`VNetBrowserAll.swift` は `merge_swift.py` で 19 本を 1 つにまとめたもの（手で直さず、直したら `python merge_swift.py` で作り直す）。
+`VelaAll.swift` は `merge_swift.py` で 19 本を 1 つにまとめたもの（手で直さず、直したら `python merge_swift.py` で作り直す）。
 
 ## Swift のコンパイルチェック（.swift を直したら必ず実行する）
 
@@ -9,7 +9,7 @@ Windows には Xcode が無いので、WSL の Ubuntu に入れた Swift 5.8.1�
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\swiftcheck\swiftcheck.ps1                          # ルートの .swift 全部（*All.swift 以外）
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\swiftcheck\swiftcheck.ps1 VNetBrowserAll.swift     # まとめた版
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\swiftcheck\swiftcheck.ps1 VelaAll.swift     # まとめた版
 ```
 
 - 最後の行が `結果: OK` ならエラー無し。`結果: NG` なら「==== エラー ====」の所を直す（終了コードも 0 / 1）

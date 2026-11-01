@@ -1,4 +1,4 @@
-VNetBrowser（実験アプリ）
+Vela（実験アプリ）
 
 Android エミュレータと同じ「仮想 LAN カード（virtio-net）」と「小さなルーター（UserNet）」を使って、
 ページを読み込んで表示するだけのブラウザです。Android の代わりに、Swift で書いた小さな

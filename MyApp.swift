@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct VNetBrowserApp: App {
+struct VelaApp: App {
     var body: some Scene {
         WindowGroup {
             BrowserView()

@@ -4,7 +4,7 @@
 # 使い方:
 #   check.sh                    # このプロジェクトのフォルダの .swift を全部（*All.swift は除く）、1 つの App としてまとめて調べる
 #   check.sh <フォルダ>          # そのフォルダの .swift を全部（*All.swift は除く）
-#   check.sh a.swift b.swift    # 指定したファイルだけ（例: check.sh VNetBrowserAll.swift でまとめた版を調べる）
+#   check.sh a.swift b.swift    # 指定したファイルだけ（例: check.sh VelaAll.swift でまとめた版を調べる）
 #   オプション: --keep-warnings  Linux の Foundation 由来の Sendable 警告も隠さずに出す
 #
 # しくみ:
