@@ -992,13 +992,7 @@ final class BrowserTab: ObservableObject, Identifiable {
         errorPageURL = f
         let html: String
         if let http = httpsFirstFrom, f.host?.lowercased() == http.host?.lowercased() {
-            html = ErrorPage.html(title: "https では開けませんでした", lines: [
-                "\(http.host ?? "") は、安全な接続（https）に対応していないようです。",
-                "http のまま開くと、通信の中身を途中で見られたり、書き換えられたりする可能性があります。"],
-                detail: "\(f.absoluteString)\n\(ns.localizedDescription)",
-                buttons: [ErrorPage.Button(label: "http のまま開く", nonce: pageActions.make("openHTTP", url: http), primary: false),
-                          ErrorPage.Button(label: "再試行", nonce: pageActions.make("retry", url: f), primary: true)],
-                kind: "httpsFirst")
+            html = ErrorPage.httpsFirst(http: http, failing: f, message: ns.localizedDescription, actions: pageActions)
             httpsFirstFrom = nil
         } else {
             let d = ErrorPage.describe(nsErrorCode: ns.code, domain: ns.domain, message: ns.localizedDescription)

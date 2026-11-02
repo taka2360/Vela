@@ -460,13 +460,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
                 buttons: [ErrorPage.Button(label: "開く", nonce: actions.make("allowLocalNetwork", url: real), primary: false)],
                 kind: e.kind.rawValue)
         } else if let http = p.httpsFirstFrom, p.context.isTopLevel, e.kind != .blocked {
-            html = ErrorPage.html(title: "https では開けませんでした", lines: [
-                "\(http.host ?? "") は、安全な接続（https）に対応していないようです。",
-                "http のまま開くと、通信の中身を途中で見られたり、書き換えられたりする可能性があります。"],
-                detail: "\(real.absoluteString)\n\(e.description)",
-                buttons: [ErrorPage.Button(label: "http のまま開く", nonce: actions.make("openHTTP", url: http), primary: false),
-                          ErrorPage.Button(label: "再試行", nonce: actions.make("retry", url: real), primary: true)],
-                kind: "httpsFirst")
+            html = ErrorPage.httpsFirst(http: http, failing: real, message: e.description, actions: actions)
         } else {
             let d = ErrorPage.describe(e)
             var buttons = [ErrorPage.Button(label: "再試行", nonce: actions.make("retry", url: real), primary: true)]

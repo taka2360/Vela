@@ -595,6 +595,18 @@ enum ErrorPage {
         }
     }
 
+    /// HTTPS-First で https に上げたが開けなかったときのページ（標準の通信・VNet で同じ）。
+    /// ボタンは「http のまま開く」（http の URL）→「再試行」（開けなかった URL）の順に、actions で合言葉を作る
+    static func httpsFirst(http: URL, failing: URL, message: String, actions: PageActions) -> String {
+        html(title: "https では開けませんでした", lines: [
+            "\(http.host ?? "") は、安全な接続（https）に対応していないようです。",
+            "http のまま開くと、通信の中身を途中で見られたり、書き換えられたりする可能性があります。"],
+            detail: "\(failing.absoluteString)\n\(message)",
+            buttons: [Button(label: "http のまま開く", nonce: actions.make("openHTTP", url: http), primary: false),
+                      Button(label: "再試行", nonce: actions.make("retry", url: failing), primary: true)],
+            kind: "httpsFirst")
+    }
+
     /// エラーページの HTML（文字は全部エスケープする。暗い表示にも合わせる）
     static func html(title: String, lines: [String], detail: String? = nil, buttons: [Button], kind: String) -> String {
         var s = """

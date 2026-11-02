@@ -47,9 +47,18 @@ func httpsFirstPageTests() {
         expectEqual(normalizeNonces(t).components(separatedBy: "NONCE").count - 1, 2)
     }
 
+    test("ErrorPage.httpsFirst は 2 か所の写しと同じ HTML（nonce を除いて）") {
+        for (h, f, m) in [(http, https, "つながりません <x>"), (url("http://Ex.com:8080/"), url("https://ex.com:8080/"), ""),
+                          (url("http:///nohost"), url("https://a/b#c"), "a\nb & \"c\"")] {
+            let shared = ErrorPage.httpsFirst(http: h, failing: f, message: m, actions: PageActions())
+            expectEqual(normalizeNonces(shared), normalizeNonces(browserTabHTTPSFirstCopy(http: h, f: f, message: m, pageActions: PageActions())))
+            expectEqual(normalizeNonces(shared), normalizeNonces(vnetSchemeHTTPSFirstCopy(http: h, real: f, message: m, actions: PageActions())))
+        }
+    }
+
     test("ボタンの nonce: 1 つ目が openHTTP（http の URL）、2 つ目が retry（https の URL）") {
         let a = PageActions()
-        let s = browserTabHTTPSFirstCopy(http: http, f: https, message: "m", pageActions: a)
+        let s = ErrorPage.httpsFirst(http: http, failing: https, message: "m", actions: a)
         guard let re = try? NSRegularExpression(pattern: "[0-9A-Fa-f]{64}") else { expect(false); return }
         let ns = re.matches(in: s, range: NSRange(s.startIndex..., in: s)).compactMap { Range($0.range, in: s).map { String(s[$0]) } }
         expectEqual(ns.count, 2)

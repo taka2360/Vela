@@ -3323,13 +3323,7 @@ final class BrowserTab: ObservableObject, Identifiable {
         errorPageURL = f
         let html: String
         if let http = httpsFirstFrom, f.host?.lowercased() == http.host?.lowercased() {
-            html = ErrorPage.html(title: "https では開けませんでした", lines: [
-                "\(http.host ?? "") は、安全な接続（https）に対応していないようです。",
-                "http のまま開くと、通信の中身を途中で見られたり、書き換えられたりする可能性があります。"],
-                detail: "\(f.absoluteString)\n\(ns.localizedDescription)",
-                buttons: [ErrorPage.Button(label: "http のまま開く", nonce: pageActions.make("openHTTP", url: http), primary: false),
-                          ErrorPage.Button(label: "再試行", nonce: pageActions.make("retry", url: f), primary: true)],
-                kind: "httpsFirst")
+            html = ErrorPage.httpsFirst(http: http, failing: f, message: ns.localizedDescription, actions: pageActions)
             httpsFirstFrom = nil
         } else {
             let d = ErrorPage.describe(nsErrorCode: ns.code, domain: ns.domain, message: ns.localizedDescription)
@@ -4167,6 +4161,18 @@ enum ErrorPage {
         default:
             return Description(title: "読めませんでした", hint: message, offerNative: false)
         }
+    }
+
+    /// HTTPS-First で https に上げたが開けなかったときのページ（標準の通信・VNet で同じ）。
+    /// ボタンは「http のまま開く」（http の URL）→「再試行」（開けなかった URL）の順に、actions で合言葉を作る
+    static func httpsFirst(http: URL, failing: URL, message: String, actions: PageActions) -> String {
+        html(title: "https では開けませんでした", lines: [
+            "\(http.host ?? "") は、安全な接続（https）に対応していないようです。",
+            "http のまま開くと、通信の中身を途中で見られたり、書き換えられたりする可能性があります。"],
+            detail: "\(failing.absoluteString)\n\(message)",
+            buttons: [Button(label: "http のまま開く", nonce: actions.make("openHTTP", url: http), primary: false),
+                      Button(label: "再試行", nonce: actions.make("retry", url: failing), primary: true)],
+            kind: "httpsFirst")
     }
 
     /// エラーページの HTML（文字は全部エスケープする。暗い表示にも合わせる）
@@ -6308,13 +6314,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
                 buttons: [ErrorPage.Button(label: "開く", nonce: actions.make("allowLocalNetwork", url: real), primary: false)],
                 kind: e.kind.rawValue)
         } else if let http = p.httpsFirstFrom, p.context.isTopLevel, e.kind != .blocked {
-            html = ErrorPage.html(title: "https では開けませんでした", lines: [
-                "\(http.host ?? "") は、安全な接続（https）に対応していないようです。",
-                "http のまま開くと、通信の中身を途中で見られたり、書き換えられたりする可能性があります。"],
-                detail: "\(real.absoluteString)\n\(e.description)",
-                buttons: [ErrorPage.Button(label: "http のまま開く", nonce: actions.make("openHTTP", url: http), primary: false),
-                          ErrorPage.Button(label: "再試行", nonce: actions.make("retry", url: real), primary: true)],
-                kind: "httpsFirst")
+            html = ErrorPage.httpsFirst(http: http, failing: real, message: e.description, actions: actions)
         } else {
             let d = ErrorPage.describe(e)
             var buttons = [ErrorPage.Button(label: "再試行", nonce: actions.make("retry", url: real), primary: true)]
