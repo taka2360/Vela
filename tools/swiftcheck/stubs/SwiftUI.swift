@@ -597,3 +597,24 @@ public struct PinnedScrollableViews: OptionSet {
     public init(rawValue: UInt32) { self.rawValue = rawValue }
     public static let sectionHeaders = PinnedScrollableViews(rawValue: 1), sectionFooters = PinnedScrollableViews(rawValue: 2)
 }
+
+// MARK: - UIKit の画面（UIViewController）を入れる
+
+public struct UIViewControllerRepresentableContext<Representable: UIViewControllerRepresentable> {
+    public var coordinator: Representable.Coordinator { fatalError() }
+}
+
+public protocol UIViewControllerRepresentable: View where Body == Never {
+    associatedtype UIViewControllerType: UIViewController
+    associatedtype Coordinator = Void
+    typealias Context = UIViewControllerRepresentableContext<Self>
+    @MainActor func makeUIViewController(context: Context) -> UIViewControllerType
+    @MainActor func updateUIViewController(_ uiViewController: UIViewControllerType, context: Context)
+    @MainActor func makeCoordinator() -> Coordinator
+}
+public extension UIViewControllerRepresentable where Coordinator == Void {
+    func makeCoordinator() -> Coordinator { () }
+}
+public extension UIViewControllerRepresentable {
+    var body: Never { fatalError() }
+}

@@ -74,9 +74,12 @@ enum HTTPSTakeover {
     }
 
     private static func swap(_ m: Method, sel: Selector, original: IMP) {
-        typealias Orig = @convention(c) (AnyObject, Selector, NSString) -> Bool
+        // scheme は nil のこともありうる（Objective-C は nil を止めない）。nil を NSString として受けて触ると、
+        // 不正なメモリアクセスで落ちるので、Optional で受けて、nil は元の実装に任せる
+        typealias Orig = @convention(c) (AnyObject, Selector, NSString?) -> Bool
         let orig = unsafeBitCast(original, to: Orig.self)
-        let block: @convention(block) (AnyObject, NSString) -> Bool = { cls, scheme in
+        let block: @convention(block) (AnyObject, NSString?) -> Bool = { cls, scheme in
+            guard let scheme else { return orig(cls, sel, nil) }
             let s = (scheme as String).lowercased()
             if s == "http" || s == "https" { return false }
             return orig(cls, sel, scheme)

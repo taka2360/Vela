@@ -75,7 +75,9 @@ final class TLSStream: @unchecked Sendable {
 
     func tcpClosed(_ error: String?) {
         tcpEnded = true
-        drive()
+        // まだ attach していない（TCP がつながる前に閉じた・取り消した）: SecureTransport には触らない。
+        // SSLSetConnection の前に SSLHandshake を呼ぶと、tlsWrite に null が来て落ちた（実機の記録: TLSStream.writeFrom で 0x28）
+        if tcp != nil { drive() }
         if !done { finish(error ?? (handshaking ? "TLS の途中で切れました" : nil)) }
     }
 
@@ -110,7 +112,7 @@ final class TLSStream: @unchecked Sendable {
 
     /// 進められるところまで進める（握手 → 読む）
     private func drive() {
-        if done { return }
+        if done || tcp == nil { return }
         if handshaking {
             let st = SSLHandshake(ctx)
             if st == errSSLWouldBlock { return }
@@ -156,6 +158,8 @@ final class TLSStream: @unchecked Sendable {
 }
 
 private func tlsRead(_ conn: SSLConnectionRef, _ data: UnsafeMutableRawPointer, _ length: UnsafeMutablePointer<Int>) -> OSStatus {
+    // 念のため: 接続の印が無ければ（SSLSetConnection の前）何も読まない
+    if Int(bitPattern: conn) == 0 { length.pointee = 0; return errSSLClosedAbort }
     let s = Unmanaged<TLSStream>.fromOpaque(conn).takeUnretainedValue()
     let (n, st) = s.readInto(data, length.pointee)
     length.pointee = n
@@ -163,6 +167,7 @@ private func tlsRead(_ conn: SSLConnectionRef, _ data: UnsafeMutableRawPointer, 
 }
 
 private func tlsWrite(_ conn: SSLConnectionRef, _ data: UnsafeRawPointer, _ length: UnsafeMutablePointer<Int>) -> OSStatus {
+    if Int(bitPattern: conn) == 0 { length.pointee = 0; return errSSLClosedAbort }
     let s = Unmanaged<TLSStream>.fromOpaque(conn).takeUnretainedValue()
     return s.writeFrom(data, length.pointee)
 }

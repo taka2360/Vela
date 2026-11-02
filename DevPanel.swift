@@ -14,6 +14,10 @@ struct DevPanel: View {
                 Text("開発者パネル").font(.headline)
                 Spacer()
                 Button("ログをコピー") { UIPasteboard.general.string = store.logs.export() }
+                Button(store.hadCrash ? "前回の記録をコピー（落ちた）" : "前回の記録をコピー") {
+                    UIPasteboard.general.string = CrashLog.previous() ?? "（前回の記録はありません）"
+                }
+                .padding(.leading, 12)
                 Button("閉じる") { dismiss() }.padding(.leading, 12)
             }
             DevStatus(store: store)
@@ -34,6 +38,7 @@ struct DevStatus: View {
             Text("VNet: \(store.vnetStatus)")
             Text("タブ \(store.tabs.count) 枚・動いている WebView \(store.liveWebViewCount) / \(BrowserStore.maxLiveWebViews)")
             Text("Cookie（写し）\(store.cookieJar.count) 個・HSTS \(store.hsts.all().count) 件")
+            Text("ネットワーク: \(store.isOnline ? "つながっている" : "つながっていない")・ダウンロード中 \(store.downloads.runningCount) 件")
         }
         .font(.system(size: 12, design: .monospaced))
     }

@@ -109,6 +109,14 @@ enum VelaSettings {
         get { SearchEngine(rawValue: d.string(forKey: "search.engine") ?? "") ?? .google }
         set { d.set(newValue.rawValue, forKey: "search.engine") }
     }
+    /// HTTPS-First: ページを開く http:// を、まず https で試す（だめなら「http のまま開く」を出す）
+    static var httpsFirst: Bool {
+        get { bool("nav.httpsFirst", true) } set { d.set(newValue, forKey: "nav.httpsFirst") }
+    }
+    /// VNet でページを読めなかったら（TLS・つながらない など）、標準の通信に自動で切り替える
+    static var autoFallbackToNative: Bool {
+        get { bool("vnet.autoFallback", false) } set { d.set(newValue, forKey: "vnet.autoFallback") }
+    }
     /// Mac の Safari の Web インスペクタからつなげるようにする（iOS 16.4 から）
     static var webInspector: Bool {
         get { bool("dev.webInspector", false) } set { d.set(newValue, forKey: "dev.webInspector") }

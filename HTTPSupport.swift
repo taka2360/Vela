@@ -146,6 +146,155 @@ enum ContentDecoding {
     #endif
 }
 
+// MARK: 少しずつ届く縮めた中身を、少しずつ戻す（流す形のとき）
+
+/// 流す形の返事の Content-Encoding を、届いた分ずつ戻す。1 種類の縮め方だけ（重ねてあるものは流さずに貯める形で読む）
+final class StreamDecoder {
+    enum Kind { case gzip, deflate, br }
+
+    /// 縮め方から作る。縮めていない（identity）なら nil。流す形で戻せないものは失敗
+    static func make(encoding: String) -> Result<StreamDecoder?, ContentDecoding.Failure> {
+        let list = encoding.lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty && $0 != "identity" }
+        if list.isEmpty { return .success(nil) }
+        guard list.count == 1 else { return .failure(.unsupported(encoding)) }
+        let kind: Kind
+        switch list[0] {
+        case "gzip", "x-gzip": kind = .gzip
+        case "deflate": kind = .deflate
+        case "br": kind = .br
+        default: return .failure(.unsupported(list[0]))
+        }
+        #if canImport(Compression)
+        if kind == .br, #unavailable(iOS 15.0, macOS 12.0) { return .failure(.unsupported("br")) }
+        guard let d = StreamDecoder(kind: kind) else { return .failure(.unsupported(list[0])) }
+        return .success(d)
+        #else
+        return .failure(.unsupported(list[0]))
+        #endif
+    }
+
+    let kind: Kind
+    let maxOutput: Int
+    private(set) var produced = 0
+    /// 頭（gzip の 10 バイト〜・zlib の 2 バイト）を読み終えるまで貯めておく
+    private var head = [UInt8]()
+    private var headDone = false
+    private var ended = false
+
+    #if canImport(Compression)
+    private var stream: compression_stream
+    private var started = false
+
+    private init?(kind: Kind, maxOutput: Int = Int.max) {
+        self.kind = kind
+        self.maxOutput = maxOutput
+        let dummy = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
+        defer { dummy.deallocate() }
+        stream = compression_stream(dst_ptr: dummy, dst_size: 0, src_ptr: UnsafePointer(dummy), src_size: 0, state: nil)
+        let algorithm: compression_algorithm
+        if kind == .br {
+            if #available(iOS 15.0, macOS 12.0, *) { algorithm = COMPRESSION_BROTLI } else { return nil }
+        } else {
+            algorithm = COMPRESSION_ZLIB      // Apple の ZLIB は「生の deflate」
+        }
+        guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, algorithm) == COMPRESSION_STATUS_OK else { return nil }
+        started = true
+    }
+
+    deinit { if started { compression_stream_destroy(&stream) } }
+    #else
+    private init?(kind: Kind, maxOutput: Int = Int.max) { return nil }
+    #endif
+
+    /// 届いた分を戻す
+    func feed(_ d: Data) -> Result<Data, ContentDecoding.Failure> {
+        if ended { return .success(Data()) }          // 終わった後のもの（gzip の後ろの 8 バイトなど）は捨てる
+        var bytes = [UInt8](d)
+        if !headDone {
+            head += bytes
+            switch skipHead() {
+            case .needMore: return .success(Data())
+            case .bad(let why): return .failure(.corrupt(why))
+            case .done(let rest): headDone = true; bytes = rest; head = []
+            }
+        }
+        return process(bytes, finalize: false)
+    }
+
+    /// 最後まで届いた
+    func finish() -> Result<Data, ContentDecoding.Failure> {
+        if ended { return .success(Data()) }
+        if !headDone { return .failure(.corrupt("頭の途中で終わりました")) }
+        return process([], finalize: true)
+    }
+
+    private enum HeadResult { case needMore, bad(String), done([UInt8]) }
+
+    private func skipHead() -> HeadResult {
+        let b = head
+        switch kind {
+        case .br:
+            return .done(b)
+        case .deflate:
+            // zlib の包み（2 バイト）があれば外す。無いもの（生の deflate）も受ける
+            if b.count < 2 { return .needMore }
+            if b[0] & 0x0F == 8 && (Int(b[0]) << 8 | Int(b[1])) % 31 == 0 { return .done(Array(b[2...])) }
+            return .done(b)
+        case .gzip:
+            if b.count < 10 { return .needMore }
+            guard b[0] == 0x1F, b[1] == 0x8B, b[2] == 8 else { return .bad("gzip の頭が違います") }
+            let flags = b[3]
+            var p = 10
+            if flags & 4 != 0 {                                         // FEXTRA
+                guard p + 2 <= b.count else { return .needMore }
+                p += 2 + (Int(b[p]) | Int(b[p + 1]) << 8)
+            }
+            for flag in [UInt8(8), 16] where flags & flag != 0 {        // FNAME・FCOMMENT（0 で終わる）
+                guard let z = b[min(p, b.count)...].firstIndex(of: 0) else { return .needMore }
+                p = z + 1
+            }
+            if flags & 2 != 0 { p += 2 }                                 // FHCRC
+            if p > b.count { return .needMore }
+            return .done(Array(b[p...]))
+        }
+    }
+
+    private func process(_ src: [UInt8], finalize: Bool) -> Result<Data, ContentDecoding.Failure> {
+        #if canImport(Compression)
+        let chunk = 1 << 16
+        let out = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
+        defer { out.deallocate() }
+        var result = Data()
+        let name = "\(kind)"
+        return src.withUnsafeBufferPointer { sb -> Result<Data, ContentDecoding.Failure> in
+            let empty: [UInt8] = [0]
+            return empty.withUnsafeBufferPointer { eb -> Result<Data, ContentDecoding.Failure> in
+                stream.src_ptr = sb.baseAddress ?? eb.baseAddress!
+                stream.src_size = sb.count
+                while true {
+                    stream.dst_ptr = out
+                    stream.dst_size = chunk
+                    let flags = finalize ? Int32(COMPRESSION_STREAM_FINALIZE.rawValue) : 0
+                    let st = compression_stream_process(&stream, flags)
+                    let n = chunk - stream.dst_size
+                    if produced + n > maxOutput { return .failure(.tooLarge(maxOutput)) }
+                    if n > 0 { result.append(out, count: n); produced += n }
+                    if st == COMPRESSION_STATUS_END { ended = true; return .success(result) }
+                    if st != COMPRESSION_STATUS_OK { return .failure(.corrupt(name)) }
+                    // 入れたものを全部使い切って、出てくるものも無くなったら、次の分を待つ
+                    if stream.src_size == 0 && n < chunk {
+                        if finalize && n == 0 { return .failure(.corrupt("\(name)・途中で切れています")) }
+                        if !finalize { return .success(result) }
+                    }
+                }
+            }
+        }
+        #else
+        return .failure(.unsupported("\(kind)"))
+        #endif
+    }
+}
+
 // MARK: ブラウザらしさ（User-Agent・言語）
 
 enum BrowserIdentity {

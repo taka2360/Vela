@@ -26,11 +26,31 @@ open class WKNavigationAction: NSObject {
     open var sourceFrame: WKFrameInfo { WKFrameInfo() }
     open var targetFrame: WKFrameInfo? { nil }
     open var navigationType: WKNavigationType { .other }
+    open var shouldPerformDownload: Bool { false }
+}
+
+open class WKDownload: NSObject {
+    open var originalRequest: URLRequest? { nil }
+    open weak var webView: WKWebView? { nil }
+    open weak var delegate: WKDownloadDelegate?
+    open var progress: Progress { Progress(totalUnitCount: 0) }
+    open func cancel(_ completionHandler: (@MainActor (Data?) -> Void)? = nil) {}
+}
+
+@MainActor public protocol WKDownloadDelegate: NSObjectProtocol {
+    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String) async -> URL?
+    func downloadDidFinish(_ download: WKDownload)
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?)
+}
+public extension WKDownloadDelegate {
+    func downloadDidFinish(_ download: WKDownload) {}
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {}
 }
 
 open class WKNavigationResponse: NSObject {
     open var response: URLResponse { fatalError() }
     open var isForMainFrame: Bool { true }
+    open var canShowMIMEType: Bool { true }
 }
 
 @MainActor public protocol WKNavigationDelegate: NSObjectProtocol {
@@ -43,6 +63,8 @@ open class WKNavigationResponse: NSObject {
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error)
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error)
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView)
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload)
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload)
 }
 public extension WKNavigationDelegate {
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {}
@@ -54,6 +76,8 @@ public extension WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {}
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {}
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {}
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {}
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {}
 }
 
 open class WKWindowFeatures: NSObject {}
@@ -233,6 +257,8 @@ open class WKBackForwardList: NSObject {
     @MainActor open func takeSnapshot(with snapshotConfiguration: WKSnapshotConfiguration?,
                                       completionHandler: @escaping @MainActor (UIImage?, Error?) -> Void) {}
     @MainActor @discardableResult open func go(to item: WKBackForwardListItem) -> WKNavigation? { nil }
+    @MainActor open func startDownload(using request: URLRequest, completionHandler: @escaping @MainActor (WKDownload) -> Void) {}
+    @MainActor open func resumeDownload(fromResumeData resumeData: Data, completionHandler: @escaping @MainActor (WKDownload) -> Void) {}
     @MainActor open var customUserAgent: String?
     @MainActor open var allowsBackForwardNavigationGestures = false
     @MainActor open var isInspectable = false

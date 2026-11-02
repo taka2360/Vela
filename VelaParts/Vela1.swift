@@ -1,13 +1,14 @@
 // このファイルは merge_swift.py で自動生成したものです（直接編集しないでください）
-// VelaParts の 1 / 6。全部まとめて Playgrounds に入れる（VelaAll.swift とは一緒に入れない）
+// VelaParts の 1 / 10。全部まとめて Playgrounds に入れる（VelaAll.swift とは一緒に入れない）
 
 import SwiftUI
 import WebKit
 import Foundation
-import ObjectiveC
+import Network
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+import ObjectiveC
 #if canImport(Compression)
 import Compression
 #endif
@@ -53,6 +54,9 @@ struct BrowserView: View {
             if store.tabs.count > 1 {
                 TabStrip(store: store)
             }
+            if !store.isOnline {
+                OfflineBanner()
+            }
             Divider()
             PageArea(store: store)
         }
@@ -77,6 +81,7 @@ struct TopBar: View {
                 NavButtons(tab: tab)
                 AddressField(store: store, tab: tab)
                 ReloadButton(tab: tab)
+                DownloadsButton(manager: store.downloads, show: $store.showDownloads)
                 MoreMenu(store: store, tab: tab)
                 Button { store.newTab(url: nil) } label: { Image(systemName: "plus") }
                     .keyboardShortcut("t", modifiers: .command)
@@ -88,6 +93,22 @@ struct TopBar: View {
             LoadingBar(progress: tab.progress, visible: tab.isLoading)
         }
         .background(Color(UIColor.secondarySystemBackground))
+        .sheet(isPresented: $store.showDownloads) { DownloadsView(manager: store.downloads) }
+    }
+}
+
+/// ネットワークにつながっていないときの帯
+struct OfflineBanner: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "wifi.slash")
+            Text("ネットワークにつながっていません")
+        }
+        .font(.system(size: 13, weight: .semibold))
+        .foregroundColor(.white)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 5)
+        .background(Color.orange)
     }
 }
 
@@ -523,6 +544,10 @@ struct DevPanel: View {
                 Text("開発者パネル").font(.headline)
                 Spacer()
                 Button("ログをコピー") { UIPasteboard.general.string = store.logs.export() }
+                Button(store.hadCrash ? "前回の記録をコピー（落ちた）" : "前回の記録をコピー") {
+                    UIPasteboard.general.string = CrashLog.previous() ?? "（前回の記録はありません）"
+                }
+                .padding(.leading, 12)
                 Button("閉じる") { dismiss() }.padding(.leading, 12)
             }
             DevStatus(store: store)
@@ -543,6 +568,7 @@ struct DevStatus: View {
             Text("VNet: \(store.vnetStatus)")
             Text("タブ \(store.tabs.count) 枚・動いている WebView \(store.liveWebViewCount) / \(BrowserStore.maxLiveWebViews)")
             Text("Cookie（写し）\(store.cookieJar.count) 個・HSTS \(store.hsts.all().count) 件")
+            Text("ネットワーク: \(store.isOnline ? "つながっている" : "つながっていない")・ダウンロード中 \(store.downloads.runningCount) 件")
         }
         .font(.system(size: 12, design: .monospaced))
     }
@@ -592,373 +618,333 @@ struct DevLogView: View {
 }
 
 // ======================================================================
-// MARK: - BrowserStore.swift
+// MARK: - Downloads.swift
 // ======================================================================
 
-// MARK: - アプリ全体（タブ・共有の部品・保存）
+// MARK: - ダウンロード
 //
-// ・タブ 1 枚 = BrowserTab（WKWebView は必要なときだけ作る。動いている WebView は maxLiveWebViews 枚まで）
-// ・通信（VNetMachine）・Cookie の写し・HSTS・ログ・LAN の保護のルールは、全部のタブで 1 つを共有する
-// ・タブの並び（と各タブの戻る/進むの履歴）を session.json に保存して、次に起動したときに戻す
-// ・メモリが足りなくなったら（メモリ警告）、見ていないタブの WebView を捨てる（スナップショットと履歴は残す）
+// ・WebKit の WKDownload を使う（VNet のタブでも標準の通信のタブでも同じ。VNet は返事を流す形で渡すので、大きいファイルでもメモリにためない）
+// ・保存先は Documents/Downloads（同じ名前があれば「名前 (2).zip」のようにする）
+// ・進み具合は 0.5 秒ごとに見る。取り消し・やり直し（途中から: resumeData）・共有（「ファイル」に保存など）・削除ができる
+// ・起動したときに、前にダウンロードしたファイルを一覧に戻す
 
-/// 通信の作り（タブごと）
-enum NetMode: String, Codable {
-    /// https・http をそのまま VNetScheme が引き受ける（アドレスは本物の https://…）
-    case vnetDirect = "VNet"
-    /// 予備の vnets://… の作り（開発者向けの実験。CSP などを外すので安全ではない）
-    case vnetsLegacy = "VNet（vnets://・実験）"
-    /// 標準の通信（WebKit 内蔵）
-    case native = "標準"
-
-    var usesVNet: Bool { self != .native }
-    var short: String {
-        switch self { case .vnetDirect: return "VNet"; case .vnetsLegacy: return "vnets"; case .native: return "標準" }
+@MainActor
+final class DownloadItem: ObservableObject, Identifiable {
+    enum State: Equatable {
+        case running
+        case finished
+        case failed(String)
+        case cancelled
     }
-}
 
-/// ページの JavaScript からのダイアログ（alert・confirm・prompt）
-struct JSDialog: Identifiable {
-    enum Kind { case alert, confirm, prompt(String) }
     let id = UUID()
-    let kind: Kind
-    let message: String
-    let origin: String
-    /// (OK か, prompt の入力)
-    let respond: (Bool, String?) -> Void
-}
+    @Published var filename: String
+    @Published var received: Int64 = 0
+    @Published var expected: Int64 = -1
+    @Published var state = State.running
+    @Published var fileURL: URL?
+    let source: URL?
+    var download: WKDownload?
+    var resumeData: Data?
+    /// VNet が自分で書いているダウンロード（VNet のタブ）
+    var vnet: VNetDownload?
+    /// やり直すとき（VNet のダウンロードは、同じ URL をもう一度 VNet で読む）
+    var restart: (() -> Void)?
 
-/// 保存するタブ
-struct SavedTab: Codable {
-    var id: Int
-    var url: String?
-    var title: String
-    var mode: NetMode
-    /// WebKit の戻る/進むの履歴（WKWebView.interactionState）
-    var state: Data?
-}
+    /// VNet のダウンロードの様子を写す
+    func syncVNet() {
+        guard let v = vnet else { return }
+        received = v.received
+        switch v.state {
+        case .running: state = .running
+        case .finished: state = .finished; expected = received
+        case .cancelled: state = .cancelled
+        case .failed(let why): state = .failed(why)
+        }
+    }
 
-struct SessionData: Codable {
-    var tabs: [SavedTab]
-    var selected: Int?
+    init(filename: String, source: URL?) {
+        self.filename = filename
+        self.source = source
+    }
+
+    var fraction: Double? { expected > 0 ? min(1, Double(received) / Double(expected)) : nil }
 }
 
 @MainActor
-final class BrowserStore: ObservableObject {
-    @Published private(set) var tabs: [BrowserTab] = []
-    @Published private(set) var selectedID: Int?
-    @Published var showTabOverview = false
-    @Published var showDevPanel = false
-    /// いま出しているダイアログ（順番待ちは dialogQueue）
-    @Published private(set) var dialog: JSDialog?
-    @Published var dialogInput = ""
-    /// VNet の様子（ツールバー・開発者パネル用）
-    @Published private(set) var vnetReady = false
-    @Published private(set) var vnetStatus = "準備中…"
-    /// 開発者パネルのログ（パネルを開いている間だけ更新する）
-    @Published private(set) var logText = ""
+final class DownloadManager: NSObject, ObservableObject, WKDownloadDelegate {
+    @Published private(set) var items: [DownloadItem] = []
+    /// ログ（どのスレッドからでもよい）
+    var log: (@Sendable (String) -> Void)?
+    /// やり直し（途中から）に使う WebView を返す
+    var webViewForResume: (() -> WKWebView?)?
+    private var timer: Timer?
 
-    let machine = VNetMachine(factory: NWUserNetFactory())
-    /// Cookie の写し（正本は WebKit の置き場）
-    let cookieJar = CookieJar()
-    /// HSTS の記録
-    let hsts = HSTSStore(fileURL: HSTSStore.defaultFileURL())
-    /// 開発者向けのログ（どのスレッドからでも書ける）
-    let logs = DevLog()
-    /// https の横取りの結果・新しいタブの通信の作り（setUp で決める）
-    private(set) var takeover: HTTPSTakeover.Outcome = .disabledBySetting
-    private(set) var defaultMode: NetMode = .native
-    /// 全部のタブに入れる WebKit のルール（LAN の保護など）
-    private(set) var contentRuleLists: [WKContentRuleList] = []
-    private var cookieSync: WebCookieSync?
-    private var nextTabID = 1
-    /// 閉じたタブ（⌘⇧T で戻す。新しいものが後ろ）
-    private var closedTabs: [SavedTab] = []
-    private var dialogQueue: [JSDialog] = []
-    private let session = JSONFile<SessionData>(name: "session.json")
-    private var timers: [Timer] = []
-    private var memoryObserver: NSObjectProtocol?
-    private var didSetUp = false
-
-    /// 動いている WebView の上限（これを超えたら、長く見ていないタブから WebView を捨てる）
-    static let maxLiveWebViews = 6
-    static let maxClosedTabs = 20
-
-    /// @StateObject から作られる。iPad の Swift ではここが MainActor の中と見なされないことがあるので、
-    /// 自分の @MainActor のものは触らず、準備は setUp に回す
-    nonisolated init() {
-        Task { @MainActor in self.setUp() }
+    /// BrowserStore の nonisolated init から作られるので、ここでは何もしない（準備は loadExisting）
+    nonisolated override init() {
+        super.init()
     }
 
-    var selectedTab: BrowserTab? { tabs.first { $0.id == selectedID } }
-    var searchEngine: SearchEngine { VelaSettings.searchEngine }
-    var liveWebViewCount: Int { tabs.filter { $0.webView != nil }.count }
+    var runningCount: Int { items.filter { $0.state == .running }.count }
 
-    private func setUp() {
-        if didSetUp { return }
-        didSetUp = true
-        let lb = logs
-        takeover = HTTPSTakeover.install()
-        if takeover == .installed { defaultMode = .vnetDirect }
-        else if VelaSettings.legacyVNetsFallback && !VelaSettings.vnetDisabled { defaultMode = .vnetsLegacy }
-        else { defaultMode = .native }
-        logs.add(takeover.description)
-        logs.add("新しいタブの通信: \(defaultMode.rawValue)")
-        if defaultMode == .vnetsLegacy { logs.add("⚠️ 予備の vnets://… の作りで読みます（開発者向けの実験。CSP などを外すので安全ではありません）") }
-        session.log = { s in lb.add(s) }
+    nonisolated static var folder: URL { DownloadFiles.folder }
 
-        // VNet: Cookie の正本は WebKit の置き場。CookieJar はその写し
-        cookieJar.settings = VelaSettings.cookiePolicy
-        cookieJar.log = { s in lb.add(s) }
-        hsts.log = { s in lb.add(s) }
-        machine.log = { s in lb.add(s) }
-        if takeover == .installed || defaultMode == .vnetsLegacy {
-            let sync = WebCookieSync(store: WKWebsiteDataStore.default().httpCookieStore, jar: cookieJar)
-            sync.log = { s in lb.add(s) }
-            cookieSync = sync
-            machine.configurePolicies(cookieJar: cookieJar, hsts: hsts, localNetworkProtection: VelaSettings.localNetworkProtection)
-            // 自作の通信で送る User-Agent も同じもの（ページの JavaScript から見えるものと食い違うと、ロボットだと思われる）
-            machine.setUserAgent(BrowserIdentity.userAgent)
-            machine.boot()
+    /// 前にダウンロードしたファイルを一覧に入れる（新しい順）
+    func loadExisting() {
+        let fm = FileManager.default
+        let files = (try? fm.contentsOfDirectory(at: DownloadManager.folder, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        let sorted = files.sorted { a, b in
+            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return da > db
         }
-        if VelaSettings.localNetworkProtection { compileLocalNetworkRules() } else { logs.add("⚠️ LAN の保護は切ってあります") }
-        if defaultMode == .vnetsLegacy { compileVNetOnlyRules() }
-
-        restoreSession()
-        if tabs.isEmpty { newTab(url: nil) }
-
-        memoryObserver = NotificationCenter.default.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification,
-                                                                object: nil, queue: .main) { [weak self] _ in
-            let store = self
-            Task { @MainActor in store?.handleMemoryWarning() }
-        }
-        timers.append(Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            let store = self
-            Task { @MainActor in store?.refreshStatus() }
-        })
-        timers.append(Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            let store = self
-            Task { @MainActor in store?.flushLogIfVisible() }
-        })
-    }
-
-    // MARK: タブ
-
-    /// 新しいタブ（url が nil なら空のタブ）。select: すぐ見るか
-    @discardableResult
-    func newTab(url: URL?, select: Bool = true, mode: NetMode? = nil, after: BrowserTab? = nil) -> BrowserTab {
-        let tab = BrowserTab(id: nextTabID, store: self, mode: mode ?? defaultMode)
-        nextTabID += 1
-        if let after, let i = tabs.firstIndex(where: { $0 === after }) { tabs.insert(tab, at: i + 1) } else { tabs.append(tab) }
-        if let url { tab.load(url, userInitiated: true) }
-        if select { self.select(tab) }
-        saveSession()
-        return tab
-    }
-
-    /// ページが開いた新しい窓（target=_blank・window.open）。WebKit が渡した設定で WebView を作ってタブにする
-    func adoptPopup(configuration: WKWebViewConfiguration, opener: BrowserTab) -> WKWebView {
-        let tab = BrowserTab(id: nextTabID, store: self, mode: opener.mode)
-        nextTabID += 1
-        if let i = tabs.firstIndex(where: { $0 === opener }) { tabs.insert(tab, at: i + 1) } else { tabs.append(tab) }
-        let wv = tab.adopt(configuration: configuration, scheme: opener.scheme)
-        select(tab)
-        logs.add("新しい窓をタブにしました（#\(opener.id) から）", level: .info, category: .nav, tab: tab.id)
-        return wv
-    }
-
-    func select(_ tab: BrowserTab) {
-        selectedID = tab.id
-        tab.lastSelected = Date()
-        tab.ensureWebView()
-        trimLiveWebViews()
-        saveSession()
-    }
-
-    func close(_ tab: BrowserTab) {
-        guard let i = tabs.firstIndex(where: { $0 === tab }) else { return }
-        closedTabs.append(tab.saved())
-        if closedTabs.count > BrowserStore.maxClosedTabs { closedTabs.removeFirst(closedTabs.count - BrowserStore.maxClosedTabs) }
-        tab.tearDown()
-        tabs.remove(at: i)
-        logs.add("タブを閉じました", level: .info, category: .nav, tab: tab.id)
-        if tabs.isEmpty { newTab(url: nil); return }
-        if selectedID == tab.id { select(tabs[min(i, tabs.count - 1)]) }
-        saveSession()
-    }
-
-    func closeOthers(_ keep: BrowserTab) {
-        for t in tabs where t !== keep { close(t) }
-    }
-
-    var canReopenClosedTab: Bool { !closedTabs.isEmpty }
-
-    func reopenClosedTab() {
-        guard let s = closedTabs.popLast() else { return }
-        let tab = BrowserTab(id: nextTabID, store: self, mode: s.mode)
-        nextTabID += 1
-        tab.restore(from: s)
-        tabs.append(tab)
-        select(tab)
-    }
-
-    func selectNextTab(_ step: Int) {
-        guard let cur = selectedTab, let i = tabs.firstIndex(where: { $0 === cur }), !tabs.isEmpty else { return }
-        select(tabs[(i + step + tabs.count) % tabs.count])
-    }
-
-    /// アドレス欄から開く（URL か検索語か）
-    func open(_ text: String, in tab: BrowserTab? = nil) {
-        guard let r = AddressInput.resolve(text, engine: searchEngine) else { return }
-        let target = tab ?? selectedTab ?? newTab(url: nil)
-        switch r {
-        case .url(let u):
-            logs.add("―― \(u.absoluteString) を開きます ――", level: .info, category: .nav, tab: target.id)
-            target.load(u, userInitiated: true)
-        case .search(let q, let u):
-            logs.add("―― 「\(q)」を検索します（\(searchEngine.name)）――", level: .info, category: .nav, tab: target.id)
-            target.load(u, userInitiated: true)
+        for f in sorted where !f.lastPathComponent.hasPrefix(".") {
+            let item = DownloadItem(filename: f.lastPathComponent, source: nil)
+            item.fileURL = f
+            item.state = .finished
+            let size = (try? fm.attributesOfItem(atPath: f.path)[.size] as? NSNumber)?.int64Value ?? 0
+            item.received = size
+            item.expected = size
+            items.append(item)
         }
     }
 
-    /// 動いている WebView が多すぎたら、長く見ていないタブ（見ているタブ以外）から WebView を捨てる
-    private func trimLiveWebViews() {
-        let live = tabs.filter { $0.webView != nil && $0.id != selectedID }.sorted { $0.lastSelected < $1.lastSelected }
-        let over = live.count + (selectedTab?.webView != nil ? 1 : 0) - BrowserStore.maxLiveWebViews
-        if over <= 0 { return }
-        for t in live.prefix(over) { t.suspend(reason: "動いている WebView が \(BrowserStore.maxLiveWebViews) 枚を超えた") }
+    /// WebKit がダウンロードに変えたものを受け取る
+    func adopt(_ d: WKDownload, source: URL?) {
+        let item = DownloadItem(filename: source?.lastPathComponent ?? "download", source: source)
+        item.download = d
+        d.delegate = self
+        items.insert(item, at: 0)
+        log?("⬇︎ ダウンロード開始: \(source?.absoluteString ?? "?")")
+        startTimer()
     }
 
-    private func handleMemoryWarning() {
-        let others = tabs.filter { $0.webView != nil && $0.id != selectedID }
-        logs.add("⚠️ メモリ警告: 見ていないタブ \(others.count) 枚の WebView を捨てます", level: .warning, category: .app)
-        for t in others { t.suspend(reason: "メモリ警告") }
-    }
-
-    /// タブ一覧を開く前に、動いているタブのスナップショットを撮る
-    func openTabOverview() {
-        for t in tabs where t.webView != nil { t.takeSnapshot() }
-        showTabOverview = true
-    }
-
-    // MARK: 保存
-
-    func saveSession() {
-        session.save(SessionData(tabs: tabs.map { $0.saved() }, selected: selectedID))
-    }
-
-    /// アプリが裏に回るとき: すぐ書く
-    func saveSessionNow() {
-        session.saveNow(SessionData(tabs: tabs.map { $0.saved() }, selected: selectedID))
-        hsts.saveNow()
-    }
-
-    private func restoreSession() {
-        guard let s = session.load(), !s.tabs.isEmpty else { return }
-        for st in s.tabs {
-            var mode = st.mode
-            if mode.usesVNet && defaultMode == .native { mode = .native }      // VNet が使えないときは標準の通信で
-            if mode == .vnetDirect && defaultMode == .vnetsLegacy { mode = .vnetsLegacy }
-            let tab = BrowserTab(id: st.id, store: self, mode: mode)
-            tab.restore(from: st)
-            tabs.append(tab)
-            nextTabID = max(nextTabID, st.id + 1)
+    /// VNet が自分で書き始めたダウンロードを一覧に入れる
+    func register(_ dl: VNetDownload, restart: (() -> Void)?) {
+        let item = DownloadItem(filename: dl.fileURL.lastPathComponent, source: dl.source)
+        item.vnet = dl
+        item.fileURL = dl.fileURL
+        item.expected = dl.expected
+        item.restart = restart
+        dl.onChange = { [weak item] in
+            let it = item
+            Task { @MainActor in it?.syncVNet() }
         }
-        logs.add("前のタブを \(s.tabs.count) 枚戻しました", level: .info, category: .app)
-        select(tabs.first { $0.id == s.selected } ?? tabs[0])
+        items.insert(item, at: 0)
+        item.syncVNet()
+        log?("⬇︎ ダウンロード開始（VNet）: \(dl.source.absoluteString)")
     }
 
-    // MARK: ダイアログ（JavaScript の alert・confirm・prompt）
+    private func item(for d: WKDownload) -> DownloadItem? { items.first { $0.download === d } }
 
-    func presentDialog(_ d: JSDialog) {
-        if dialog == nil { show(d) } else { dialogQueue.append(d) }
-    }
+    // MARK: WKDownloadDelegate
 
-    private func show(_ d: JSDialog) {
-        if case .prompt(let def) = d.kind { dialogInput = def } else { dialogInput = "" }
-        dialog = d
-    }
-
-    /// ダイアログを閉じる（ok: OK を押したか）
-    func answerDialog(ok: Bool) {
-        guard let d = dialog else { return }
-        dialog = nil
-        d.respond(ok, ok ? dialogInput : nil)
-        if !dialogQueue.isEmpty { show(dialogQueue.removeFirst()) }
-    }
-
-    /// そのタブのダイアログを全部取り消す（タブを閉じたとき）
-    func cancelDialogs(for tab: BrowserTab) {
-        let mine = dialogQueue.filter { $0.origin.hasPrefix("#\(tab.id) ") }
-        dialogQueue.removeAll { $0.origin.hasPrefix("#\(tab.id) ") }
-        for d in mine { d.respond(false, nil) }
-        if let d = dialog, d.origin.hasPrefix("#\(tab.id) ") { answerDialog(ok: false) }
-    }
-
-    // MARK: WebKit のルール
-
-    /// LAN の保護のルール（標準の通信のタブ・WebSocket・VNet の手前）
-    private func compileLocalNetworkRules() {
-        let lb = logs
-        WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "vela-lan-protection", encodedContentRuleList: PageScripts.localNetworkRules) { [weak self] list, error in
-            let store = self
-            if let list {
-                Task { @MainActor in store?.addRuleList(list) }
-            } else {
-                lb.add("⚠️ LAN の保護のルールを WebKit に入れられません: \(error.map { "\($0)" } ?? "不明")")
-            }
+    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String) async -> URL? {
+        let url = DownloadFiles.uniqueURL(for: suggestedFilename)
+        if let item = item(for: download) {
+            item.filename = url.lastPathComponent
+            item.fileURL = url
+            item.expected = response.expectedContentLength
         }
+        return url
     }
 
-    /// 予備の vnets:// の作りで、ブラウザが自分で外へ読みに行くのを止める（自作の通信だけで読む実験のため）
-    private func compileVNetOnlyRules() {
-        let rules = #"[{"trigger":{"url-filter":"^https?://"},"action":{"type":"block"}}]"#
-        WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "vnet-only", encodedContentRuleList: rules) { [weak self] list, _ in
-            let store = self
-            if let list { Task { @MainActor in store?.addRuleList(list, onlyVNetsLegacy: true) } }
+    func downloadDidFinish(_ download: WKDownload) {
+        guard let item = item(for: download) else { return }
+        item.state = .finished
+        if let f = item.fileURL, let size = (try? FileManager.default.attributesOfItem(atPath: f.path)[.size] as? NSNumber)?.int64Value {
+            item.received = size
+            item.expected = size
         }
+        item.download = nil
+        log?("⬇︎ ダウンロード完了: \(item.filename)（\(item.received / 1024)KB）")
     }
 
-    private var vnetsOnlyRuleLists: [WKContentRuleList] = []
-
-    private func addRuleList(_ list: WKContentRuleList, onlyVNetsLegacy: Bool = false) {
-        if onlyVNetsLegacy { vnetsOnlyRuleLists.append(list) } else { contentRuleLists.append(list) }
-        for t in tabs { t.addRuleList(list, onlyVNetsLegacy: onlyVNetsLegacy) }
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        guard let item = item(for: download) else { return }
+        item.resumeData = resumeData
+        item.download = nil
+        if item.state == .cancelled { return }
+        item.state = .failed(error.localizedDescription)
+        log?("⬇︎✕ ダウンロード失敗: \(item.filename)：\(error.localizedDescription)\(resumeData != nil ? "（途中から再開できます）" : "")")
     }
 
-    /// そのタブに入れるルール
-    func ruleLists(for mode: NetMode) -> [WKContentRuleList] {
-        contentRuleLists + (mode == .vnetsLegacy ? vnetsOnlyRuleLists : [])
-    }
+    // MARK: 操作
 
-    /// VNet のタブの Cookie を WebKit の置き場に入れる（VNetScheme から）
-    func pushCookies(_ changes: [CookieChange]) async {
-        await cookieSync?.apply(changes)
-    }
-
-    func cookiesChangedByPage() {
-        cookieSync?.scheduleRefresh()
-    }
-
-    // MARK: 様子
-
-    private func refreshStatus() {
-        guard defaultMode.usesVNet || tabs.contains(where: { $0.mode.usesVNet }) else {
-            vnetStatus = "VNet: 使っていません（\(takeover.description)）"
+    func cancel(_ item: DownloadItem) {
+        if let v = item.vnet {
+            item.state = .cancelled
+            v.cancel()
+            log?("⬇︎ ダウンロードを取り消しました: \(item.filename)")
             return
         }
-        machine.stats { [weak self] s in
-            let store = self
-            let text = (s.ready ? "IP \(s.ip)" : "IP をもらっています…") + "・" + s.summary
-            Task { @MainActor in
-                store?.vnetReady = s.ready
-                store?.vnetStatus = text
+        guard let d = item.download else { return }
+        item.state = .cancelled
+        d.cancel { [weak item] data in
+            item?.resumeData = data
+        }
+        log?("⬇︎ ダウンロードを取り消しました: \(item.filename)")
+    }
+
+    /// やり直す（途中までのデータがあれば、そこから）
+    func retry(_ item: DownloadItem) {
+        if item.vnet != nil {
+            let again = item.restart
+            remove(item)
+            again?()
+            return
+        }
+        if let data = item.resumeData, let wv = webViewForResume?() {
+            item.state = .running
+            item.resumeData = nil
+            wv.resumeDownload(fromResumeData: data) { [weak self, weak item] d in
+                guard let self, let item else { return }
+                item.download = d
+                d.delegate = self
+                self.startTimer()
+            }
+            log?("⬇︎ 途中から再開します: \(item.filename)")
+        } else if let src = item.source, let wv = webViewForResume?() {
+            remove(item)
+            wv.startDownload(using: URLRequest(url: src)) { [weak self] d in
+                self?.adopt(d, source: src)
             }
         }
     }
 
-    private func flushLogIfVisible() {
-        guard showDevPanel, let t = logs.take(lines: 400) else { return }
-        logText = t
+    /// 一覧から外して、ファイルも消す
+    func remove(_ item: DownloadItem) {
+        if item.state == .running { cancel(item) }
+        if let f = item.fileURL { try? FileManager.default.removeItem(at: f) }
+        items.removeAll { $0 === item }
     }
+
+    func clearFinished() {
+        items.removeAll { $0.state != .running }
+    }
+
+    private func startTimer() {
+        if timer != nil { return }
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            let me = self
+            Task { @MainActor in me?.tick() }
+        }
+    }
+
+    private func tick() {
+        var running = false
+        for item in items where item.state == .running {
+            guard let d = item.download else { continue }
+            running = true
+            item.received = d.progress.completedUnitCount
+            if d.progress.totalUnitCount > 0 { item.expected = d.progress.totalUnitCount }
+        }
+        if !running { timer?.invalidate(); timer = nil }
+    }
+}
+
+// MARK: - 画面
+
+/// ツールバーのダウンロードのボタン（ダウンロードがあるときだけ出す）
+struct DownloadsButton: View {
+    @ObservedObject var manager: DownloadManager
+    @Binding var show: Bool
+
+    var body: some View {
+        if !manager.items.isEmpty {
+            Button { show = true } label: {
+                Image(systemName: manager.runningCount > 0 ? "arrow.down.circle.fill" : "arrow.down.circle")
+            }
+        }
+    }
+}
+
+struct DownloadsView: View {
+    @ObservedObject var manager: DownloadManager
+    @Environment(\.dismiss) private var dismiss
+    @State private var sharing: URL?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("ダウンロード").font(.headline)
+                Spacer()
+                Button("終わったものを一覧から外す") { manager.clearFinished() }
+                Button("閉じる") { dismiss() }.padding(.leading, 12)
+            }
+            .padding()
+            ScrollView {
+                LazyVStack(spacing: 10) {
+                    ForEach(manager.items) { item in
+                        DownloadRow(manager: manager, item: item) { sharing = $0 }
+                    }
+                }
+                .padding(.horizontal)
+            }
+        }
+        .sheet(isPresented: Binding(get: { sharing != nil }, set: { if !$0 { sharing = nil } })) {
+            if let u = sharing { ShareSheet(items: [u]) }
+        }
+    }
+}
+
+struct DownloadRow: View {
+    @ObservedObject var manager: DownloadManager
+    @ObservedObject var item: DownloadItem
+    let share: (URL) -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "doc").font(.system(size: 24)).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(item.filename).lineLimit(1)
+                if item.state == .running {
+                    ProgressView(value: item.fraction ?? 0)
+                }
+                Text(statusText).font(.system(size: 12)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            buttons
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color(UIColor.secondarySystemBackground)))
+    }
+
+    @ViewBuilder private var buttons: some View {
+        switch item.state {
+        case .running:
+            Button { manager.cancel(item) } label: { Image(systemName: "xmark.circle") }
+        case .finished:
+            if let f = item.fileURL {
+                Button { share(f) } label: { Image(systemName: "square.and.arrow.up") }
+            }
+            Button { manager.remove(item) } label: { Image(systemName: "trash") }
+        case .failed, .cancelled:
+            Button { manager.retry(item) } label: { Image(systemName: "arrow.clockwise") }
+            Button { manager.remove(item) } label: { Image(systemName: "trash") }
+        }
+    }
+
+    private var statusText: String {
+        let size = ByteCountFormatter.string(fromByteCount: item.received, countStyle: .file)
+        switch item.state {
+        case .running:
+            if item.expected > 0 { return "\(size) / \(ByteCountFormatter.string(fromByteCount: item.expected, countStyle: .file))" }
+            return size
+        case .finished: return "完了・\(size)"
+        case .failed(let why): return "失敗: \(why)\(item.resumeData != nil ? "（途中から再開できます）" : "")"
+        case .cancelled: return "取り消しました"
+        }
+    }
+}
+
+/// 共有シート（「ファイル」に保存・ほかのアプリで開く など）
+struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }

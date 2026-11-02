@@ -78,6 +78,8 @@ final class DevLog: @unchecked Sendable {
         counts[level, default: 0] += 1
         dirty = true
         lock.unlock()
+        // 落ちたときのために、すぐファイルにも書く（CrashLog.start の前は何もしない）
+        CrashLog.writeLine(e.line)
     }
 
     /// 古い順に全部

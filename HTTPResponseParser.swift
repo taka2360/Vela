@@ -11,6 +11,9 @@ import Foundation
 //  ・chunked: サイズは 16 進の数字だけ。チャンクの後ろは必ず CRLF。行・トレーラーの長さに上限
 //  ・ヘッダの合計・1 行・行数に上限。中身は limits.maxBody まで
 // 止めた接続は使い回さない（呼ぶ側の HTTPConn が閉じる）
+//
+// 流す形（ストリーミング）: ヘッダを読んだところで decideStreaming が true を返したら、中身は貯めずに
+// 届いた分ずつ onChunk に渡す（大きいファイル・動画でメモリを使わない）。そのときは maxBody の上限はかけない
 
 final class ResponseParser {
     struct Limits {
@@ -45,8 +48,16 @@ final class ResponseParser {
     private(set) var received = 0
     /// おかしな返事だった（nil なら問題なし）
     private(set) var failure: Failure?
-    /// 中身が増えたとき（増えたバイト数）。アプリ全体の貯めている量を数えるのに使う
+    /// 中身が増えたとき（増えたバイト数）。アプリ全体の貯めている量を数えるのに使う（流す形のときは呼ばない）
     var onBodyGrow: ((Int) -> Void)?
+    /// ヘッダを読み終えたとき（100 Continue などを除く）。true を返すと、中身を流す形にする
+    var decideStreaming: (() -> Bool)?
+    /// 流す形のときの中身（届いた分ずつ）
+    var onChunk: ((Data) -> Void)?
+    /// 流す形にしたか
+    private(set) var streaming = false
+    /// 受け取った中身のバイト数（流す形でも数える）
+    private(set) var bodyCount = 0
 
     private var head = [UInt8]()
     private var headDone = false
@@ -106,11 +117,17 @@ final class ResponseParser {
 
     private func appendBody<C: Collection>(_ b: C) where C.Element == UInt8 {
         if b.isEmpty { return }
+        if streaming {
+            bodyCount += b.count
+            onChunk?(Data(b))
+            return
+        }
         if body.count + b.count > limits.maxBody {
             fail(.tooLarge("中身が \(limits.maxBody >> 20)MB を超えています"))
             return
         }
         body.append(contentsOf: b)
+        bodyCount += b.count
         onBodyGrow?(b.count)
     }
 
@@ -156,12 +173,13 @@ final class ResponseParser {
             length = n
         }
         if isHead || status == 204 || status == 304 { complete = true; return }
+        streaming = decideStreaming?() ?? false
         if !te.isEmpty {
             let codings = te.joined(separator: ",").lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
             if codings.last == "chunked" { mode = .chunked }
             else { mode = .untilClose; keepAlive = false }          // chunked で終わらないなら、閉じるまで（RFC 9112 6.3）
         } else if let n = length {
-            if n > limits.maxBody { fail(.tooLarge("Content-Length が \(limits.maxBody >> 20)MB を超えています（\(n)）")); return }
+            if n > limits.maxBody && !streaming { fail(.tooLarge("Content-Length が \(limits.maxBody >> 20)MB を超えています（\(n)）")); return }
             mode = .length(n)
             if n == 0 { complete = true }
         } else {
@@ -176,9 +194,9 @@ final class ResponseParser {
             appendBody(b)
             return []
         case .length(let n):
-            let take = min(max(n - body.count, 0), b.count)
+            let take = min(max(n - bodyCount, 0), b.count)
             appendBody(b[0..<take])
-            if body.count >= n { complete = true }
+            if bodyCount >= n { complete = true }
             return Array(b[take...])
         case .chunked:
             var i = 0
@@ -207,7 +225,7 @@ final class ResponseParser {
                         guard !sizeText.isEmpty, sizeText.count <= 16, sizeText.allSatisfy({ $0.isHexDigit }), let n = Int(sizeText, radix: 16) else {
                             fail(.malformed("チャンクのサイズが不正: \(sizeText.prefix(20))")); break
                         }
-                        if n > limits.maxBody - body.count { fail(.tooLarge("チャンクが大きすぎます（\(n)）")); break }
+                        if !streaming && n > limits.maxBody - body.count { fail(.tooLarge("チャンクが大きすぎます（\(n)）")); break }
                         chunk = n == 0 ? .trailer : .data(n)
                     }
                 case .data(let remain):

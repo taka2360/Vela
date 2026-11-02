@@ -45,6 +45,12 @@ final class BrowserTab: ObservableObject, Identifiable {
     /// 休止中のときの、戻る/進むの履歴（WKWebView.interactionState）と開く URL
     private var savedState: Data?
     private var pendingURL: URL?
+    /// 標準の通信のときのエラーページのボタンの合言葉（VNet のときは VNetScheme が持つ）
+    private let pageActions = PageActions()
+    /// HTTPS-First（標準の通信）: https に上げて試している元の http の URL
+    private var httpsFirstFrom: URL?
+    /// HTTPS-First で「http のまま開く」を選んだホスト
+    private var httpAllowedHosts = Set<String>()
 
     init(id: Int, store: BrowserStore, mode: NetMode) {
         self.id = id
@@ -128,6 +134,16 @@ final class BrowserTab: ObservableObject, Identifiable {
             let s = VNetScheme()
             s.machine = store.machine
             s.hsts = store.hsts
+            s.httpsFirst = VelaSettings.httpsFirst
+            s.httpAllowedHosts = httpAllowedHosts
+            s.onTopLevelFailure = { [weak self] u, e in
+                let tab = self
+                Task { @MainActor in tab?.vnetFailed(u, e) }
+            }
+            s.onDownloadStarted = { [weak self] dl in
+                let tab = self
+                Task { @MainActor in tab?.registerVNetDownload(dl) }
+            }
             let tabID = id
             let lb = store.logs
             s.log = { m in lb.add(m, tab: tabID) }
@@ -289,9 +305,10 @@ final class BrowserTab: ObservableObject, Identifiable {
     func go(to item: WKBackForwardListItem) { webView?.go(to: item) }
 
     /// 通信の作りを変える（同じ URL で WebView を作り直す）
-    func switchMode(to m: NetMode) {
-        guard m != mode else { return }
-        let u = url
+    /// 通信の作りを変える（同じ URL か、target で開き直す）
+    func switchMode(to m: NetMode, url target: URL? = nil) {
+        guard m != mode else { if let target { load(target, userInitiated: true) }; return }
+        let u = target ?? url
         log("通信を \(mode.rawValue) → \(m.rawValue) に切り替えます")
         tearDownWebView()
         savedState = nil
@@ -317,6 +334,105 @@ final class BrowserTab: ObservableObject, Identifiable {
         savedState = s.state
         pendingURL = url
         state = .suspended
+    }
+
+    /// エラーページのボタン
+    private func pageAction(_ item: PageActions.Item) {
+        switch item.action {
+        case "retry":
+            load(item.url, userInitiated: true)
+        case "openNative":
+            log("標準の通信で開き直します（ユーザーの操作）")
+            switchMode(to: .native, url: item.url)
+        case "openHTTP":
+            if let h = item.url.host?.lowercased() {
+                httpAllowedHosts.insert(h)
+                scheme?.httpAllowedHosts.insert(h)
+            }
+            log("http のまま開きます: \(item.url.absoluteString)", category: .security)
+            // VNet の http（80 番）は今の環境では 400 にされるので、標準の通信で開く
+            if mode.usesVNet { switchMode(to: .native, url: item.url) } else { load(item.url, userInitiated: true) }
+        case "allowLocalNetwork":
+            log("🛡 LAN の確認: ユーザーが許可しました → \(item.url.absoluteString)", category: .security)
+            load(item.url, userInitiated: true)
+        default:
+            break
+        }
+    }
+
+    /// VNet でページ本体を読めなかった。設定で選んであれば、標準の通信に自動で切り替える
+    private func vnetFailed(_ u: URL, _ e: FetchError) {
+        let kinds: Set<FetchError.Kind> = [.tls, .tlsVersion, .connect, .timeout, .reset, .malformed, .notReady]
+        guard VelaSettings.autoFallbackToNative, mode.usesVNet, kinds.contains(e.kind) else { return }
+        log("VNet で読めなかったので、標準の通信に自動で切り替えます（\(e.kind.rawValue)）", level: .warning)
+        switchMode(to: .native, url: u)
+    }
+
+    // MARK: 標準の通信のエラー・HTTPS-First
+
+    /// HTTPS-First（標準の通信）: ページを開く http:// を https に上げるなら、その URL
+    func httpsFirstUpgrade(_ u: URL) -> URL? {
+        guard VelaSettings.httpsFirst, mode == .native, u.scheme?.lowercased() == "http", let h = u.host?.lowercased(),
+              !httpAllowedHosts.contains(h), !SiteUtil.isIPLiteral(h), LocalNetworkPolicy.classify(host: h) == nil, u.port == nil,
+              var c = URLComponents(url: u, resolvingAgainstBaseURL: false) else { return nil }
+        c.scheme = "https"
+        httpsFirstFrom = u
+        log("🔒 HTTPS-First: \(u.absoluteString) → https", category: .security)
+        return c.url
+    }
+
+    func didCommitNavigation() {
+        httpsFirstFrom = nil
+        syncFromWebView()
+    }
+
+    /// WebKit（標準の通信など）が読めなかった: エラーページを出す
+    func showLoadError(_ error: Error) {
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled { return }      // 取り消し（次の移動など）
+        if ns.domain == "WebKitErrorDomain" && (ns.code == 102 || ns.code == 204) { return } // ダウンロードに変わった など
+        guard let wv = webView else { return }
+        let failing = (ns.userInfo[NSURLErrorFailingURLErrorKey] as? URL) ?? url
+        guard let f = failing.flatMap({ VNetURL.toReal($0) }) else { return }
+        let html: String
+        if let http = httpsFirstFrom, f.host?.lowercased() == http.host?.lowercased() {
+            html = ErrorPage.html(title: "https では開けませんでした", lines: [
+                "\(http.host ?? "") は、安全な接続（https）に対応していないようです。",
+                "http のまま開くと、通信の中身を途中で見られたり、書き換えられたりする可能性があります。"],
+                detail: "\(f.absoluteString)\n\(ns.localizedDescription)",
+                buttons: [ErrorPage.Button(label: "http のまま開く", nonce: pageActions.make("openHTTP", url: http), primary: false),
+                          ErrorPage.Button(label: "再試行", nonce: pageActions.make("retry", url: f), primary: true)],
+                kind: "httpsFirst")
+            httpsFirstFrom = nil
+        } else {
+            let d = ErrorPage.describe(nsErrorCode: ns.code, domain: ns.domain, message: ns.localizedDescription)
+            html = ErrorPage.html(title: d.title, lines: [d.hint, f.absoluteString], detail: "\(ns.domain) \(ns.code): \(ns.localizedDescription)",
+                                  buttons: [ErrorPage.Button(label: "再試行", nonce: pageActions.make("retry", url: f), primary: true)],
+                                  kind: "\(ns.domain)/\(ns.code)")
+        }
+        wv.loadHTMLString(html, baseURL: f)
+    }
+
+    // MARK: ダウンロード
+
+    func adoptDownload(_ d: WKDownload, source: URL?) {
+        store?.downloads.adopt(d, source: source ?? url)
+    }
+
+    /// VNet が自分で書き始めたダウンロードを一覧に入れる
+    func registerVNetDownload(_ dl: VNetDownload) {
+        let src = dl.source
+        store?.downloads.register(dl) { [weak self] in self?.startDownload(src) }
+    }
+
+    /// URL をダウンロードする。VNet のタブは VNet で（WebKit の WKDownload は VNet の読み込みで落ちるため）、標準の通信は WebKit で
+    func startDownload(_ u: URL) {
+        let s = u.scheme?.lowercased() ?? ""
+        if mode.usesVNet, s == "http" || s == "https", let scheme {
+            scheme.startDownload(url: u, referer: url)
+        } else if let wv = webView {
+            wv.startDownload(using: URLRequest(url: u)) { [weak self] d in self?.adoptDownload(d, source: u) }
+        }
     }
 
     // MARK: WebKit からの知らせ（TabWebDelegate から）
@@ -361,14 +477,14 @@ final class BrowserTab: ObservableObject, Identifiable {
     /// エラーページのボタン・守りのスクリプトからの知らせ
     private func handleAction(_ body: [String: Any], isMainFrame: Bool, origin: String) {
         switch body["action"] as? String {
-        case "allowLocalNetwork":
-            // 確認のページ（メインフレーム）からの、合言葉の合っている知らせだけを受け付ける
-            guard isMainFrame, let nonce = body["nonce"] as? String, let u = scheme?.consumeConsent(nonce) else {
-                log("🛡 LAN の確認: 受け付けない知らせです（\(origin)）", category: .security)
+        case "page":
+            // エラーページ・確認のページ（メインフレーム）からの、合言葉の合っている知らせだけを受け付ける
+            guard isMainFrame, let nonce = body["nonce"] as? String,
+                  let item = scheme?.actions.consume(nonce) ?? pageActions.consume(nonce) else {
+                log("🛡 ページのボタン: 受け付けない知らせです（\(origin)）", category: .security)
                 return
             }
-            log("🛡 LAN の確認: ユーザーが許可しました → \(u.absoluteString)", category: .security)
-            load(u, userInitiated: true)
+            pageAction(item)
         case "blockedWebSocket":
             log("🛡 LAN の保護: WebSocket を止めました（\(origin) → \(body["url"] as? String ?? "?")）", category: .security)
         case "usedWebSocket":
@@ -393,9 +509,25 @@ final class TabWebDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
         super.init()
     }
 
-    // リンクを押したとき: vnets:// の作りなら、自作の通信のアドレスに直して開き直す
+    // リンクを押したとき: ダウンロードの指定（<a download>）・HTTPS-First（標準の通信）・vnets:// の作りの読み替え
+    // Objective-C の名前を明示する（Playgrounds のプレビューは関数名を __preview_ に変えるので、2 つの async 版が同じ名前になってぶつかる）
+    @objc(webView:decidePolicyForNavigationAction:decisionHandler:)
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
-        guard let tab, tab.mode == .vnetsLegacy else { return .allow }
+        guard let tab else { return .allow }
+        if navigationAction.shouldPerformDownload {
+            // VNet のタブの http(s) は、WebKit のダウンロードにしない（落ちるため）。VNet で読んでファイルに書く
+            if tab.mode.usesVNet, let u = navigationAction.request.url, let s = u.scheme?.lowercased(), s == "http" || s == "https" {
+                tab.startDownload(VNetURL.toReal(u) ?? u)
+                return .cancel
+            }
+            return .download
+        }
+        let main = navigationAction.targetFrame?.isMainFrame ?? true
+        if main, let u = navigationAction.request.url, let up = tab.httpsFirstUpgrade(u) {
+            webView.load(URLRequest(url: up))
+            return .cancel
+        }
+        guard tab.mode == .vnetsLegacy else { return .allow }
         if let u = navigationAction.request.url, let s = u.scheme?.lowercased(), s == "http" || s == "https",
            navigationAction.targetFrame?.isMainFrame ?? true, let v = VNetURL.toVNet(u) {
             webView.load(URLRequest(url: v))
@@ -409,7 +541,34 @@ final class TabWebDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-        tab?.syncFromWebView()
+        tab?.didCommitNavigation()
+    }
+
+    /// 表示できない種類（zip・PDF の一部など）や「添付ファイル」の指定なら、ダウンロードにする
+    @objc(webView:decidePolicyForNavigationResponse:decisionHandler:)
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse) async -> WKNavigationResponsePolicy {
+        var attachment = false
+        if let http = navigationResponse.response as? HTTPURLResponse {
+            // 204 No Content: 移動しない（VNet がダウンロードに変えたときにも返す。ここでダウンロードを始めると二重になる）
+            if http.statusCode == 204 { return .cancel }
+            let cd = http.allHeaderFields.first { ($0.key as? String)?.lowercased() == "content-disposition" }?.value as? String
+            if let cd, cd.lowercased().hasPrefix("attachment") { attachment = true }
+        }
+        guard attachment || !navigationResponse.canShowMIMEType else { return .allow }
+        // VNet のタブ: WebKit のダウンロードにはしない（VNetScheme の読み込みを変えると落ちる）。止めて、VNet で読み直してファイルに書く
+        if let tab, tab.mode.usesVNet, let u = navigationResponse.response.url {
+            tab.startDownload(VNetURL.toReal(u) ?? u)
+            return .cancel
+        }
+        return .download
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        tab?.adoptDownload(download, source: navigationAction.request.url)
+    }
+
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        tab?.adoptDownload(download, source: navigationResponse.response.url)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -424,6 +583,7 @@ final class TabWebDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         tab?.navigationEvent("✕ 読み込みに失敗: \(error.localizedDescription)", level: .error)
+        tab?.showLoadError(error)
         tab?.syncFromWebView()
     }
 

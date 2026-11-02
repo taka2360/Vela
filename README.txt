@@ -20,16 +20,16 @@ Android エミュレータと同じ「仮想 LAN カード（virtio-net）」と
 1. 新しい「App」を作る
 2. 最初からある ContentView.swift と MyApp.swift を消す（または中身をこのフォルダのものに入れ替える）
 3. このフォルダの .swift ファイルを全部入れる
-   画面: MyApp / BrowserView / TabViews / DevPanel / BrowserStore / BrowserTab / AddressInput / Persistence / DevLog
+   画面: MyApp / BrowserView / TabViews / DevPanel / Downloads / DownloadFiles / BrowserStore / BrowserTab / AddressInput / ErrorPages / Persistence / DevLog / CrashLog
    VNet と WebKit: VNetScheme / HTTPSTakeover / PageScripts
    守り: NetPolicy / CookieJar / HSTSStore
    http: HTTPClient / HTTPResponseParser / HTTPSupport / TLSClient
    TCP/IP: GuestStack / GuestTCP / DNSMessage / Packet
    カード: VNetMachine / VNetCore / VNetDriver
    ルーター: UserNet / UserNetApple
-   （全部で 28 ファイル。まとめたものを使うなら VelaParts フォルダの Vela1〜6.swift の 6 つだけを入れる）
+   （全部で 32 ファイル。まとめたものを使うなら VelaParts フォルダの Vela1〜10.swift の 10 個だけを入れる）
    ※ 1 つにまとめた VelaAll.swift は大きすぎて、Playgrounds が「Timed out waiting for a thunk to build after 30.0 seconds」
-     で止まることがあります（1 つのファイルを作るのに 30 秒を超える）。そのときは VelaParts の 6 つを使ってください
+     で止まることがあります（1 つのファイルを作るのに 30 秒を超える）。そのときは VelaParts の 10 個を使ってください
 4. 実行して、アドレスに https://example.com/ などを入れて「開く」
 
 メモ
@@ -41,6 +41,12 @@ Android エミュレータと同じ「仮想 LAN カード（virtio-net）」と
   読んでいる途中の合計が 128MB を超えたら新しい要求を待たせます。接続は同じ相手に 6 本・全部で 32 本まで
 ・ページの読み込みをやめたら（WebKit が止めたら）、裏の通信も止めます
 ・TCP は、順番を飛ばして届いた分を取っておき、送り直しで重なった分は外して受け取ります
+・返事は流す形で WebKit に渡します（ヘッダが来たらすぐ渡し、中身は届いた分ずつ。大きいファイル・動画でもメモリにためない）
+・HTTPS-First: ページを開く http:// は、まず https で試します。だめなら「http のまま開く」を出します（設定で切れます）
+・読めなかったときは、原因と「再試行」「標準の通信で開く」のボタンを出します。設定で、標準の通信へ自動で切り替えることもできます
+・ダウンロードは Documents/Downloads に保存します。ツールバーのボタンから、進み具合・取り消し・共有（「ファイル」に保存など）ができます
+  VNet のタブでは、WebKit のダウンロード（WKDownload）を使わずに VNet が自分でファイルに書きます
+  （VNet が引き受けた読み込みを WebKit がダウンロードに変えると、アプリが落ちたため）。途中からの再開はできず、やり直しは最初からです
 
 VNet の対応範囲
   VNet が読むもの: ページ本体と部品の http / https（HTTP/1.1）、fetch・XMLHttpRequest、リダイレクト

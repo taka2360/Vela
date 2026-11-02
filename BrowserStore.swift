@@ -1,5 +1,6 @@
 import SwiftUI
 import WebKit
+import Network
 
 // MARK: - アプリ全体（タブ・共有の部品・保存）
 //
@@ -63,6 +64,14 @@ final class BrowserStore: ObservableObject {
     @Published private(set) var vnetStatus = "準備中…"
     /// 開発者パネルのログ（パネルを開いている間だけ更新する）
     @Published private(set) var logText = ""
+    @Published var showDownloads = false
+    /// 前回は落ちて終わった（開発者パネルで前回の記録を見られる）
+    @Published private(set) var hadCrash = false
+    /// ネットワークにつながっているか（NWPathMonitor）
+    @Published private(set) var isOnline = true
+    /// ダウンロード
+    let downloads = DownloadManager()
+    private let pathMonitor = NWPathMonitor()
 
     let machine = VNetMachine(factory: NWUserNetFactory())
     /// Cookie の写し（正本は WebKit の置き場）
@@ -103,7 +112,12 @@ final class BrowserStore: ObservableObject {
     private func setUp() {
         if didSetUp { return }
         didSetUp = true
+        CrashLog.start()
         let lb = logs
+        if let crash = CrashLog.previousCrashSummary() {
+            logs.add("⚠️ 前回は落ちて終わりました: \(crash)（開発者パネルの「前回の記録」で、落ちる前のログが見られます）", level: .error, category: .app)
+            hadCrash = true
+        }
         takeover = HTTPSTakeover.install()
         if takeover == .installed { defaultMode = .vnetDirect }
         else if VelaSettings.legacyVNetsFallback && !VelaSettings.vnetDisabled { defaultMode = .vnetsLegacy }
@@ -129,6 +143,18 @@ final class BrowserStore: ObservableObject {
         }
         if VelaSettings.localNetworkProtection { compileLocalNetworkRules() } else { logs.add("⚠️ LAN の保護は切ってあります") }
         if defaultMode == .vnetsLegacy { compileVNetOnlyRules() }
+
+        downloads.log = { s in lb.add(s, level: .info, category: .download) }
+        downloads.webViewForResume = { [weak self] in self?.selectedTab?.webView }
+        downloads.loadExisting()
+
+        // ネットワークの様子（つながっていないときは帯を出す）
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let online = path.status == .satisfied
+            let store = self
+            Task { @MainActor in store?.setOnline(online) }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "vela-path"))
 
         restoreSession()
         if tabs.isEmpty { newTab(url: nil) }
@@ -347,6 +373,12 @@ final class BrowserStore: ObservableObject {
     }
 
     // MARK: 様子
+
+    private func setOnline(_ online: Bool) {
+        if online == isOnline { return }
+        isOnline = online
+        logs.add(online ? "ネットワークにつながりました" : "⚠️ ネットワークにつながっていません", level: online ? .info : .warning, category: .app)
+    }
 
     private func refreshStatus() {
         guard defaultMode.usesVNet || tabs.contains(where: { $0.mode.usesVNet }) else {

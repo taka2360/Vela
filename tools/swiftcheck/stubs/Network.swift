@@ -89,3 +89,20 @@ public final class NWConnection {
                         completion: @escaping (Data?, ContentContext?, Bool, NWError?) -> Void) {}
     public func receiveMessage(completion: @escaping (Data?, ContentContext?, Bool, NWError?) -> Void) {}
 }
+
+// MARK: - ネットワークの様子
+
+public struct NWPath: Sendable {
+    public enum Status: Sendable { case satisfied, unsatisfied, requiresConnection }
+    public var status: Status { .satisfied }
+    public var isExpensive: Bool { false }
+    public var isConstrained: Bool { false }
+}
+
+public final class NWPathMonitor: @unchecked Sendable {
+    public init() {}
+    public var pathUpdateHandler: (@Sendable (NWPath) -> Void)?
+    public var currentPath: NWPath { NWPath() }
+    public func start(queue: DispatchQueue) {}
+    public func cancel() {}
+}

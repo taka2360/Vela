@@ -1,13 +1,14 @@
 // このファイルは merge_swift.py で自動生成したものです（直接編集しないでください）
-// 元ファイル: MyApp.swift, BrowserView.swift, TabViews.swift, DevPanel.swift, BrowserStore.swift, BrowserTab.swift, AddressInput.swift, Persistence.swift, DevLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
+// 元ファイル: MyApp.swift, BrowserView.swift, TabViews.swift, DevPanel.swift, Downloads.swift, DownloadFiles.swift, BrowserStore.swift, BrowserTab.swift, AddressInput.swift, ErrorPages.swift, Persistence.swift, DevLog.swift, CrashLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
 
 import SwiftUI
 import WebKit
 import Foundation
-import ObjectiveC
+import Network
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+import ObjectiveC
 #if canImport(Compression)
 import Compression
 #endif
@@ -53,6 +54,9 @@ struct BrowserView: View {
             if store.tabs.count > 1 {
                 TabStrip(store: store)
             }
+            if !store.isOnline {
+                OfflineBanner()
+            }
             Divider()
             PageArea(store: store)
         }
@@ -77,6 +81,7 @@ struct TopBar: View {
                 NavButtons(tab: tab)
                 AddressField(store: store, tab: tab)
                 ReloadButton(tab: tab)
+                DownloadsButton(manager: store.downloads, show: $store.showDownloads)
                 MoreMenu(store: store, tab: tab)
                 Button { store.newTab(url: nil) } label: { Image(systemName: "plus") }
                     .keyboardShortcut("t", modifiers: .command)
@@ -88,6 +93,22 @@ struct TopBar: View {
             LoadingBar(progress: tab.progress, visible: tab.isLoading)
         }
         .background(Color(UIColor.secondarySystemBackground))
+        .sheet(isPresented: $store.showDownloads) { DownloadsView(manager: store.downloads) }
+    }
+}
+
+/// ネットワークにつながっていないときの帯
+struct OfflineBanner: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "wifi.slash")
+            Text("ネットワークにつながっていません")
+        }
+        .font(.system(size: 13, weight: .semibold))
+        .foregroundColor(.white)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 5)
+        .background(Color.orange)
     }
 }
 
@@ -523,6 +544,10 @@ struct DevPanel: View {
                 Text("開発者パネル").font(.headline)
                 Spacer()
                 Button("ログをコピー") { UIPasteboard.general.string = store.logs.export() }
+                Button(store.hadCrash ? "前回の記録をコピー（落ちた）" : "前回の記録をコピー") {
+                    UIPasteboard.general.string = CrashLog.previous() ?? "（前回の記録はありません）"
+                }
+                .padding(.leading, 12)
                 Button("閉じる") { dismiss() }.padding(.leading, 12)
             }
             DevStatus(store: store)
@@ -543,6 +568,7 @@ struct DevStatus: View {
             Text("VNet: \(store.vnetStatus)")
             Text("タブ \(store.tabs.count) 枚・動いている WebView \(store.liveWebViewCount) / \(BrowserStore.maxLiveWebViews)")
             Text("Cookie（写し）\(store.cookieJar.count) 個・HSTS \(store.hsts.all().count) 件")
+            Text("ネットワーク: \(store.isOnline ? "つながっている" : "つながっていない")・ダウンロード中 \(store.downloads.runningCount) 件")
         }
         .font(.system(size: 12, design: .monospaced))
     }
@@ -587,6 +613,565 @@ struct DevLogView: View {
             .background(Color.black)
             .clipShape(RoundedRectangle(cornerRadius: 6))
             .onChange(of: text) { _ in proxy.scrollTo("end", anchor: .bottom) }
+        }
+    }
+}
+
+// ======================================================================
+// MARK: - Downloads.swift
+// ======================================================================
+
+// MARK: - ダウンロード
+//
+// ・WebKit の WKDownload を使う（VNet のタブでも標準の通信のタブでも同じ。VNet は返事を流す形で渡すので、大きいファイルでもメモリにためない）
+// ・保存先は Documents/Downloads（同じ名前があれば「名前 (2).zip」のようにする）
+// ・進み具合は 0.5 秒ごとに見る。取り消し・やり直し（途中から: resumeData）・共有（「ファイル」に保存など）・削除ができる
+// ・起動したときに、前にダウンロードしたファイルを一覧に戻す
+
+@MainActor
+final class DownloadItem: ObservableObject, Identifiable {
+    enum State: Equatable {
+        case running
+        case finished
+        case failed(String)
+        case cancelled
+    }
+
+    let id = UUID()
+    @Published var filename: String
+    @Published var received: Int64 = 0
+    @Published var expected: Int64 = -1
+    @Published var state = State.running
+    @Published var fileURL: URL?
+    let source: URL?
+    var download: WKDownload?
+    var resumeData: Data?
+    /// VNet が自分で書いているダウンロード（VNet のタブ）
+    var vnet: VNetDownload?
+    /// やり直すとき（VNet のダウンロードは、同じ URL をもう一度 VNet で読む）
+    var restart: (() -> Void)?
+
+    /// VNet のダウンロードの様子を写す
+    func syncVNet() {
+        guard let v = vnet else { return }
+        received = v.received
+        switch v.state {
+        case .running: state = .running
+        case .finished: state = .finished; expected = received
+        case .cancelled: state = .cancelled
+        case .failed(let why): state = .failed(why)
+        }
+    }
+
+    init(filename: String, source: URL?) {
+        self.filename = filename
+        self.source = source
+    }
+
+    var fraction: Double? { expected > 0 ? min(1, Double(received) / Double(expected)) : nil }
+}
+
+@MainActor
+final class DownloadManager: NSObject, ObservableObject, WKDownloadDelegate {
+    @Published private(set) var items: [DownloadItem] = []
+    /// ログ（どのスレッドからでもよい）
+    var log: (@Sendable (String) -> Void)?
+    /// やり直し（途中から）に使う WebView を返す
+    var webViewForResume: (() -> WKWebView?)?
+    private var timer: Timer?
+
+    /// BrowserStore の nonisolated init から作られるので、ここでは何もしない（準備は loadExisting）
+    nonisolated override init() {
+        super.init()
+    }
+
+    var runningCount: Int { items.filter { $0.state == .running }.count }
+
+    nonisolated static var folder: URL { DownloadFiles.folder }
+
+    /// 前にダウンロードしたファイルを一覧に入れる（新しい順）
+    func loadExisting() {
+        let fm = FileManager.default
+        let files = (try? fm.contentsOfDirectory(at: DownloadManager.folder, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        let sorted = files.sorted { a, b in
+            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return da > db
+        }
+        for f in sorted where !f.lastPathComponent.hasPrefix(".") {
+            let item = DownloadItem(filename: f.lastPathComponent, source: nil)
+            item.fileURL = f
+            item.state = .finished
+            let size = (try? fm.attributesOfItem(atPath: f.path)[.size] as? NSNumber)?.int64Value ?? 0
+            item.received = size
+            item.expected = size
+            items.append(item)
+        }
+    }
+
+    /// WebKit がダウンロードに変えたものを受け取る
+    func adopt(_ d: WKDownload, source: URL?) {
+        let item = DownloadItem(filename: source?.lastPathComponent ?? "download", source: source)
+        item.download = d
+        d.delegate = self
+        items.insert(item, at: 0)
+        log?("⬇︎ ダウンロード開始: \(source?.absoluteString ?? "?")")
+        startTimer()
+    }
+
+    /// VNet が自分で書き始めたダウンロードを一覧に入れる
+    func register(_ dl: VNetDownload, restart: (() -> Void)?) {
+        let item = DownloadItem(filename: dl.fileURL.lastPathComponent, source: dl.source)
+        item.vnet = dl
+        item.fileURL = dl.fileURL
+        item.expected = dl.expected
+        item.restart = restart
+        dl.onChange = { [weak item] in
+            let it = item
+            Task { @MainActor in it?.syncVNet() }
+        }
+        items.insert(item, at: 0)
+        item.syncVNet()
+        log?("⬇︎ ダウンロード開始（VNet）: \(dl.source.absoluteString)")
+    }
+
+    private func item(for d: WKDownload) -> DownloadItem? { items.first { $0.download === d } }
+
+    // MARK: WKDownloadDelegate
+
+    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String) async -> URL? {
+        let url = DownloadFiles.uniqueURL(for: suggestedFilename)
+        if let item = item(for: download) {
+            item.filename = url.lastPathComponent
+            item.fileURL = url
+            item.expected = response.expectedContentLength
+        }
+        return url
+    }
+
+    func downloadDidFinish(_ download: WKDownload) {
+        guard let item = item(for: download) else { return }
+        item.state = .finished
+        if let f = item.fileURL, let size = (try? FileManager.default.attributesOfItem(atPath: f.path)[.size] as? NSNumber)?.int64Value {
+            item.received = size
+            item.expected = size
+        }
+        item.download = nil
+        log?("⬇︎ ダウンロード完了: \(item.filename)（\(item.received / 1024)KB）")
+    }
+
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        guard let item = item(for: download) else { return }
+        item.resumeData = resumeData
+        item.download = nil
+        if item.state == .cancelled { return }
+        item.state = .failed(error.localizedDescription)
+        log?("⬇︎✕ ダウンロード失敗: \(item.filename)：\(error.localizedDescription)\(resumeData != nil ? "（途中から再開できます）" : "")")
+    }
+
+    // MARK: 操作
+
+    func cancel(_ item: DownloadItem) {
+        if let v = item.vnet {
+            item.state = .cancelled
+            v.cancel()
+            log?("⬇︎ ダウンロードを取り消しました: \(item.filename)")
+            return
+        }
+        guard let d = item.download else { return }
+        item.state = .cancelled
+        d.cancel { [weak item] data in
+            item?.resumeData = data
+        }
+        log?("⬇︎ ダウンロードを取り消しました: \(item.filename)")
+    }
+
+    /// やり直す（途中までのデータがあれば、そこから）
+    func retry(_ item: DownloadItem) {
+        if item.vnet != nil {
+            let again = item.restart
+            remove(item)
+            again?()
+            return
+        }
+        if let data = item.resumeData, let wv = webViewForResume?() {
+            item.state = .running
+            item.resumeData = nil
+            wv.resumeDownload(fromResumeData: data) { [weak self, weak item] d in
+                guard let self, let item else { return }
+                item.download = d
+                d.delegate = self
+                self.startTimer()
+            }
+            log?("⬇︎ 途中から再開します: \(item.filename)")
+        } else if let src = item.source, let wv = webViewForResume?() {
+            remove(item)
+            wv.startDownload(using: URLRequest(url: src)) { [weak self] d in
+                self?.adopt(d, source: src)
+            }
+        }
+    }
+
+    /// 一覧から外して、ファイルも消す
+    func remove(_ item: DownloadItem) {
+        if item.state == .running { cancel(item) }
+        if let f = item.fileURL { try? FileManager.default.removeItem(at: f) }
+        items.removeAll { $0 === item }
+    }
+
+    func clearFinished() {
+        items.removeAll { $0.state != .running }
+    }
+
+    private func startTimer() {
+        if timer != nil { return }
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            let me = self
+            Task { @MainActor in me?.tick() }
+        }
+    }
+
+    private func tick() {
+        var running = false
+        for item in items where item.state == .running {
+            guard let d = item.download else { continue }
+            running = true
+            item.received = d.progress.completedUnitCount
+            if d.progress.totalUnitCount > 0 { item.expected = d.progress.totalUnitCount }
+        }
+        if !running { timer?.invalidate(); timer = nil }
+    }
+}
+
+// MARK: - 画面
+
+/// ツールバーのダウンロードのボタン（ダウンロードがあるときだけ出す）
+struct DownloadsButton: View {
+    @ObservedObject var manager: DownloadManager
+    @Binding var show: Bool
+
+    var body: some View {
+        if !manager.items.isEmpty {
+            Button { show = true } label: {
+                Image(systemName: manager.runningCount > 0 ? "arrow.down.circle.fill" : "arrow.down.circle")
+            }
+        }
+    }
+}
+
+struct DownloadsView: View {
+    @ObservedObject var manager: DownloadManager
+    @Environment(\.dismiss) private var dismiss
+    @State private var sharing: URL?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("ダウンロード").font(.headline)
+                Spacer()
+                Button("終わったものを一覧から外す") { manager.clearFinished() }
+                Button("閉じる") { dismiss() }.padding(.leading, 12)
+            }
+            .padding()
+            ScrollView {
+                LazyVStack(spacing: 10) {
+                    ForEach(manager.items) { item in
+                        DownloadRow(manager: manager, item: item) { sharing = $0 }
+                    }
+                }
+                .padding(.horizontal)
+            }
+        }
+        .sheet(isPresented: Binding(get: { sharing != nil }, set: { if !$0 { sharing = nil } })) {
+            if let u = sharing { ShareSheet(items: [u]) }
+        }
+    }
+}
+
+struct DownloadRow: View {
+    @ObservedObject var manager: DownloadManager
+    @ObservedObject var item: DownloadItem
+    let share: (URL) -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "doc").font(.system(size: 24)).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(item.filename).lineLimit(1)
+                if item.state == .running {
+                    ProgressView(value: item.fraction ?? 0)
+                }
+                Text(statusText).font(.system(size: 12)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            buttons
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color(UIColor.secondarySystemBackground)))
+    }
+
+    @ViewBuilder private var buttons: some View {
+        switch item.state {
+        case .running:
+            Button { manager.cancel(item) } label: { Image(systemName: "xmark.circle") }
+        case .finished:
+            if let f = item.fileURL {
+                Button { share(f) } label: { Image(systemName: "square.and.arrow.up") }
+            }
+            Button { manager.remove(item) } label: { Image(systemName: "trash") }
+        case .failed, .cancelled:
+            Button { manager.retry(item) } label: { Image(systemName: "arrow.clockwise") }
+            Button { manager.remove(item) } label: { Image(systemName: "trash") }
+        }
+    }
+
+    private var statusText: String {
+        let size = ByteCountFormatter.string(fromByteCount: item.received, countStyle: .file)
+        switch item.state {
+        case .running:
+            if item.expected > 0 { return "\(size) / \(ByteCountFormatter.string(fromByteCount: item.expected, countStyle: .file))" }
+            return size
+        case .finished: return "完了・\(size)"
+        case .failed(let why): return "失敗: \(why)\(item.resumeData != nil ? "（途中から再開できます）" : "")"
+        case .cancelled: return "取り消しました"
+        }
+    }
+}
+
+/// 共有シート（「ファイル」に保存・ほかのアプリで開く など）
+struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+
+// ======================================================================
+// MARK: - DownloadFiles.swift
+// ======================================================================
+
+// MARK: - ダウンロードのファイル（UI・WebKit に頼らない部分。Linux でテストする）
+//
+// ・VNet のタブのダウンロードは、WebKit の WKDownload を使わずに VNet が自分でファイルに書く
+//   （VNetScheme が引き受けた読み込みを WebKit がダウンロードに変えると、iPad でアプリが落ちたため）
+// ・ここには、ダウンロードにするかの判定・ファイル名の決め方・ファイルに書く部品（VNetDownload）を置く
+
+enum DownloadFiles {
+    /// 保存先（Documents/Downloads）
+    static var folder: URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first ?? FileManager.default.temporaryDirectory
+        let dir = docs.appendingPathComponent("Downloads", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// 同じ名前があれば「名前 (2).拡張子」にする
+    static func uniqueURL(for name: String, in dir: URL = folder) -> URL {
+        let safe = sanitize(name)
+        let base = (safe as NSString).deletingPathExtension
+        let ext = (safe as NSString).pathExtension
+        var url = dir.appendingPathComponent(safe)
+        var n = 2
+        while FileManager.default.fileExists(atPath: url.path) {
+            url = dir.appendingPathComponent(ext.isEmpty ? "\(base) (\(n))" : "\(base) (\(n)).\(ext)")
+            n += 1
+        }
+        return url
+    }
+
+    /// ファイル名に使えない文字を外す（パスの区切り・制御文字・先頭の「.」）
+    static func sanitize(_ raw: String) -> String {
+        var s = String(raw.unicodeScalars.map { c -> Character in
+            if c.value < 0x20 || c.value == 0x7F || "/\\:".unicodeScalars.contains(c) { return "_" }
+            return Character(c)
+        })
+        s = s.trimmingCharacters(in: .whitespaces)
+        while s.hasPrefix(".") { s.removeFirst() }
+        if s.count > 200 {
+            let ext = (s as NSString).pathExtension
+            s = String(s.prefix(200 - ext.count - 1)) + (ext.isEmpty ? "" : "." + ext)
+        }
+        return s.isEmpty ? "download" : s
+    }
+
+    /// ページとして表示できる種類か（できないものはダウンロードにする）
+    static func isDisplayable(mime raw: String) -> Bool {
+        let m = raw.split(separator: ";").first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
+        if m.isEmpty { return true }                         // 種類が無い: WebKit に任せる（中身から判断する）
+        for p in ["text/", "image/", "video/", "audio/", "multipart/"] where m.hasPrefix(p) { return true }
+        let shown: Set<String> = ["application/xhtml+xml", "application/xml", "application/json", "application/javascript",
+                                  "application/x-javascript", "application/ecmascript", "application/pdf", "application/rss+xml",
+                                  "application/atom+xml", "application/ld+json", "application/manifest+json",
+                                  "application/vnd.apple.mpegurl", "application/x-mpegurl", "application/dash+xml"]
+        return shown.contains(m)
+    }
+
+    /// この返事をダウンロードにするか（ページ本体の返事のときに使う）
+    static func isDownload(status: Int, headers: [(String, String)]) -> Bool {
+        guard (200...299).contains(status), status != 204 else { return false }
+        if let cd = headers.value(for: "Content-Disposition"), cd.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("attachment") {
+            return true
+        }
+        guard let ct = headers.value(for: "Content-Type") else { return false }
+        return !isDisplayable(mime: ct)
+    }
+
+    /// ファイル名を決める（Content-Disposition の filename* → filename → URL の最後 → "download"。拡張子が無ければ種類から足す）
+    static func filename(contentDisposition: String?, url: URL?, mime: String?) -> String {
+        var name: String?
+        if let cd = contentDisposition {
+            let params = parseParams(cd)
+            if let star = params["filename*"], let v = decodeRFC5987(star), !v.isEmpty { name = v }
+            else if let plain = params["filename"], !plain.isEmpty { name = plain }
+        }
+        if name == nil, let u = url {
+            let last = u.lastPathComponent
+            if !last.isEmpty && last != "/" { name = last.removingPercentEncoding ?? last }
+        }
+        var n = sanitize(name.map { ($0 as NSString).lastPathComponent } ?? "download")
+        if (n as NSString).pathExtension.isEmpty, let ext = mime.flatMap(extensionFor) { n += "." + ext }
+        return n
+    }
+
+    static func extensionFor(mime raw: String) -> String? {
+        let m = raw.split(separator: ";").first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
+        let map = ["application/pdf": "pdf", "application/zip": "zip", "application/json": "json", "text/plain": "txt",
+                   "text/csv": "csv", "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "video/mp4": "mp4",
+                   "audio/mpeg": "mp3", "application/gzip": "gz", "application/x-tar": "tar", "application/epub+zip": "epub"]
+        return map[m]
+    }
+
+    /// 「attachment; filename="a.zip"; filename*=UTF-8''a.zip」を名前 → 値にする（名前は小文字）
+    static func parseParams(_ s: String) -> [String: String] {
+        var out: [String: String] = [:]
+        var i = s.startIndex
+        // 最初の「;」まで（attachment など）は飛ばす
+        guard let semi = s.firstIndex(of: ";") else { return out }
+        i = s.index(after: semi)
+        while i < s.endIndex {
+            while i < s.endIndex && (s[i] == " " || s[i] == ";") { i = s.index(after: i) }
+            guard let eq = s[i...].firstIndex(of: "=") else { break }
+            let key = s[i..<eq].trimmingCharacters(in: .whitespaces).lowercased()
+            i = s.index(after: eq)
+            var value = ""
+            if i < s.endIndex && s[i] == "\"" {
+                i = s.index(after: i)
+                while i < s.endIndex && s[i] != "\"" {
+                    if s[i] == "\\", s.index(after: i) < s.endIndex { i = s.index(after: i) }
+                    value.append(s[i])
+                    i = s.index(after: i)
+                }
+                if i < s.endIndex { i = s.index(after: i) }
+            } else {
+                let end = s[i...].firstIndex(of: ";") ?? s.endIndex
+                value = s[i..<end].trimmingCharacters(in: .whitespaces)
+                i = end
+            }
+            if !key.isEmpty { out[key] = value }
+        }
+        return out
+    }
+
+    /// RFC 5987: 「UTF-8''%E3%81%82.zip」を戻す（UTF-8 と ISO-8859-1 だけ）
+    static func decodeRFC5987(_ v: String) -> String? {
+        let parts = v.split(separator: "'", maxSplits: 2, omittingEmptySubsequences: false)
+        guard parts.count == 3 else { return nil }
+        let charset = parts[0].lowercased()
+        let encoded = String(parts[2])
+        if charset == "utf-8" { return encoded.removingPercentEncoding }
+        if charset == "iso-8859-1" {
+            var bytes: [UInt8] = []
+            var it = encoded.utf8.makeIterator()
+            while let c = it.next() {
+                if c == UInt8(ascii: "%"), let h = it.next(), let l = it.next(), let v = UInt8(String(bytes: [h, l], encoding: .ascii) ?? "", radix: 16) {
+                    bytes.append(v)
+                } else {
+                    bytes.append(c)
+                }
+            }
+            return String(bytes: bytes, encoding: .isoLatin1)
+        }
+        return nil
+    }
+}
+
+/// VNet が自分でファイルに書くダウンロード 1 つ（どのスレッドからでも使える）
+final class VNetDownload: @unchecked Sendable {
+    enum State: Equatable, Sendable {
+        case running, finished, cancelled
+        case failed(String)
+    }
+
+    let source: URL
+    let fileURL: URL
+    let expected: Int64
+    /// 取り消すとき（VNet の要求を止める）。始めた側が入れる
+    var cancelAction: (@Sendable () -> Void)?
+    /// 進み具合・状態が変わったとき（間引いて呼ぶ。どのスレッドから呼ばれるかは決まっていない）
+    var onChange: (@Sendable () -> Void)?
+
+    private let queue = DispatchQueue(label: "vela-download")
+    private let lock = NSLock()
+    private var handle: FileHandle?
+    private var _received: Int64 = 0
+    private var _state = State.running
+    private var lastNotify = Date.distantPast
+
+    /// ファイルを作る。作れなければ nil
+    init?(source: URL, suggestedName: String, expected: Int64, in dir: URL = DownloadFiles.folder) {
+        self.source = source
+        self.expected = expected
+        fileURL = DownloadFiles.uniqueURL(for: suggestedName, in: dir)
+        guard FileManager.default.createFile(atPath: fileURL.path, contents: nil),
+              let h = try? FileHandle(forWritingTo: fileURL) else { return nil }
+        handle = h
+    }
+
+    var received: Int64 { lock.lock(); defer { lock.unlock() }; return _received }
+    var state: State { lock.lock(); defer { lock.unlock() }; return _state }
+
+    func write(_ d: Data) {
+        queue.async {
+            guard let h = self.handle, self.state == .running else { return }
+            h.write(d)
+            self.lock.lock()
+            self._received += Int64(d.count)
+            let now = Date()
+            let notify = now.timeIntervalSince(self.lastNotify) > 0.3
+            if notify { self.lastNotify = now }
+            self.lock.unlock()
+            if notify { self.onChange?() }
+        }
+    }
+
+    /// 最後まで届いた
+    func finish() { end(.finished, removeFile: false) }
+
+    /// 失敗した（途中までのファイルは消す）
+    func fail(_ why: String) { end(.failed(why), removeFile: true) }
+
+    /// ユーザーが取り消した
+    func cancel() {
+        cancelAction?()
+        end(.cancelled, removeFile: true)
+    }
+
+    /// 書き終わるまで待つ（テスト用）
+    func waitUntilIdle() { queue.sync {} }
+
+    private func end(_ s: State, removeFile: Bool) {
+        queue.async {
+            self.lock.lock()
+            if self._state != .running { self.lock.unlock(); return }
+            self._state = s
+            self.lock.unlock()
+            try? self.handle?.close()
+            self.handle = nil
+            if removeFile { try? FileManager.default.removeItem(at: self.fileURL) }
+            self.onChange?()
         }
     }
 }
@@ -657,6 +1242,14 @@ final class BrowserStore: ObservableObject {
     @Published private(set) var vnetStatus = "準備中…"
     /// 開発者パネルのログ（パネルを開いている間だけ更新する）
     @Published private(set) var logText = ""
+    @Published var showDownloads = false
+    /// 前回は落ちて終わった（開発者パネルで前回の記録を見られる）
+    @Published private(set) var hadCrash = false
+    /// ネットワークにつながっているか（NWPathMonitor）
+    @Published private(set) var isOnline = true
+    /// ダウンロード
+    let downloads = DownloadManager()
+    private let pathMonitor = NWPathMonitor()
 
     let machine = VNetMachine(factory: NWUserNetFactory())
     /// Cookie の写し（正本は WebKit の置き場）
@@ -697,7 +1290,12 @@ final class BrowserStore: ObservableObject {
     private func setUp() {
         if didSetUp { return }
         didSetUp = true
+        CrashLog.start()
         let lb = logs
+        if let crash = CrashLog.previousCrashSummary() {
+            logs.add("⚠️ 前回は落ちて終わりました: \(crash)（開発者パネルの「前回の記録」で、落ちる前のログが見られます）", level: .error, category: .app)
+            hadCrash = true
+        }
         takeover = HTTPSTakeover.install()
         if takeover == .installed { defaultMode = .vnetDirect }
         else if VelaSettings.legacyVNetsFallback && !VelaSettings.vnetDisabled { defaultMode = .vnetsLegacy }
@@ -723,6 +1321,18 @@ final class BrowserStore: ObservableObject {
         }
         if VelaSettings.localNetworkProtection { compileLocalNetworkRules() } else { logs.add("⚠️ LAN の保護は切ってあります") }
         if defaultMode == .vnetsLegacy { compileVNetOnlyRules() }
+
+        downloads.log = { s in lb.add(s, level: .info, category: .download) }
+        downloads.webViewForResume = { [weak self] in self?.selectedTab?.webView }
+        downloads.loadExisting()
+
+        // ネットワークの様子（つながっていないときは帯を出す）
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let online = path.status == .satisfied
+            let store = self
+            Task { @MainActor in store?.setOnline(online) }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "vela-path"))
 
         restoreSession()
         if tabs.isEmpty { newTab(url: nil) }
@@ -942,6 +1552,12 @@ final class BrowserStore: ObservableObject {
 
     // MARK: 様子
 
+    private func setOnline(_ online: Bool) {
+        if online == isOnline { return }
+        isOnline = online
+        logs.add(online ? "ネットワークにつながりました" : "⚠️ ネットワークにつながっていません", level: online ? .info : .warning, category: .app)
+    }
+
     private func refreshStatus() {
         guard defaultMode.usesVNet || tabs.contains(where: { $0.mode.usesVNet }) else {
             vnetStatus = "VNet: 使っていません（\(takeover.description)）"
@@ -1011,6 +1627,12 @@ final class BrowserTab: ObservableObject, Identifiable {
     /// 休止中のときの、戻る/進むの履歴（WKWebView.interactionState）と開く URL
     private var savedState: Data?
     private var pendingURL: URL?
+    /// 標準の通信のときのエラーページのボタンの合言葉（VNet のときは VNetScheme が持つ）
+    private let pageActions = PageActions()
+    /// HTTPS-First（標準の通信）: https に上げて試している元の http の URL
+    private var httpsFirstFrom: URL?
+    /// HTTPS-First で「http のまま開く」を選んだホスト
+    private var httpAllowedHosts = Set<String>()
 
     init(id: Int, store: BrowserStore, mode: NetMode) {
         self.id = id
@@ -1094,6 +1716,16 @@ final class BrowserTab: ObservableObject, Identifiable {
             let s = VNetScheme()
             s.machine = store.machine
             s.hsts = store.hsts
+            s.httpsFirst = VelaSettings.httpsFirst
+            s.httpAllowedHosts = httpAllowedHosts
+            s.onTopLevelFailure = { [weak self] u, e in
+                let tab = self
+                Task { @MainActor in tab?.vnetFailed(u, e) }
+            }
+            s.onDownloadStarted = { [weak self] dl in
+                let tab = self
+                Task { @MainActor in tab?.registerVNetDownload(dl) }
+            }
             let tabID = id
             let lb = store.logs
             s.log = { m in lb.add(m, tab: tabID) }
@@ -1255,9 +1887,10 @@ final class BrowserTab: ObservableObject, Identifiable {
     func go(to item: WKBackForwardListItem) { webView?.go(to: item) }
 
     /// 通信の作りを変える（同じ URL で WebView を作り直す）
-    func switchMode(to m: NetMode) {
-        guard m != mode else { return }
-        let u = url
+    /// 通信の作りを変える（同じ URL か、target で開き直す）
+    func switchMode(to m: NetMode, url target: URL? = nil) {
+        guard m != mode else { if let target { load(target, userInitiated: true) }; return }
+        let u = target ?? url
         log("通信を \(mode.rawValue) → \(m.rawValue) に切り替えます")
         tearDownWebView()
         savedState = nil
@@ -1283,6 +1916,105 @@ final class BrowserTab: ObservableObject, Identifiable {
         savedState = s.state
         pendingURL = url
         state = .suspended
+    }
+
+    /// エラーページのボタン
+    private func pageAction(_ item: PageActions.Item) {
+        switch item.action {
+        case "retry":
+            load(item.url, userInitiated: true)
+        case "openNative":
+            log("標準の通信で開き直します（ユーザーの操作）")
+            switchMode(to: .native, url: item.url)
+        case "openHTTP":
+            if let h = item.url.host?.lowercased() {
+                httpAllowedHosts.insert(h)
+                scheme?.httpAllowedHosts.insert(h)
+            }
+            log("http のまま開きます: \(item.url.absoluteString)", category: .security)
+            // VNet の http（80 番）は今の環境では 400 にされるので、標準の通信で開く
+            if mode.usesVNet { switchMode(to: .native, url: item.url) } else { load(item.url, userInitiated: true) }
+        case "allowLocalNetwork":
+            log("🛡 LAN の確認: ユーザーが許可しました → \(item.url.absoluteString)", category: .security)
+            load(item.url, userInitiated: true)
+        default:
+            break
+        }
+    }
+
+    /// VNet でページ本体を読めなかった。設定で選んであれば、標準の通信に自動で切り替える
+    private func vnetFailed(_ u: URL, _ e: FetchError) {
+        let kinds: Set<FetchError.Kind> = [.tls, .tlsVersion, .connect, .timeout, .reset, .malformed, .notReady]
+        guard VelaSettings.autoFallbackToNative, mode.usesVNet, kinds.contains(e.kind) else { return }
+        log("VNet で読めなかったので、標準の通信に自動で切り替えます（\(e.kind.rawValue)）", level: .warning)
+        switchMode(to: .native, url: u)
+    }
+
+    // MARK: 標準の通信のエラー・HTTPS-First
+
+    /// HTTPS-First（標準の通信）: ページを開く http:// を https に上げるなら、その URL
+    func httpsFirstUpgrade(_ u: URL) -> URL? {
+        guard VelaSettings.httpsFirst, mode == .native, u.scheme?.lowercased() == "http", let h = u.host?.lowercased(),
+              !httpAllowedHosts.contains(h), !SiteUtil.isIPLiteral(h), LocalNetworkPolicy.classify(host: h) == nil, u.port == nil,
+              var c = URLComponents(url: u, resolvingAgainstBaseURL: false) else { return nil }
+        c.scheme = "https"
+        httpsFirstFrom = u
+        log("🔒 HTTPS-First: \(u.absoluteString) → https", category: .security)
+        return c.url
+    }
+
+    func didCommitNavigation() {
+        httpsFirstFrom = nil
+        syncFromWebView()
+    }
+
+    /// WebKit（標準の通信など）が読めなかった: エラーページを出す
+    func showLoadError(_ error: Error) {
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled { return }      // 取り消し（次の移動など）
+        if ns.domain == "WebKitErrorDomain" && (ns.code == 102 || ns.code == 204) { return } // ダウンロードに変わった など
+        guard let wv = webView else { return }
+        let failing = (ns.userInfo[NSURLErrorFailingURLErrorKey] as? URL) ?? url
+        guard let f = failing.flatMap({ VNetURL.toReal($0) }) else { return }
+        let html: String
+        if let http = httpsFirstFrom, f.host?.lowercased() == http.host?.lowercased() {
+            html = ErrorPage.html(title: "https では開けませんでした", lines: [
+                "\(http.host ?? "") は、安全な接続（https）に対応していないようです。",
+                "http のまま開くと、通信の中身を途中で見られたり、書き換えられたりする可能性があります。"],
+                detail: "\(f.absoluteString)\n\(ns.localizedDescription)",
+                buttons: [ErrorPage.Button(label: "http のまま開く", nonce: pageActions.make("openHTTP", url: http), primary: false),
+                          ErrorPage.Button(label: "再試行", nonce: pageActions.make("retry", url: f), primary: true)],
+                kind: "httpsFirst")
+            httpsFirstFrom = nil
+        } else {
+            let d = ErrorPage.describe(nsErrorCode: ns.code, domain: ns.domain, message: ns.localizedDescription)
+            html = ErrorPage.html(title: d.title, lines: [d.hint, f.absoluteString], detail: "\(ns.domain) \(ns.code): \(ns.localizedDescription)",
+                                  buttons: [ErrorPage.Button(label: "再試行", nonce: pageActions.make("retry", url: f), primary: true)],
+                                  kind: "\(ns.domain)/\(ns.code)")
+        }
+        wv.loadHTMLString(html, baseURL: f)
+    }
+
+    // MARK: ダウンロード
+
+    func adoptDownload(_ d: WKDownload, source: URL?) {
+        store?.downloads.adopt(d, source: source ?? url)
+    }
+
+    /// VNet が自分で書き始めたダウンロードを一覧に入れる
+    func registerVNetDownload(_ dl: VNetDownload) {
+        let src = dl.source
+        store?.downloads.register(dl) { [weak self] in self?.startDownload(src) }
+    }
+
+    /// URL をダウンロードする。VNet のタブは VNet で（WebKit の WKDownload は VNet の読み込みで落ちるため）、標準の通信は WebKit で
+    func startDownload(_ u: URL) {
+        let s = u.scheme?.lowercased() ?? ""
+        if mode.usesVNet, s == "http" || s == "https", let scheme {
+            scheme.startDownload(url: u, referer: url)
+        } else if let wv = webView {
+            wv.startDownload(using: URLRequest(url: u)) { [weak self] d in self?.adoptDownload(d, source: u) }
+        }
     }
 
     // MARK: WebKit からの知らせ（TabWebDelegate から）
@@ -1327,14 +2059,14 @@ final class BrowserTab: ObservableObject, Identifiable {
     /// エラーページのボタン・守りのスクリプトからの知らせ
     private func handleAction(_ body: [String: Any], isMainFrame: Bool, origin: String) {
         switch body["action"] as? String {
-        case "allowLocalNetwork":
-            // 確認のページ（メインフレーム）からの、合言葉の合っている知らせだけを受け付ける
-            guard isMainFrame, let nonce = body["nonce"] as? String, let u = scheme?.consumeConsent(nonce) else {
-                log("🛡 LAN の確認: 受け付けない知らせです（\(origin)）", category: .security)
+        case "page":
+            // エラーページ・確認のページ（メインフレーム）からの、合言葉の合っている知らせだけを受け付ける
+            guard isMainFrame, let nonce = body["nonce"] as? String,
+                  let item = scheme?.actions.consume(nonce) ?? pageActions.consume(nonce) else {
+                log("🛡 ページのボタン: 受け付けない知らせです（\(origin)）", category: .security)
                 return
             }
-            log("🛡 LAN の確認: ユーザーが許可しました → \(u.absoluteString)", category: .security)
-            load(u, userInitiated: true)
+            pageAction(item)
         case "blockedWebSocket":
             log("🛡 LAN の保護: WebSocket を止めました（\(origin) → \(body["url"] as? String ?? "?")）", category: .security)
         case "usedWebSocket":
@@ -1359,9 +2091,25 @@ final class TabWebDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
         super.init()
     }
 
-    // リンクを押したとき: vnets:// の作りなら、自作の通信のアドレスに直して開き直す
+    // リンクを押したとき: ダウンロードの指定（<a download>）・HTTPS-First（標準の通信）・vnets:// の作りの読み替え
+    // Objective-C の名前を明示する（Playgrounds のプレビューは関数名を __preview_ に変えるので、2 つの async 版が同じ名前になってぶつかる）
+    @objc(webView:decidePolicyForNavigationAction:decisionHandler:)
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
-        guard let tab, tab.mode == .vnetsLegacy else { return .allow }
+        guard let tab else { return .allow }
+        if navigationAction.shouldPerformDownload {
+            // VNet のタブの http(s) は、WebKit のダウンロードにしない（落ちるため）。VNet で読んでファイルに書く
+            if tab.mode.usesVNet, let u = navigationAction.request.url, let s = u.scheme?.lowercased(), s == "http" || s == "https" {
+                tab.startDownload(VNetURL.toReal(u) ?? u)
+                return .cancel
+            }
+            return .download
+        }
+        let main = navigationAction.targetFrame?.isMainFrame ?? true
+        if main, let u = navigationAction.request.url, let up = tab.httpsFirstUpgrade(u) {
+            webView.load(URLRequest(url: up))
+            return .cancel
+        }
+        guard tab.mode == .vnetsLegacy else { return .allow }
         if let u = navigationAction.request.url, let s = u.scheme?.lowercased(), s == "http" || s == "https",
            navigationAction.targetFrame?.isMainFrame ?? true, let v = VNetURL.toVNet(u) {
             webView.load(URLRequest(url: v))
@@ -1375,7 +2123,34 @@ final class TabWebDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-        tab?.syncFromWebView()
+        tab?.didCommitNavigation()
+    }
+
+    /// 表示できない種類（zip・PDF の一部など）や「添付ファイル」の指定なら、ダウンロードにする
+    @objc(webView:decidePolicyForNavigationResponse:decisionHandler:)
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse) async -> WKNavigationResponsePolicy {
+        var attachment = false
+        if let http = navigationResponse.response as? HTTPURLResponse {
+            // 204 No Content: 移動しない（VNet がダウンロードに変えたときにも返す。ここでダウンロードを始めると二重になる）
+            if http.statusCode == 204 { return .cancel }
+            let cd = http.allHeaderFields.first { ($0.key as? String)?.lowercased() == "content-disposition" }?.value as? String
+            if let cd, cd.lowercased().hasPrefix("attachment") { attachment = true }
+        }
+        guard attachment || !navigationResponse.canShowMIMEType else { return .allow }
+        // VNet のタブ: WebKit のダウンロードにはしない（VNetScheme の読み込みを変えると落ちる）。止めて、VNet で読み直してファイルに書く
+        if let tab, tab.mode.usesVNet, let u = navigationResponse.response.url {
+            tab.startDownload(VNetURL.toReal(u) ?? u)
+            return .cancel
+        }
+        return .download
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        tab?.adoptDownload(download, source: navigationAction.request.url)
+    }
+
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        tab?.adoptDownload(download, source: navigationResponse.response.url)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -1390,6 +2165,7 @@ final class TabWebDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         tab?.navigationEvent("✕ 読み込みに失敗: \(error.localizedDescription)", level: .error)
+        tab?.showLoadError(error)
         tab?.syncFromWebView()
     }
 
@@ -1582,6 +2358,142 @@ enum AddressInput {
 }
 
 // ======================================================================
+// MARK: - ErrorPages.swift
+// ======================================================================
+
+// MARK: - エラーページ・確認のページ
+//
+// ・読めなかったときに、原因の説明と、できること（再試行・標準の通信で開く など）のボタンを出す
+// ・ボタンは window.webkit.messageHandlers.velaAction に {action: "page", nonce} を送る。
+//   合言葉（nonce）は 1 回だけ・10 分まで使える。ページは失敗した URL のオリジンで出すので、元のページからは合言葉を読めない
+//   （LAN の確認のように、押されると困るボタンもあるため。合言葉の無い知らせは受け付けない）
+
+/// ページのボタンの合言葉 → してほしいこと（画面のスレッドでだけ使う）
+final class PageActions {
+    struct Item {
+        let action: String
+        let url: URL
+        let at: Date
+    }
+    private var items: [String: Item] = [:]
+    static let lifetime: TimeInterval = 600
+
+    init() {}
+
+    /// 合言葉を作る
+    func make(_ action: String, url: URL, now: Date = Date()) -> String {
+        items = items.filter { now.timeIntervalSince($0.value.at) < PageActions.lifetime }
+        let n = UUID().uuidString.replacingOccurrences(of: "-", with: "") + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        items[n] = Item(action: action, url: url, at: now)
+        return n
+    }
+
+    /// 合言葉を確かめて、してほしいことを返す（1 回だけ）
+    func consume(_ nonce: String, now: Date = Date()) -> Item? {
+        guard let i = items.removeValue(forKey: nonce), now.timeIntervalSince(i.at) < PageActions.lifetime else { return nil }
+        return i
+    }
+}
+
+enum ErrorPage {
+    /// ページの中のボタン（label・合言葉）
+    struct Button {
+        let label: String
+        let nonce: String
+        let primary: Bool
+    }
+
+    /// 説明（見出し・ひとこと・標準の通信で開く案内を出すか）
+    struct Description {
+        let title: String
+        let hint: String
+        let offerNative: Bool
+    }
+
+    static func describe(_ e: FetchError) -> Description {
+        switch e.kind {
+        case .dns: return Description(title: "サーバーが見つかりません", hint: "アドレスが正しいか、ネットワークにつながっているかを確かめてください。", offerNative: true)
+        case .timeout: return Description(title: "時間切れです", hint: "サーバーから返事がありません。しばらくしてから試してください。", offerNative: true)
+        case .tls: return Description(title: "安全な接続を作れませんでした", hint: "証明書に問題があるか、VNet の TLS では話せない相手です。", offerNative: true)
+        case .tlsVersion: return Description(title: "このサイトは VNet の TLS では開けません", hint: "相手が TLS 1.3 だけを使っています（VNet の TLS は 1.2 まで）。標準の通信なら開けます。", offerNative: true)
+        case .connect: return Description(title: "サーバーにつながりません", hint: "サーバーが止まっているか、ネットワークに問題があります。", offerNative: true)
+        case .reset: return Description(title: "接続が途中で切れました", hint: "もう一度試してください。", offerNative: true)
+        case .malformed, .tooLarge: return Description(title: "サーバーの返事を読めません", hint: e.description, offerNative: true)
+        case .redirect: return Description(title: "リダイレクトが多すぎます", hint: "サーバーの設定に問題があるかもしれません。", offerNative: false)
+        case .busy: return Description(title: "要求が多すぎます", hint: "少し待ってから試してください。", offerNative: false)
+        case .blocked: return Description(title: "Vela の守りで止めました", hint: e.description, offerNative: false)
+        case .localNetworkConsent: return Description(title: "LAN の機器を開きますか？", hint: e.description, offerNative: false)
+        case .notReady: return Description(title: "VNet の準備ができていません", hint: "少し待ってから試してください。", offerNative: true)
+        case .cancelled: return Description(title: "取り消しました", hint: "", offerNative: false)
+        case .other: return Description(title: "読めませんでした", hint: e.description, offerNative: true)
+        }
+    }
+
+    /// 標準の通信（WebKit）の失敗の説明（NSURLErrorDomain の番号）
+    static func describe(nsErrorCode code: Int, domain: String, message: String) -> Description {
+        guard domain == NSURLErrorDomain else { return Description(title: "読めませんでした", hint: message, offerNative: false) }
+        switch code {
+        case NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost, NSURLErrorDataNotAllowed:
+            return Description(title: "インターネットにつながっていません", hint: "Wi-Fi やモバイル通信を確かめてください。", offerNative: false)
+        case NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed:
+            return Description(title: "サーバーが見つかりません", hint: "アドレスが正しいかを確かめてください。", offerNative: false)
+        case NSURLErrorTimedOut:
+            return Description(title: "時間切れです", hint: "サーバーから返事がありません。", offerNative: false)
+        case NSURLErrorCannotConnectToHost:
+            return Description(title: "サーバーにつながりません", hint: message, offerNative: false)
+        case NSURLErrorSecureConnectionFailed, NSURLErrorServerCertificateHasBadDate, NSURLErrorServerCertificateUntrusted,
+             NSURLErrorServerCertificateHasUnknownRoot, NSURLErrorServerCertificateNotYetValid, NSURLErrorClientCertificateRejected:
+            return Description(title: "安全な接続を作れませんでした", hint: "証明書に問題があります。このサイトは開かないでください。", offerNative: false)
+        default:
+            return Description(title: "読めませんでした", hint: message, offerNative: false)
+        }
+    }
+
+    /// エラーページの HTML（文字は全部エスケープする。暗い表示にも合わせる）
+    static func html(title: String, lines: [String], detail: String? = nil, buttons: [Button], kind: String) -> String {
+        var s = """
+        <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+        <meta name="color-scheme" content="light dark"><title>\(escape(title))</title><style>
+        body{font:17px -apple-system,system-ui;margin:0;padding:48px 24px;color:#1c1c1e;background:#f2f2f7}
+        @media (prefers-color-scheme:dark){body{color:#f2f2f7;background:#1c1c1e}.d{background:#2c2c2e}}
+        main{max-width:620px;margin:0 auto}h1{font-size:24px;margin:0 0 16px}p{line-height:1.5;word-break:break-all}
+        .u{color:#8e8e93;font-size:14px}.d{background:#e5e5ea;border-radius:8px;padding:8px 12px;font:12px ui-monospace,monospace;white-space:pre-wrap}
+        button{font-size:16px;padding:10px 20px;margin:8px 8px 0 0;border-radius:10px;border:0;background:#d1d1d6;color:inherit}
+        button.p{background:#0a84ff;color:#fff}
+        </style></head><body><main>
+        """
+        s += "<h1>\(escape(title))</h1>"
+        for l in lines where !l.isEmpty { s += "<p>\(escape(l))</p>" }
+        if !buttons.isEmpty {
+            s += "<div>"
+            for b in buttons {
+                let js = "window.webkit.messageHandlers.velaAction.postMessage({action:'page',nonce:'\(b.nonce)'})"
+                s += "<button class=\"\(b.primary ? "p" : "")\" onclick=\"\(escape(js))\">\(escape(b.label))</button>"
+            }
+            s += "</div>"
+        }
+        if let d = detail, !d.isEmpty { s += "<details><summary class=\"u\">くわしく</summary><p class=\"d\">\(escape(d))</p></details>" }
+        s += "</main></body></html><!-- vela-error:\(escape(kind)) -->"
+        return s
+    }
+
+    static func escape(_ s: String) -> String {
+        var o = ""
+        for c in s {
+            switch c {
+            case "&": o += "&amp;"
+            case "<": o += "&lt;"
+            case ">": o += "&gt;"
+            case "\"": o += "&quot;"
+            case "'": o += "&#39;"
+            default: o.append(c)
+            }
+        }
+        return o
+    }
+}
+
+// ======================================================================
 // MARK: - Persistence.swift
 // ======================================================================
 
@@ -1694,6 +2606,14 @@ enum VelaSettings {
         get { SearchEngine(rawValue: d.string(forKey: "search.engine") ?? "") ?? .google }
         set { d.set(newValue.rawValue, forKey: "search.engine") }
     }
+    /// HTTPS-First: ページを開く http:// を、まず https で試す（だめなら「http のまま開く」を出す）
+    static var httpsFirst: Bool {
+        get { bool("nav.httpsFirst", true) } set { d.set(newValue, forKey: "nav.httpsFirst") }
+    }
+    /// VNet でページを読めなかったら（TLS・つながらない など）、標準の通信に自動で切り替える
+    static var autoFallbackToNative: Bool {
+        get { bool("vnet.autoFallback", false) } set { d.set(newValue, forKey: "vnet.autoFallback") }
+    }
     /// Mac の Safari の Web インスペクタからつなげるようにする（iOS 16.4 から）
     static var webInspector: Bool {
         get { bool("dev.webInspector", false) } set { d.set(newValue, forKey: "dev.webInspector") }
@@ -1805,6 +2725,8 @@ final class DevLog: @unchecked Sendable {
         counts[level, default: 0] += 1
         dirty = true
         lock.unlock()
+        // 落ちたときのために、すぐファイルにも書く（CrashLog.start の前は何もしない）
+        CrashLog.writeLine(e.line)
     }
 
     /// 古い順に全部
@@ -1854,6 +2776,143 @@ final class DevLog: @unchecked Sendable {
 }
 
 // ======================================================================
+// MARK: - CrashLog.swift
+// ======================================================================
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+// MARK: - 落ちたときの記録（次に起動したときに、開発者パネルで見る）
+//
+// ・ログを 1 行ずつ、すぐファイルに書く（落ちる直前まで残るように。メモリのログは落ちると消える）
+// ・Objective-C の例外（WebKit などが投げる）は、名前・理由・呼び出しの順をファイルに書く
+// ・致命的なシグナル（Swift の強制終了・不正なメモリアクセスなど）は、番号・落ちたスレッド・呼び出しの順を書く
+//   （シグナルの中ではほとんど何もできないので、用意しておいた文字と backtrace_symbols_fd で、ファイルに直接書くだけ）
+// ・起動するたびに、前回の記録を crash-previous.txt に移す。前回が落ちて終わっていたら、ログに知らせる
+
+/// シグナルの中から使うので、ファイルの番号は global に置く（Swift の static は初めて触るときに準備が走るので、シグナルの中では使わない）
+private var crashFD: Int32 = -1
+private let signalMessages: [Int32: [UInt8]] = {
+    var m: [Int32: [UInt8]] = [:]
+    for (s, name) in [(SIGABRT, "SIGABRT"), (SIGSEGV, "SIGSEGV"), (SIGBUS, "SIGBUS"), (SIGILL, "SIGILL"), (SIGTRAP, "SIGTRAP"), (SIGFPE, "SIGFPE")] {
+        m[s] = Array("\n【シグナル】\(name)（\(s)）でアプリが止まりました\n".utf8)
+    }
+    return m
+}()
+/// 呼び出しの順を入れる場所（シグナルの中では作れないので、先に用意する）
+private let backtraceCapacity: Int32 = 64
+private let backtraceBuffer = UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: 64)
+private let mainThreadText = Array("落ちたスレッド: 画面のスレッド（main）\n呼び出しの順:\n".utf8)
+private let otherThreadText = Array("落ちたスレッド: 裏のスレッド（main 以外）\n呼び出しの順:\n".utf8)
+
+// backtrace・backtrace_symbols_fd（C の execinfo.h）。iPad の Swift Playgrounds では Darwin から見えなかった
+// （「cannot find 'backtrace' in scope」）ので、C の関数の名前で直接つなぐ。iOS・Linux の libc のどちらにもある
+@_silgen_name("backtrace")
+private func cBacktrace(_ buffer: UnsafeMutablePointer<UnsafeMutableRawPointer?>, _ size: Int32) -> Int32
+@_silgen_name("backtrace_symbols_fd")
+private func cBacktraceSymbolsFD(_ buffer: UnsafePointer<UnsafeMutableRawPointer?>, _ size: Int32, _ fd: Int32)
+
+/// 致命的なシグナルの受け口。シグナルの中なので、用意しておいたものを write で書くだけにする
+private func crashSignalHandler(_ sig: Int32) {
+    if crashFD >= 0 {
+        if let m = signalMessages[sig] { _ = m.withUnsafeBytes { write(crashFD, $0.baseAddress, $0.count) } }
+        #if canImport(Darwin)
+        let isMain = pthread_main_np() != 0
+        #else
+        let isMain = false
+        #endif
+        let t = isMain ? mainThreadText : otherThreadText
+        _ = t.withUnsafeBytes { write(crashFD, $0.baseAddress, $0.count) }
+        let n = cBacktrace(backtraceBuffer, backtraceCapacity)
+        cBacktraceSymbolsFD(backtraceBuffer, n, crashFD)
+    }
+    signal(sig, SIG_DFL)
+    raise(sig)
+}
+
+enum CrashLog {
+    private static let lock = NSLock()
+    private static var written = 0
+    static let maxBytes = 2 << 20
+    static let exceptionMark = "【例外】"
+    static let signalMark = "【シグナル】"
+
+    static var folder: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? FileManager.default.temporaryDirectory
+        let dir = base.appendingPathComponent("Vela", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+    static var currentURL: URL { folder.appendingPathComponent("crash-current.txt") }
+    static var previousURL: URL { folder.appendingPathComponent("crash-previous.txt") }
+
+    /// 起動したときに 1 回。前回の記録を移して、新しいファイルを開き、例外とシグナルの受け口を入れる
+    static func start() {
+        lock.lock(); defer { lock.unlock() }
+        if crashFD >= 0 { return }
+        let fm = FileManager.default
+        try? fm.removeItem(at: previousURL)
+        if fm.fileExists(atPath: currentURL.path) { try? fm.moveItem(at: currentURL, to: previousURL) }
+        crashFD = open(currentURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        _ = (signalMessages, mainThreadText, otherThreadText, backtraceBuffer)     // シグナルの中で準備が走らないよう、先に作っておく
+        #if canImport(Darwin)
+        NSSetUncaughtExceptionHandler { e in CrashLog.recordException(e) }
+        #endif
+        _ = cBacktrace(backtraceBuffer, 1)     // 初めて呼ぶときの準備を、シグナルの中ではなくここで済ませておく
+        for s in [SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE] {
+            signal(s, crashSignalHandler)
+        }
+        // ここはもう lock を持っているので、writeLine ではなく writeLineLocked（NSLock は 2 回取ると止まる）
+        writeLineLocked("―― 起動 \(Date()) ――")
+    }
+
+    /// 1 行書く（DevLog から全部の行が来る）
+    static func writeLine(_ s: String) {
+        lock.lock(); defer { lock.unlock() }
+        writeLineLocked(s)
+    }
+
+    /// lock を持っているときに呼ぶ
+    private static func writeLineLocked(_ s: String) {
+        guard crashFD >= 0 else { return }
+        let bytes = Array((s + "\n").utf8)
+        if written + bytes.count > maxBytes {
+            // 大きくなりすぎたら最初から（落ちる直前の分があればよい）
+            _ = ftruncate(crashFD, 0)
+            _ = lseek(crashFD, 0, SEEK_SET)
+            written = 0
+        }
+        _ = bytes.withUnsafeBytes { write(crashFD, $0.baseAddress, $0.count) }
+        written += bytes.count
+    }
+
+    #if canImport(Darwin)
+    static func recordException(_ e: NSException) {
+        var s = "\n\(exceptionMark)\(e.name.rawValue): \(e.reason ?? "（理由なし）")\n"
+        s += e.callStackSymbols.prefix(40).joined(separator: "\n")
+        writeLine(s)
+    }
+    #endif
+
+    /// 前回の記録（最後の lines 行）。無ければ nil
+    static func previous(lines: Int = 300) -> String? {
+        guard let d = try? Data(contentsOf: previousURL), !d.isEmpty else { return nil }
+        let text = String(decoding: d, as: UTF8.self)
+        return text.split(separator: "\n", omittingEmptySubsequences: false).suffix(lines).joined(separator: "\n")
+    }
+
+    /// 前回は落ちて終わったか（例外かシグナルの記録がある）。あれば、その行
+    static func previousCrashSummary() -> String? {
+        guard let p = previous(lines: 2000) else { return nil }
+        let lines = p.split(separator: "\n")
+        return lines.last { $0.contains(exceptionMark) || $0.contains(signalMark) }.map(String.init)
+    }
+}
+
+// ======================================================================
 // MARK: - VNetScheme.swift
 // ======================================================================
 
@@ -1869,6 +2928,8 @@ final class DevLog: @unchecked Sendable {
 // ・Cookie は CookieJar（WebKit の置き場の写し）と CookiePolicy。届いた Cookie は WebKit の置き場に入れてから、ページに返事を渡す
 // ・HSTS: 記録があれば http を https に上げる。https の応答から記録する（HSTSPolicy の条件のときだけ）
 // ・LAN の保護で「確認が必要」になった移動は、確認のページを出す（ユーザーが押したら、ユーザーの操作として開き直す）
+// ・直接の作り（https をそのまま引き受ける）では、返事を流す形で渡す: ヘッダが来たら WebKit に返事を渡し、中身は届いた分ずつ渡す
+//   （大きいファイル・動画でもメモリにためない。3xx は貯めて移動として渡す。vnets:// の作りは中身を書き換えるので貯める）
 
 final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     var machine: VNetMachine?
@@ -1878,23 +2939,20 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     var pushCookies: (([CookieChange], _ done: @escaping @Sendable () -> Void) -> Void)?
     /// HSTS の記録（nil なら使わない）
     var hsts: HSTSStore?
-    /// LAN への移動の確認のページで使う合言葉（nonce）→ 開く URL。ページのボタンはこの合言葉を付けて知らせる。
-    /// 合言葉は確認のページの中にしか無い（確認のページは LAN 側のオリジンで出すので、元の公開のページからは読めない）
-    private var consents: [String: (url: URL, at: Date)] = [:]
-
-    /// 確認のページのボタンから届いた合言葉を確かめて、開く URL を返す（1 回だけ・10 分まで）
-    func consumeConsent(_ nonce: String) -> URL? {
-        guard let c = consents.removeValue(forKey: nonce), Date().timeIntervalSince(c.at) < 600 else { return nil }
-        return c.url
-    }
-
-    private func makeConsentNonce(_ url: URL) -> String {
-        let now = Date()
-        consents = consents.filter { now.timeIntervalSince($0.value.at) < 600 }
-        let n = UUID().uuidString + UUID().uuidString
-        consents[n] = (url, now)
-        return n
-    }
+    /// エラーページ・確認のページのボタンの合言葉（nonce）→ してほしいこと。
+    /// ページは失敗した URL のオリジンで出すので、元の公開のページからは合言葉を読めない
+    let actions = PageActions()
+    /// HTTPS-First: ページを開く http:// を、まず https で試す（公開のホストだけ）
+    var httpsFirst = true
+    /// HTTPS-First で https がだめで、ユーザーが「http のまま開く」を選んだホスト
+    var httpAllowedHosts = Set<String>()
+    /// ページ本体の読み込みに失敗したとき（標準の通信へ自動で切り替えるかを、タブが決める）
+    var onTopLevelFailure: ((URL, FetchError) -> Void)?
+    /// VNet が自分でファイルに書くダウンロードを始めたとき（画面のスレッドで呼ぶ）。
+    /// WebKit の WKDownload は使わない（VNetScheme が引き受けた読み込みを WebKit がダウンロードに変えると、アプリが落ちたため）
+    var onDownloadStarted: ((VNetDownload) -> Void)?
+    /// ダウンロードに変えた要求（WebKit の要求は 204 で終わらせ、中身はファイルに書く）
+    private var downloadsInFlight: [Int: VNetDownload] = [:]
 
     /// 読み込み中の要求
     private struct Pending {
@@ -1916,8 +2974,26 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         let token = RequestToken()
         /// 予備の vnets:// の作りの要求か
         var vnetsMode: Bool { VNetURL.isVNet(shownURL) }
+        /// 流す形の様子: none（まだ・貯める形）→ pushing（Cookie を WebKit に入れている）→ sending（中身を渡している）
+        var streamPhase = StreamPhase.none
+        /// sending になる前に届いた中身
+        var streamQueue: [Data] = []
+        /// sending になる前に読み終わった（失敗した）
+        var streamDone: Result<HTTPResult, FetchError>?
+        var streamBytes = 0
+        /// HTTPS-First で https に上げた元の http の URL（https で失敗したら「http のまま開く」を出す）
+        var httpsFirstFrom: URL?
+        /// 自分で作った移動（HSTS・HTTPS-First）を WebKit に伝えている途中
+        var syntheticRedirect = false
     }
-    private var pending: [ObjectIdentifier: Pending] = [:]
+    private enum StreamPhase { case none, pushing, sending }
+    /// 読み込み中の要求（番号 → 要求）。番号は要求ごとに 1 つずつ増やす（使い回さない）。
+    /// WebKit の要求のアドレス（ObjectIdentifier）で引くと、止めた要求のアドレスを次の要求が使い回したときに、
+    /// 前の要求の遅れて届いた返事が新しい要求に渡ってしまい、WebKit が例外を出して落ちた
+    private var pending: [Int: Pending] = [:]
+    /// WebKit の要求 → 番号（stop で引く。使い回されたアドレスかどうかは task が同じものかで確かめる）
+    private var taskIDs: [ObjectIdentifier: Int] = [:]
+    private var nextID = 1
 
     /// ユーザーがアドレス欄などから開いた URL（1 回だけ使える印。ページのリンクや JavaScript の移動と見分ける）
     private var userNavigation: (url: URL, at: Date)?
@@ -1933,7 +3009,11 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
 
     func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {
         // 裏の通信も止める（待ち行列から外す・読んでいる途中の接続は切る）
-        pending.removeValue(forKey: ObjectIdentifier(task))?.token.cancel()
+        let key = ObjectIdentifier(task)
+        guard let id = taskIDs[key], let p = pending[id], (p.task as AnyObject) === (task as AnyObject) else { return }
+        taskIDs[key] = nil
+        pending[id] = nil
+        p.token.cancel()
     }
 
     /// 読み込み中の要求の数（開発者向け）
@@ -1945,45 +3025,91 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         }
         let body = VNetScheme.body(of: task.request)
         let ctx = context(for: task.request, real: real)
-        let id = ObjectIdentifier(task)
+        let id = nextID
+        nextID += 1
+        // 終わった要求の分は、ときどきまとめて消す（増え続けないように）
+        if taskIDs.count > 256 { taskIDs = taskIDs.filter { pending[$0.value] != nil || downloadsInFlight[$0.value] != nil } }
+        taskIDs[ObjectIdentifier(task)] = id
         let webKitRedirects = SchemeTaskRedirect.isAvailable(task)
         var p = Pending(task: task, shownURL: shown, realURL: real, started: Date(), request: task.request, body: body,
                         webKitRedirects: webKitRedirects, context: ctx)
         pending[id] = p
-        // HSTS: 記録のあるホストの http は、https に上げてから読む（WebKit にも移動として伝える）
-        if real.scheme?.lowercased() == "http", let h = SiteUtil.host(of: real), hsts?.shouldUpgrade(h) == true,
-           var c = URLComponents(url: real, resolvingAgainstBaseURL: false) {
-            c.scheme = "https"
-            if c.port == 80 { c.port = nil }
-            if let up = c.url {
-                log?("🔒 HSTS: \(real.absoluteString) → https")
-                if webKitRedirects {
-                    let next = RedirectPolicy.Next(url: up, method: task.request.httpMethod ?? "GET", headers: VNetScheme.headerPairs(task.request),
-                                                   body: body, crossOrigin: true, upgradedByHSTS: true, dropped: [])
-                    redirect(id, p, status: 307, serverHeaders: [("Non-Authoritative-Reason", "HSTS")], type: "text/plain", next: next)
-                    return
-                }
-                p.realURL = up
-                p.context = ctx.redirected(from: real, to: up)
+        // HSTS・HTTPS-First: http を https に上げてから読む（WebKit にも移動として伝える）
+        if let (up, reason) = upgradeTarget(real, ctx: ctx) {
+            log?("🔒 \(reason): \(real.absoluteString) → https")
+            if reason == "HTTPS-First" { p.httpsFirstFrom = real }
+            if webKitRedirects {
+                p.syntheticRedirect = true
                 pending[id] = p
-                fetch(id, makeRequest(task.request, url: up, body: body, ctx: p.context), followRedirects: true, machine: machine)
+                let next = RedirectPolicy.Next(url: up, method: task.request.httpMethod ?? "GET", headers: VNetScheme.headerPairs(task.request),
+                                               body: body, crossOrigin: true, upgradedByHSTS: true, dropped: [])
+                redirect(id, p, status: 307, serverHeaders: [("Non-Authoritative-Reason", reason)], type: "text/plain", next: next)
                 return
             }
+            p.realURL = up
+            p.context = ctx.redirected(from: real, to: up)
+            pending[id] = p
+            fetch(id, makeRequest(task.request, url: up, body: body, ctx: p.context), followRedirects: true, machine: machine)
+            return
         }
         fetch(id, makeRequest(task.request, url: real, body: body, ctx: ctx), followRedirects: !webKitRedirects, machine: machine)
     }
 
-    private func fetch(_ id: ObjectIdentifier, _ req: HTTPRequest, followRedirects: Bool, machine: VNetMachine) {
+    /// http を https に上げるか（HSTS の記録がある・HTTPS-First）。上げるなら (https の URL, 理由)
+    private func upgradeTarget(_ real: URL, ctx: RequestContext) -> (URL, String)? {
+        guard real.scheme?.lowercased() == "http", let h = SiteUtil.host(of: real),
+              var c = URLComponents(url: real, resolvingAgainstBaseURL: false) else { return nil }
+        let reason: String
+        if hsts?.shouldUpgrade(h) == true {
+            reason = "HSTS"
+        } else if httpsFirst && ctx.isTopLevel && !httpAllowedHosts.contains(h) && !SiteUtil.isIPLiteral(h)
+                    && LocalNetworkPolicy.classify(host: h) == nil && c.port == nil {
+            // 公開の名前のホストだけ（LAN・数字のアドレス・ポート指定は、https が無いことが多いので上げない）
+            reason = "HTTPS-First"
+        } else {
+            return nil
+        }
+        c.scheme = "https"
+        if c.port == 80 { c.port = nil }
+        guard let up = c.url else { return nil }
+        return (up, reason)
+    }
+
+    private func fetch(_ id: Int, _ req: HTTPRequest, followRedirects: Bool, machine: VNetMachine) {
         var req = req
         req.token = pending[id]?.token
+        // 直接の作りでは、流す形で受け取る（3xx は貯めて、移動として渡す・追いかける）
+        if let p = pending[id], !p.vnetsMode {
+            req.sink = StreamSink(shouldStream: { status, _ in !RedirectPolicy.statuses.contains(status) },
+                                  onHead: { [weak self] h in
+                                      let me = self
+                                      DispatchQueue.main.async { me?.streamHead(id, h) }
+                                  },
+                                  onData: { [weak self] d in
+                                      let me = self
+                                      DispatchQueue.main.async { me?.streamData(id, d) }
+                                  })
+        }
         machine.send(req, followRedirects: followRedirects) { [weak self] result in
             let me = self   // weak の self は var なので、並行で動く閉包からは直接さわれない。let に受け直す
             DispatchQueue.main.async { me?.finish(id, result) }
         }
     }
 
-    private func finish(_ id: ObjectIdentifier, _ result: Result<HTTPResult, FetchError>) {
-        guard pending[id] != nil else { return }
+    private func finish(_ id: Int, _ result: Result<HTTPResult, FetchError>) {
+        if let dl = downloadsInFlight.removeValue(forKey: id) {
+            switch result {
+            case .success: dl.finish()
+            case .failure(let e): if e.kind != .cancelled { dl.fail(e.description) }
+            }
+            return
+        }
+        guard var p = pending[id] else { return }
+        // 流す形で返事をもう渡し始めている: 終わりを伝える（まだ Cookie を入れている途中なら、渡し始めてから）
+        if p.streamPhase != .none {
+            if p.streamPhase == .sending { endStream(id, result) } else { p.streamDone = result; pending[id] = p }
+            return
+        }
         // Cookie が届いていたら、先にブラウザの置き場に入れてから返事を渡す（ページがすぐ document.cookie を読んでも間に合うように）
         if case .success(let r) = result, !r.cookieChanges.isEmpty, let pushCookies {
             pushCookies(r.cookieChanges) { [weak self] in
@@ -1996,7 +3122,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     }
 
     /// 返事を WebKit に渡す（途中で止められていたら何もしない）
-    private func complete(_ id: ObjectIdentifier, _ result: Result<HTTPResult, FetchError>) {
+    private func complete(_ id: Int, _ result: Result<HTTPResult, FetchError>) {
         guard let p = pending[id] else { return }
         if case .success(let r) = result, let sts = r.header("Strict-Transport-Security") {
             hsts?.record(header: sts, url: r.url, ctx: p.context)
@@ -2043,56 +3169,195 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         }
     }
 
-    /// 失敗をページにする（LAN への移動の確認なら、確認のページ）
+    // MARK: 流す形
+
+    /// 流す形の返事のヘッダが来た: Cookie を WebKit の置き場に入れてから、返事を渡す
+    private func streamHead(_ id: Int, _ h: HTTPHead) {
+        guard var p = pending[id] else { return }
+        // ページ本体の返事がダウンロード（添付ファイル・表示できない種類）なら、WebKit には渡さずにファイルに書く
+        if p.context.isTopLevel, onDownloadStarted != nil, DownloadFiles.isDownload(status: h.status, headers: h.headers),
+           let dl = makeDownload(h) {
+            let token = p.token
+            dl.cancelAction = { token.cancel() }
+            downloadsInFlight[id] = dl
+            pending[id] = nil
+            if !h.cookieChanges.isEmpty { pushCookies?(h.cookieChanges) {} }
+            // ページはそのまま（204 No Content は「移動しない」）
+            if let resp = HTTPURLResponse(url: p.shownURL, statusCode: 204, httpVersion: "HTTP/1.1",
+                                          headerFields: ["Content-Type": "text/plain", "Content-Length": "0"]) {
+                p.task.didReceive(resp)
+                p.task.didFinish()
+            }
+            log?("⬇︎ ダウンロードにします: \(h.url.absoluteString) → \(dl.fileURL.lastPathComponent)")
+            onDownloadStarted?(dl)
+            return
+        }
+        p.streamPhase = .pushing
+        pending[id] = p
+        if let sts = h.header("Strict-Transport-Security") { hsts?.record(header: sts, url: h.url, ctx: p.context) }
+        if !h.cookieChanges.isEmpty, let pushCookies {
+            pushCookies(h.cookieChanges) { [weak self] in
+                let me = self
+                DispatchQueue.main.async { me?.startSending(id, h) }
+            }
+        } else {
+            startSending(id, h)
+        }
+    }
+
+    /// ダウンロードのファイルを作る
+    private static func download(for h: HTTPHead) -> VNetDownload? {
+        let name = DownloadFiles.filename(contentDisposition: h.header("Content-Disposition"), url: h.url, mime: h.header("Content-Type"))
+        let expected = h.header("Content-Length").flatMap { Int64($0) } ?? -1
+        return VNetDownload(source: h.url, suggestedName: name, expected: expected)
+    }
+
+    private func makeDownload(_ h: HTTPHead) -> VNetDownload? { VNetScheme.download(for: h) }
+
+    /// URL をダウンロードする（<a download> のリンク・やり直しなど。WebKit を通さずに VNet で読んでファイルに書く）
+    func startDownload(url: URL, referer: URL?) {
+        guard let machine else { return }
+        var r = URLRequest(url: url)
+        if let referer { r.setValue(referer.absoluteString, forHTTPHeaderField: "Referer") }
+        var ctx = RequestContext(topURL: url, isTopLevel: true, initiator: referer)
+        ctx.userInitiated = true
+        var req = makeRequest(r, url: url, body: nil, ctx: ctx)
+        let token = RequestToken()
+        req.token = token
+        final class Box: @unchecked Sendable {
+            let lock = NSLock()
+            var download: VNetDownload?
+            var status = 0
+        }
+        let box = Box()
+        let started: (VNetDownload, [CookieChange]) -> Void = { [weak self] dl, changes in
+            let me = self
+            DispatchQueue.main.async {
+                if !changes.isEmpty { me?.pushCookies?(changes) {} }
+                me?.onDownloadStarted?(dl)
+            }
+        }
+        req.sink = StreamSink(shouldStream: { status, _ in !RedirectPolicy.statuses.contains(status) },
+                              onHead: { h in
+                                  guard let dl = VNetScheme.download(for: h) else { return }
+                                  dl.cancelAction = { token.cancel() }
+                                  box.lock.lock(); box.download = dl; box.status = h.status; box.lock.unlock()
+                                  started(dl, h.cookieChanges)
+                              },
+                              onData: { d in
+                                  box.lock.lock(); let dl = box.download; box.lock.unlock()
+                                  dl?.write(d)
+                              })
+        let lg = log
+        lg?("⬇︎ VNet でダウンロードします: \(url.absoluteString)")
+        machine.send(req, followRedirects: true) { result in
+            box.lock.lock(); var dl = box.download; let status = box.status; box.lock.unlock()
+            switch result {
+            case .success(let r):
+                // 流す形にならなかった（縮め方が流せないなど）: 貯めた中身をまとめて書く
+                if dl == nil, let made = VNetScheme.download(for: HTTPHead(status: r.status, headers: r.headers, url: r.url, cookieChanges: r.cookieChanges)) {
+                    made.cancelAction = { token.cancel() }
+                    made.write(r.body)
+                    dl = made
+                    started(made, r.cookieChanges)
+                }
+                let code = r.streamed ? status : r.status
+                if (200...299).contains(code) { dl?.finish() } else { dl?.fail("サーバーの返事 \(code)") }
+            case .failure(let e):
+                if e.kind != .cancelled { dl?.fail(e.description) }
+                lg?("⬇︎✕ ダウンロード失敗: \(url.absoluteString)：\(e.description)")
+            }
+        }
+    }
+
+    private func startSending(_ id: Int, _ h: HTTPHead) {
+        guard var p = pending[id] else { return }
+        let shownReal = VNetURL.toReal(p.shownURL) ?? p.shownURL
+        let shown = h.url == shownReal ? p.shownURL : h.url
+        let type = VNetScheme.contentType(headers: h.headers, real: h.url)
+        let length = h.header("Content-Length").flatMap { Int($0) }
+        let headers = VNetScheme.responseHeaders(type: type, length: length, vnetsMode: false, extra: h.headers)
+        guard let resp = HTTPURLResponse(url: shown, statusCode: h.status, httpVersion: "HTTP/1.1", headerFields: headers) else {
+            pending[id] = nil
+            p.task.didFailWithError(URLError(.badServerResponse))
+            return
+        }
+        p.task.didReceive(resp)
+        p.streamPhase = .sending
+        let queued = p.streamQueue
+        p.streamQueue = []
+        for d in queued { p.task.didReceive(d); p.streamBytes += d.count }
+        let done = p.streamDone
+        pending[id] = p
+        if let done { endStream(id, done) }
+    }
+
+    private func streamData(_ id: Int, _ d: Data) {
+        if let dl = downloadsInFlight[id] { dl.write(d); return }
+        guard var p = pending[id] else { return }
+        if p.streamPhase == .sending {
+            p.task.didReceive(d)
+            p.streamBytes += d.count
+        } else {
+            p.streamQueue.append(d)
+        }
+        pending[id] = p
+    }
+
+    private func endStream(_ id: Int, _ result: Result<HTTPResult, FetchError>) {
+        guard let p = pending.removeValue(forKey: id) else { return }
+        let ms = Int(Date().timeIntervalSince(p.started) * 1000)
+        switch result {
+        case .success(let r):
+            log?("✓ \(r.status) \(r.url.absoluteString)（\(p.streamBytes / 1024)KB・\(ms)ms・流す形）")
+            // リダイレクトの途中で届いた Cookie もあれば、WebKit の置き場に入れておく（同じものを入れ直しても害は無い）
+            if !r.cookieChanges.isEmpty { pushCookies?(r.cookieChanges) {} }
+            p.task.didFinish()
+        case .failure(let e):
+            log?("✕ \(p.realURL.absoluteString)：途中で失敗（\(p.streamBytes / 1024)KB まで）：\(e.description)")
+            p.task.didFailWithError(URLError(e.kind == .timeout ? .timedOut : .networkConnectionLost))
+        }
+    }
+
+    /// 失敗をページにする（説明と、できることのボタン。LAN への移動なら確認のページ）
     private func fail(_ p: Pending, _ e: FetchError) {
         let real = p.realURL
         log?("✕ \(real.absoluteString)：\(e.description)")
-        var html: String
+        let html: String
         if e.kind == .localNetworkConsent && p.context.isTopLevel {
-            let nonce = makeConsentNonce(real)
-            html = VNetScheme.page(title: "LAN の機器を開きますか？", lines: [
+            html = ErrorPage.html(title: "LAN の機器を開きますか？", lines: [
                 "ページが、LAN（家や会社の中のネットワーク）にある次のアドレスへ移動しようとしています。",
-                real.absoluteString, e.description,
-                "心当たりがなければ開かないでください。"],
-                button: ("開く", "window.webkit.messageHandlers.velaAction.postMessage({action:'allowLocalNetwork',nonce:'\(nonce)'})"))
+                real.absoluteString, "心当たりがなければ開かないでください。"],
+                detail: e.description,
+                buttons: [ErrorPage.Button(label: "開く", nonce: actions.make("allowLocalNetwork", url: real), primary: false)],
+                kind: e.kind.rawValue)
+        } else if let http = p.httpsFirstFrom, p.context.isTopLevel, e.kind != .blocked {
+            html = ErrorPage.html(title: "https では開けませんでした", lines: [
+                "\(http.host ?? "") は、安全な接続（https）に対応していないようです。",
+                "http のまま開くと、通信の中身を途中で見られたり、書き換えられたりする可能性があります。"],
+                detail: "\(real.absoluteString)\n\(e.description)",
+                buttons: [ErrorPage.Button(label: "http のまま開く", nonce: actions.make("openHTTP", url: http), primary: false),
+                          ErrorPage.Button(label: "再試行", nonce: actions.make("retry", url: real), primary: true)],
+                kind: "httpsFirst")
         } else {
-            html = VNetScheme.page(title: "読めませんでした", lines: [real.absoluteString, e.description], button: nil)
-        }
-        html += "<!-- vela-error:\(e.kind.rawValue) -->"
-        respond(p.task, url: p.shownURL, status: 502, type: "text/html; charset=utf-8", body: Data(html.utf8), vnetsMode: p.vnetsMode)
-    }
-
-    /// エラー・確認のページ（文字は全部エスケープする）
-    static func page(title: String, lines: [String], button: (String, String)?) -> String {
-        var s = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
-        s += "<title>\(htmlEscape(title))</title></head><body style='font:16px -apple-system;padding:24px;max-width:640px'>"
-        s += "<h3>\(htmlEscape(title))</h3>"
-        for l in lines { s += "<p style='word-break:break-all'>\(htmlEscape(l))</p>" }
-        if let (label, js) = button {
-            s += "<button style='font-size:16px;padding:8px 20px' onclick=\"\(htmlEscape(js))\">\(htmlEscape(label))</button>"
-        }
-        return s + "</body></html>"
-    }
-
-    static func htmlEscape(_ s: String) -> String {
-        var o = ""
-        for c in s {
-            switch c {
-            case "&": o += "&amp;"
-            case "<": o += "&lt;"
-            case ">": o += "&gt;"
-            case "\"": o += "&quot;"
-            case "'": o += "&#39;"
-            default: o.append(c)
+            let d = ErrorPage.describe(e)
+            var buttons = [ErrorPage.Button(label: "再試行", nonce: actions.make("retry", url: real), primary: true)]
+            if d.offerNative && p.context.isTopLevel {
+                buttons.append(ErrorPage.Button(label: "標準の通信で開く", nonce: actions.make("openNative", url: real), primary: false))
             }
+            html = ErrorPage.html(title: d.title, lines: [d.hint, real.absoluteString], detail: e.description, buttons: buttons, kind: e.kind.rawValue)
         }
-        return o
+        respond(p.task, url: p.shownURL, status: 502, type: "text/html; charset=utf-8", body: Data(html.utf8), vnetsMode: p.vnetsMode)
+        if p.context.isTopLevel, let cb = onTopLevelFailure {
+            let u = p.httpsFirstFrom ?? real
+            DispatchQueue.main.async { cb(u, e) }
+        }
     }
 
     // MARK: 移動（リダイレクト）
 
     /// 3xx を WebKit に伝える。WebKit が次の要求を返してきたら、それを読みに行く
-    private func redirect(_ id: ObjectIdentifier, _ p: Pending, status: Int, serverHeaders: [(String, String)], type: String, next: RedirectPolicy.Next) {
+    private func redirect(_ id: Int, _ p: Pending, status: Int, serverHeaders: [(String, String)], type: String, next: RedirectPolicy.Next) {
         let nextShown = p.vnetsMode ? (VNetURL.toVNet(next.url) ?? next.url) : next.url
         let dropped = next.dropped.isEmpty ? "" : "（外したヘッダ: \(next.dropped.joined(separator: ", "))）"
         log?("↪ \(status) \(p.realURL.absoluteString) → \(next.url.absoluteString)\(dropped)")
@@ -2129,7 +3394,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     }
 
     /// WebKit が移動を受け入れた（newReq が次の要求）。nil なら WebKit がやめた（このあと stop が来る）
-    private func afterRedirect(_ id: ObjectIdentifier, _ newReq: NSURLRequest?, body: Data?) {
+    private func afterRedirect(_ id: Int, _ newReq: NSURLRequest?, body: Data?) {
         guard var p = pending[id] else { return }
         guard let newReq, let u = newReq.url, let real = VNetURL.toReal(u), let machine else {
             pending[id] = nil
@@ -2141,6 +3406,8 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         r.mainDocumentURL = newReq.mainDocumentURL
         r.httpShouldHandleCookies = p.request.httpShouldHandleCookies
         let b = newReq.httpBody ?? body
+        // サーバーの移動なら、HTTPS-First の「http のまま開く」は出さない（自分で作った移動のときだけ残す）
+        if p.syntheticRedirect { p.syntheticRedirect = false } else { p.httpsFirstFrom = nil }
         p.context = p.context.redirected(from: p.realURL, to: real)
         p.shownURL = u
         p.realURL = real
@@ -2268,7 +3535,11 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
 
     /// Content-Type。種類が書いていない動画・音声は、拡張子から決める（でないと再生できない）
     static func contentType(_ r: HTTPResult, real: URL) -> String {
-        let type = r.header("Content-Type") ?? "application/octet-stream"
+        contentType(headers: r.headers, real: real)
+    }
+
+    static func contentType(headers: [(String, String)], real: URL) -> String {
+        let type = headers.value(for: "Content-Type") ?? "application/octet-stream"
         let lower = type.lowercased()
         if lower.hasPrefix("application/octet-stream") || lower.hasPrefix("binary/"),
            let guess = mediaTypes[real.pathExtension.lowercased()] {
@@ -2294,7 +3565,8 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
 
     /// 返事のヘッダ: 相手のヘッダ（CSP・X-Frame-Options・動画に要る Content-Range など）＋ 長さ・種類。
     /// CORS（Access-Control-*）はサーバーの答えをそのまま渡す（CORSPassthrough）。Vela が許可を足すことはしない
-    static func responseHeaders(type: String, length: Int, vnetsMode: Bool, extra: [(String, String)]) -> [String: String] {
+    /// length が nil なら Content-Length を付けない（流す形で、長さが分からないとき）
+    static func responseHeaders(type: String, length: Int?, vnetsMode: Bool, extra: [(String, String)]) -> [String: String] {
         var h: [String: String] = [:]
         var names: [String: String] = [:]      // 小文字の名前 → h での名前（同じ名前が何行もあれば「, 」でつなぐ）
         func add(_ k: String, _ v: String) {
@@ -2309,7 +3581,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         }
         for (k, v) in CORSPassthrough.headers(extra, vnetsMode: vnetsMode) { add(k, v) }
         h["Content-Type"] = type
-        h["Content-Length"] = String(length)
+        if let length { h["Content-Length"] = String(length) }
         return h
     }
 
@@ -2399,9 +3671,12 @@ enum HTTPSTakeover {
     }
 
     private static func swap(_ m: Method, sel: Selector, original: IMP) {
-        typealias Orig = @convention(c) (AnyObject, Selector, NSString) -> Bool
+        // scheme は nil のこともありうる（Objective-C は nil を止めない）。nil を NSString として受けて触ると、
+        // 不正なメモリアクセスで落ちるので、Optional で受けて、nil は元の実装に任せる
+        typealias Orig = @convention(c) (AnyObject, Selector, NSString?) -> Bool
         let orig = unsafeBitCast(original, to: Orig.self)
-        let block: @convention(block) (AnyObject, NSString) -> Bool = { cls, scheme in
+        let block: @convention(block) (AnyObject, NSString?) -> Bool = { cls, scheme in
+            guard let scheme else { return orig(cls, sel, nil) }
             let s = (scheme as String).lowercased()
             if s == "http" || s == "https" { return false }
             return orig(cls, sel, scheme)
@@ -3684,6 +4959,36 @@ struct HTTPRequest: Sendable {
     var context = RequestContext()
     /// 取り消しの印（WebKit が読み込みをやめたら cancel される）
     var token: RequestToken?
+    /// 流す形で受け取る相手（nil なら全部貯めてから返す）
+    var sink: StreamSink?
+}
+
+/// 流す形にした返事のヘッダ
+struct HTTPHead: Sendable {
+    var status: Int
+    /// 中身を戻すときは Content-Encoding・Content-Length を外してある
+    var headers: [(String, String)]
+    var url: URL
+    /// この返事で CookieJar に入れた Cookie の変更（WebKit の置き場にも入れてから、ページに返事を渡すこと）
+    var cookieChanges: [CookieChange]
+    func header(_ name: String) -> String? { headers.value(for: name) }
+}
+
+/// 流す形で受け取る相手（VNetScheme）。どれも stack.queue の上で呼ばれる
+final class StreamSink: @unchecked Sendable {
+    /// ヘッダを見て、流す形にするか（3xx などは貯めて、追いかけたり WebKit に移動として渡したりする）
+    let shouldStream: (_ status: Int, _ headers: [(String, String)]) -> Bool
+    /// 流す形にした返事のヘッダ（中身より先に 1 回だけ）
+    let onHead: (HTTPHead) -> Void
+    /// 中身（戻したもの。届いた分ずつ）
+    let onData: (Data) -> Void
+
+    init(shouldStream: @escaping (_ status: Int, _ headers: [(String, String)]) -> Bool,
+         onHead: @escaping (HTTPHead) -> Void, onData: @escaping (Data) -> Void) {
+        self.shouldStream = shouldStream
+        self.onHead = onHead
+        self.onData = onData
+    }
 }
 
 struct HTTPResult: Sendable {
@@ -3693,6 +4998,8 @@ struct HTTPResult: Sendable {
     var url: URL
     /// CookieJar に入れた Cookie の変更（リダイレクトの途中の分も）。ブラウザ（WebKit）の Cookie の置き場にも同じことをする
     var cookieChanges: [CookieChange] = []
+    /// 中身は流す形で StreamSink に渡した（body は空）
+    var streamed = false
     func header(_ name: String) -> String? { headers.value(for: name) }
 }
 
@@ -3770,13 +5077,22 @@ final class HTTPConn: @unchecked Sendable {
     /// 要求を 1 つ送る（返事を読み終わったら done）。何回目の要求か（取り消しに使う番号）を返す
     /// onGrow: 返事の中身が増えたとき（増えたバイト数）
     @discardableResult
+    /// decide: ヘッダを読んだところで呼ぶ。中身を受け取る関数を返したら、流す形にする
     func send(_ bytes: Data, isHead: Bool, limits: ResponseParser.Limits = ResponseParser.Limits(),
-              onGrow: ((Int) -> Void)? = nil, done: @escaping Completion) -> Int {
+              onGrow: ((Int) -> Void)? = nil, decide: ((ResponseParser) -> ((Data) -> Void)?)? = nil,
+              done: @escaping Completion) -> Int {
         uses += 1
         serial += 1
         if !alive { done(.failure(FetchError("接続が閉じています", kind: .reset)), false, true); return serial }
         let p = ResponseParser(isHead: isHead, limits: limits)
         p.onBodyGrow = onGrow
+        if let decide {
+            p.decideStreaming = { [unowned p] in
+                guard let h = decide(p) else { return false }
+                p.onChunk = h
+                return true
+            }
+        }
         parser = p
         onDone = done
         lastActivity = Date()
@@ -4021,13 +5337,20 @@ final class HTTPPool: @unchecked Sendable {
                     return
                 }
                 var held = 0
+                let stream = StreamState()
+                let decide: ((ResponseParser) -> ((Data) -> Void)?)? = req.sink.map { sink in
+                    { [weak self] p in self?.startStream(p, req: req, sink: sink, state: stream) }
+                }
                 let serial = c.send(bytes, isHead: req.method == "HEAD", limits: self.parserLimits(),
-                                    onGrow: { [weak self] n in held += n; self?.bufferedBytes += n }) { [weak self] r, reusable, gotNothing in
+                                    onGrow: { [weak self] n in held += n; self?.bufferedBytes += n },
+                                    decide: decide) { [weak self] r, reusable, gotNothing in
                     guard let self else { return }
                     self.bufferedBytes -= held
                     held = 0
                     self.release(c, reusable: reusable)
                     switch r {
+                    case .success(let p) where p.streaming:
+                        done(self.finishStream(p, req: req, state: stream))
                     case .success(let p):
                         done(self.result(p, req: req))
                     case .failure(let e):
@@ -4044,6 +5367,63 @@ final class HTTPPool: @unchecked Sendable {
                               cancel: { done(.failure(HTTPPool.cancelled)) }, fail: { done(.failure($0)) }, run: run)
             }
         }
+    }
+
+    /// 流す形の途中の様子（1 つの要求の間だけ）
+    private final class StreamState {
+        var sink: StreamSink?
+        var decoder: StreamDecoder?
+        var head: HTTPHead?
+        var failure: FetchError?
+        var bytes = 0
+    }
+
+    /// ヘッダを読んだところで、流す形にするかを決める。流すなら、Cookie を入れて onHead を呼び、中身を受け取る関数を返す
+    private func startStream(_ p: ResponseParser, req: HTTPRequest, sink: StreamSink, state: StreamState) -> ((Data) -> Void)? {
+        guard sink.shouldStream(p.status, p.headers) else { return nil }
+        var headers = p.headers
+        let enc = headers.value(for: "Content-Encoding") ?? ""
+        let decoder: StreamDecoder?
+        switch StreamDecoder.make(encoding: enc) {
+        case .success(let d): decoder = d
+        case .failure: return nil            // 流す形で戻せない縮め方（重ねてあるなど）: 貯める形で読む
+        }
+        if decoder != nil { headers.removeAll(named: ["content-encoding", "content-length"]) }
+        headers.removeAll(named: ["transfer-encoding"])
+        var changes: [CookieChange] = []
+        let lines = headers.values(for: "Set-Cookie")
+        if !lines.isEmpty, let jar = cookieJar { changes = jar.receive(lines, url: req.url, method: req.method, ctx: req.context) }
+        let head = HTTPHead(status: p.status, headers: headers, url: req.url, cookieChanges: changes)
+        state.sink = sink
+        state.decoder = decoder
+        state.head = head
+        sink.onHead(head)
+        return { [weak state] chunk in
+            guard let state, state.failure == nil else { return }
+            state.bytes += chunk.count
+            guard let d = state.decoder else { sink.onData(chunk); return }
+            switch d.feed(chunk) {
+            case .success(let out): if !out.isEmpty { sink.onData(out) }
+            case .failure(let f): state.failure = FetchError(f.description, kind: .malformed)
+            }
+        }
+    }
+
+    /// 流す形の返事を読み終えた
+    private func finishStream(_ p: ResponseParser, req: HTTPRequest, state: StreamState) -> Result<HTTPResult, FetchError> {
+        if let d = state.decoder, state.failure == nil {
+            switch d.finish() {
+            case .success(let out): if !out.isEmpty { state.sink?.onData(out) }
+            case .failure(let f): state.failure = FetchError(f.description, kind: .malformed)
+            }
+        }
+        if let f = state.failure {
+            stack.trace?("流す形の中身を戻せませんでした: \(req.url.absoluteString)（\(f.description)）")
+            return .failure(f)
+        }
+        let h = state.head
+        return .success(HTTPResult(status: p.status, headers: h?.headers ?? p.headers, body: Data(), url: req.url,
+                                   cookieChanges: h?.cookieChanges ?? [], streamed: true))
     }
 
     private func parserLimits() -> ResponseParser.Limits {
@@ -4285,6 +5665,9 @@ final class HTTPPool: @unchecked Sendable {
 //  ・chunked: サイズは 16 進の数字だけ。チャンクの後ろは必ず CRLF。行・トレーラーの長さに上限
 //  ・ヘッダの合計・1 行・行数に上限。中身は limits.maxBody まで
 // 止めた接続は使い回さない（呼ぶ側の HTTPConn が閉じる）
+//
+// 流す形（ストリーミング）: ヘッダを読んだところで decideStreaming が true を返したら、中身は貯めずに
+// 届いた分ずつ onChunk に渡す（大きいファイル・動画でメモリを使わない）。そのときは maxBody の上限はかけない
 
 final class ResponseParser {
     struct Limits {
@@ -4319,8 +5702,16 @@ final class ResponseParser {
     private(set) var received = 0
     /// おかしな返事だった（nil なら問題なし）
     private(set) var failure: Failure?
-    /// 中身が増えたとき（増えたバイト数）。アプリ全体の貯めている量を数えるのに使う
+    /// 中身が増えたとき（増えたバイト数）。アプリ全体の貯めている量を数えるのに使う（流す形のときは呼ばない）
     var onBodyGrow: ((Int) -> Void)?
+    /// ヘッダを読み終えたとき（100 Continue などを除く）。true を返すと、中身を流す形にする
+    var decideStreaming: (() -> Bool)?
+    /// 流す形のときの中身（届いた分ずつ）
+    var onChunk: ((Data) -> Void)?
+    /// 流す形にしたか
+    private(set) var streaming = false
+    /// 受け取った中身のバイト数（流す形でも数える）
+    private(set) var bodyCount = 0
 
     private var head = [UInt8]()
     private var headDone = false
@@ -4380,11 +5771,17 @@ final class ResponseParser {
 
     private func appendBody<C: Collection>(_ b: C) where C.Element == UInt8 {
         if b.isEmpty { return }
+        if streaming {
+            bodyCount += b.count
+            onChunk?(Data(b))
+            return
+        }
         if body.count + b.count > limits.maxBody {
             fail(.tooLarge("中身が \(limits.maxBody >> 20)MB を超えています"))
             return
         }
         body.append(contentsOf: b)
+        bodyCount += b.count
         onBodyGrow?(b.count)
     }
 
@@ -4430,12 +5827,13 @@ final class ResponseParser {
             length = n
         }
         if isHead || status == 204 || status == 304 { complete = true; return }
+        streaming = decideStreaming?() ?? false
         if !te.isEmpty {
             let codings = te.joined(separator: ",").lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
             if codings.last == "chunked" { mode = .chunked }
             else { mode = .untilClose; keepAlive = false }          // chunked で終わらないなら、閉じるまで（RFC 9112 6.3）
         } else if let n = length {
-            if n > limits.maxBody { fail(.tooLarge("Content-Length が \(limits.maxBody >> 20)MB を超えています（\(n)）")); return }
+            if n > limits.maxBody && !streaming { fail(.tooLarge("Content-Length が \(limits.maxBody >> 20)MB を超えています（\(n)）")); return }
             mode = .length(n)
             if n == 0 { complete = true }
         } else {
@@ -4450,9 +5848,9 @@ final class ResponseParser {
             appendBody(b)
             return []
         case .length(let n):
-            let take = min(max(n - body.count, 0), b.count)
+            let take = min(max(n - bodyCount, 0), b.count)
             appendBody(b[0..<take])
-            if body.count >= n { complete = true }
+            if bodyCount >= n { complete = true }
             return Array(b[take...])
         case .chunked:
             var i = 0
@@ -4481,7 +5879,7 @@ final class ResponseParser {
                         guard !sizeText.isEmpty, sizeText.count <= 16, sizeText.allSatisfy({ $0.isHexDigit }), let n = Int(sizeText, radix: 16) else {
                             fail(.malformed("チャンクのサイズが不正: \(sizeText.prefix(20))")); break
                         }
-                        if n > limits.maxBody - body.count { fail(.tooLarge("チャンクが大きすぎます（\(n)）")); break }
+                        if !streaming && n > limits.maxBody - body.count { fail(.tooLarge("チャンクが大きすぎます（\(n)）")); break }
                         chunk = n == 0 ? .trailer : .data(n)
                     }
                 case .data(let remain):
@@ -4648,6 +6046,155 @@ enum ContentDecoding {
     #endif
 }
 
+// MARK: 少しずつ届く縮めた中身を、少しずつ戻す（流す形のとき）
+
+/// 流す形の返事の Content-Encoding を、届いた分ずつ戻す。1 種類の縮め方だけ（重ねてあるものは流さずに貯める形で読む）
+final class StreamDecoder {
+    enum Kind { case gzip, deflate, br }
+
+    /// 縮め方から作る。縮めていない（identity）なら nil。流す形で戻せないものは失敗
+    static func make(encoding: String) -> Result<StreamDecoder?, ContentDecoding.Failure> {
+        let list = encoding.lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty && $0 != "identity" }
+        if list.isEmpty { return .success(nil) }
+        guard list.count == 1 else { return .failure(.unsupported(encoding)) }
+        let kind: Kind
+        switch list[0] {
+        case "gzip", "x-gzip": kind = .gzip
+        case "deflate": kind = .deflate
+        case "br": kind = .br
+        default: return .failure(.unsupported(list[0]))
+        }
+        #if canImport(Compression)
+        if kind == .br, #unavailable(iOS 15.0, macOS 12.0) { return .failure(.unsupported("br")) }
+        guard let d = StreamDecoder(kind: kind) else { return .failure(.unsupported(list[0])) }
+        return .success(d)
+        #else
+        return .failure(.unsupported(list[0]))
+        #endif
+    }
+
+    let kind: Kind
+    let maxOutput: Int
+    private(set) var produced = 0
+    /// 頭（gzip の 10 バイト〜・zlib の 2 バイト）を読み終えるまで貯めておく
+    private var head = [UInt8]()
+    private var headDone = false
+    private var ended = false
+
+    #if canImport(Compression)
+    private var stream: compression_stream
+    private var started = false
+
+    private init?(kind: Kind, maxOutput: Int = Int.max) {
+        self.kind = kind
+        self.maxOutput = maxOutput
+        let dummy = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
+        defer { dummy.deallocate() }
+        stream = compression_stream(dst_ptr: dummy, dst_size: 0, src_ptr: UnsafePointer(dummy), src_size: 0, state: nil)
+        let algorithm: compression_algorithm
+        if kind == .br {
+            if #available(iOS 15.0, macOS 12.0, *) { algorithm = COMPRESSION_BROTLI } else { return nil }
+        } else {
+            algorithm = COMPRESSION_ZLIB      // Apple の ZLIB は「生の deflate」
+        }
+        guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, algorithm) == COMPRESSION_STATUS_OK else { return nil }
+        started = true
+    }
+
+    deinit { if started { compression_stream_destroy(&stream) } }
+    #else
+    private init?(kind: Kind, maxOutput: Int = Int.max) { return nil }
+    #endif
+
+    /// 届いた分を戻す
+    func feed(_ d: Data) -> Result<Data, ContentDecoding.Failure> {
+        if ended { return .success(Data()) }          // 終わった後のもの（gzip の後ろの 8 バイトなど）は捨てる
+        var bytes = [UInt8](d)
+        if !headDone {
+            head += bytes
+            switch skipHead() {
+            case .needMore: return .success(Data())
+            case .bad(let why): return .failure(.corrupt(why))
+            case .done(let rest): headDone = true; bytes = rest; head = []
+            }
+        }
+        return process(bytes, finalize: false)
+    }
+
+    /// 最後まで届いた
+    func finish() -> Result<Data, ContentDecoding.Failure> {
+        if ended { return .success(Data()) }
+        if !headDone { return .failure(.corrupt("頭の途中で終わりました")) }
+        return process([], finalize: true)
+    }
+
+    private enum HeadResult { case needMore, bad(String), done([UInt8]) }
+
+    private func skipHead() -> HeadResult {
+        let b = head
+        switch kind {
+        case .br:
+            return .done(b)
+        case .deflate:
+            // zlib の包み（2 バイト）があれば外す。無いもの（生の deflate）も受ける
+            if b.count < 2 { return .needMore }
+            if b[0] & 0x0F == 8 && (Int(b[0]) << 8 | Int(b[1])) % 31 == 0 { return .done(Array(b[2...])) }
+            return .done(b)
+        case .gzip:
+            if b.count < 10 { return .needMore }
+            guard b[0] == 0x1F, b[1] == 0x8B, b[2] == 8 else { return .bad("gzip の頭が違います") }
+            let flags = b[3]
+            var p = 10
+            if flags & 4 != 0 {                                         // FEXTRA
+                guard p + 2 <= b.count else { return .needMore }
+                p += 2 + (Int(b[p]) | Int(b[p + 1]) << 8)
+            }
+            for flag in [UInt8(8), 16] where flags & flag != 0 {        // FNAME・FCOMMENT（0 で終わる）
+                guard let z = b[min(p, b.count)...].firstIndex(of: 0) else { return .needMore }
+                p = z + 1
+            }
+            if flags & 2 != 0 { p += 2 }                                 // FHCRC
+            if p > b.count { return .needMore }
+            return .done(Array(b[p...]))
+        }
+    }
+
+    private func process(_ src: [UInt8], finalize: Bool) -> Result<Data, ContentDecoding.Failure> {
+        #if canImport(Compression)
+        let chunk = 1 << 16
+        let out = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
+        defer { out.deallocate() }
+        var result = Data()
+        let name = "\(kind)"
+        return src.withUnsafeBufferPointer { sb -> Result<Data, ContentDecoding.Failure> in
+            let empty: [UInt8] = [0]
+            return empty.withUnsafeBufferPointer { eb -> Result<Data, ContentDecoding.Failure> in
+                stream.src_ptr = sb.baseAddress ?? eb.baseAddress!
+                stream.src_size = sb.count
+                while true {
+                    stream.dst_ptr = out
+                    stream.dst_size = chunk
+                    let flags = finalize ? Int32(COMPRESSION_STREAM_FINALIZE.rawValue) : 0
+                    let st = compression_stream_process(&stream, flags)
+                    let n = chunk - stream.dst_size
+                    if produced + n > maxOutput { return .failure(.tooLarge(maxOutput)) }
+                    if n > 0 { result.append(out, count: n); produced += n }
+                    if st == COMPRESSION_STATUS_END { ended = true; return .success(result) }
+                    if st != COMPRESSION_STATUS_OK { return .failure(.corrupt(name)) }
+                    // 入れたものを全部使い切って、出てくるものも無くなったら、次の分を待つ
+                    if stream.src_size == 0 && n < chunk {
+                        if finalize && n == 0 { return .failure(.corrupt("\(name)・途中で切れています")) }
+                        if !finalize { return .success(result) }
+                    }
+                }
+            }
+        }
+        #else
+        return .failure(.unsupported("\(kind)"))
+        #endif
+    }
+}
+
 // MARK: ブラウザらしさ（User-Agent・言語）
 
 enum BrowserIdentity {
@@ -4749,7 +6296,9 @@ final class TLSStream: @unchecked Sendable {
 
     func tcpClosed(_ error: String?) {
         tcpEnded = true
-        drive()
+        // まだ attach していない（TCP がつながる前に閉じた・取り消した）: SecureTransport には触らない。
+        // SSLSetConnection の前に SSLHandshake を呼ぶと、tlsWrite に null が来て落ちた（実機の記録: TLSStream.writeFrom で 0x28）
+        if tcp != nil { drive() }
         if !done { finish(error ?? (handshaking ? "TLS の途中で切れました" : nil)) }
     }
 
@@ -4784,7 +6333,7 @@ final class TLSStream: @unchecked Sendable {
 
     /// 進められるところまで進める（握手 → 読む）
     private func drive() {
-        if done { return }
+        if done || tcp == nil { return }
         if handshaking {
             let st = SSLHandshake(ctx)
             if st == errSSLWouldBlock { return }
@@ -4830,6 +6379,8 @@ final class TLSStream: @unchecked Sendable {
 }
 
 private func tlsRead(_ conn: SSLConnectionRef, _ data: UnsafeMutableRawPointer, _ length: UnsafeMutablePointer<Int>) -> OSStatus {
+    // 念のため: 接続の印が無ければ（SSLSetConnection の前）何も読まない
+    if Int(bitPattern: conn) == 0 { length.pointee = 0; return errSSLClosedAbort }
     let s = Unmanaged<TLSStream>.fromOpaque(conn).takeUnretainedValue()
     let (n, st) = s.readInto(data, length.pointee)
     length.pointee = n
@@ -4837,6 +6388,7 @@ private func tlsRead(_ conn: SSLConnectionRef, _ data: UnsafeMutableRawPointer, 
 }
 
 private func tlsWrite(_ conn: SSLConnectionRef, _ data: UnsafeRawPointer, _ length: UnsafeMutablePointer<Int>) -> OSStatus {
+    if Int(bitPattern: conn) == 0 { length.pointee = 0; return errSSLClosedAbort }
     let s = Unmanaged<TLSStream>.fromOpaque(conn).takeUnretainedValue()
     return s.writeFrom(data, length.pointee)
 }

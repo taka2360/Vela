@@ -13,6 +13,7 @@
 #   Linux には SwiftUI・WebKit・UIKit・Network・Security・Compression・ObjectiveC が無いので、
 #   stubs/ の「形だけの定義」（スタブ）を先にモジュールにして、それを import させて型チェック（-typecheck）する。
 #   さらに #if os(iOS) を「iOS として」読むように、コピーした上で os(iOS) → true に置き換えてから調べる。
+#   Linux の Swift は @objc を受け付けないので、@objc / @objc(セレクタ) も消してから調べる。
 #
 # 終了コード: 0 = エラー無し、1 = エラーあり、2 = 使い方・環境の問題
 set -uo pipefail
@@ -32,7 +33,7 @@ for a in "$@"; do
     case "$a" in
         --keep-warnings) KEEP_WARN=1 ;;
         --timing) TIMING=1 ;;
-        -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
         *) ARGS+=("$a") ;;
     esac
 done
@@ -64,9 +65,13 @@ if [ ! -f "$STAMP" ] || [ -n "$(find "$HERE/stubs" -newer "$STAMP" -name '*.swif
     echo "スタブ（SwiftUI・WebKit など iOS の部品の形だけ）を用意しています…"
     rm -rf "$MODS"; mkdir -p "$MODS"
     for m in UIKit ObjectiveC Compression Security Network WebKit SwiftUI; do
-        if ! "$SWIFTC" -swift-version 5 -parse-as-library -emit-module -module-name "$m" -I "$MODS" \
-                -emit-module-path "$MODS/$m.swiftmodule" "$HERE/stubs/$m.swift" 2>&1 | grep -E "error" ; then :; fi
-        [ -f "$MODS/$m.swiftmodule" ] || { echo "スタブ $m を作れませんでした（stubs/$m.swift を直してください）"; exit 2; }
+        # エラーが 1 つでもあれば止める（古いモジュールのまま調べて「OK」と出さないように、作りかけも消す）
+        if "$SWIFTC" -swift-version 5 -parse-as-library -emit-module -module-name "$m" -I "$MODS" \
+                -emit-module-path "$MODS/$m.swiftmodule" "$HERE/stubs/$m.swift" 2>&1 | grep -E "error"; then
+            rm -rf "$MODS"
+            echo "スタブ $m を作れませんでした（stubs/$m.swift を直してください）"; exit 2
+        fi
+        [ -f "$MODS/$m.swiftmodule" ] || { rm -rf "$MODS"; echo "スタブ $m を作れませんでした（stubs/$m.swift を直してください）"; exit 2; }
     done
     touch "$STAMP"
 fi
@@ -79,7 +84,7 @@ MAIN=0
 for f in "${FILES[@]}"; do
     b=$(basename "$f")
     if [ -e "$WORK/$b" ]; then echo "同じ名前のファイルが 2 つあります: $b"; exit 2; fi
-    sed -E 's/\bos\(iOS\)/true/g; s/\bos\((macOS|watchOS|tvOS|Linux|Windows)\)/false/g' "$f" > "$WORK/$b"
+    sed -E 's/\bos\(iOS\)/true/g; s/\bos\((macOS|watchOS|tvOS|Linux|Windows)\)/false/g; s/@objc(\([A-Za-z0-9_:]*\))?//g' "$f" > "$WORK/$b"
     COPIES+=("$WORK/$b")
     grep -qE '^\s*@main\b' "$f" && MAIN=1
 done

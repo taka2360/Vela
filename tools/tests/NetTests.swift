@@ -321,6 +321,35 @@ func netTests() {
         let r = ok(fetch(m, HTTPRequest(url: url("http://site.test/big"))))
         expectEqual(r?.body.count, 262144)
     }
+    test("流す形: ヘッダ → 中身の順に届き、結果の body は空・3xx は貯めて追いかける") {
+        final class Got: @unchecked Sendable {
+            let lock = NSLock()
+            var heads: [Int] = []
+            var data = Data()
+            var dataBeforeHead = false
+        }
+        let got = Got()
+        let sink = StreamSink(shouldStream: { status, _ in !(300...399).contains(status) },
+                              onHead: { h in got.lock.lock(); got.heads.append(h.status); got.lock.unlock() },
+                              onData: { d in got.lock.lock(); if got.heads.isEmpty { got.dataBeforeHead = true }; got.data.append(d); got.lock.unlock() })
+        var req = HTTPRequest(url: url("http://site.test/big"))
+        req.sink = sink
+        let r = ok(fetch(m, req))
+        expect(r?.streamed == true); expectEqual(r?.body.count, 0)
+        expectEqual(got.heads, [200]); expect(!got.dataBeforeHead)
+        expect(got.data == Data(String(repeating: "0123456789abcdef", count: 16384).utf8), "中身が違う（\(got.data.count)）")
+        let s = statsOf(m)
+        expectEqual(s?.pool.bufferedBytes, 0, "流す形は貯めている量に数えない")
+        var red = HTTPRequest(url: url("http://site.test/to-other"))
+        let got2 = Got()
+        red.sink = StreamSink(shouldStream: { status, _ in !(300...399).contains(status) },
+                              onHead: { h in got2.lock.lock(); got2.heads.append(h.status); got2.lock.unlock() },
+                              onData: { d in got2.lock.lock(); got2.data.append(d); got2.lock.unlock() })
+        let r2 = ok(fetch(m, red))
+        expectEqual(r2?.url.absoluteString, "http://other.test/landing")
+        expectEqual(got2.heads, [200])
+        expectEqual(String(decoding: got2.data, as: UTF8.self), "other:none")
+    }
     tamper(m, drop: 41)
     test("フレームを捨てても（41 個に 1 個）欠けずに届く（送り直し・並べ直し）") {
         let r = ok(fetch(m, HTTPRequest(url: url("http://site.test/big")), timeout: 60))

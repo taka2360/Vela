@@ -17,3 +17,6 @@ VNetMachine.swift
 DevLog.swift
 Persistence.swift
 AddressInput.swift
+ErrorPages.swift
+DownloadFiles.swift
+CrashLog.swift

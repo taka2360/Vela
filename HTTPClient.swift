@@ -24,6 +24,36 @@ struct HTTPRequest: Sendable {
     var context = RequestContext()
     /// 取り消しの印（WebKit が読み込みをやめたら cancel される）
     var token: RequestToken?
+    /// 流す形で受け取る相手（nil なら全部貯めてから返す）
+    var sink: StreamSink?
+}
+
+/// 流す形にした返事のヘッダ
+struct HTTPHead: Sendable {
+    var status: Int
+    /// 中身を戻すときは Content-Encoding・Content-Length を外してある
+    var headers: [(String, String)]
+    var url: URL
+    /// この返事で CookieJar に入れた Cookie の変更（WebKit の置き場にも入れてから、ページに返事を渡すこと）
+    var cookieChanges: [CookieChange]
+    func header(_ name: String) -> String? { headers.value(for: name) }
+}
+
+/// 流す形で受け取る相手（VNetScheme）。どれも stack.queue の上で呼ばれる
+final class StreamSink: @unchecked Sendable {
+    /// ヘッダを見て、流す形にするか（3xx などは貯めて、追いかけたり WebKit に移動として渡したりする）
+    let shouldStream: (_ status: Int, _ headers: [(String, String)]) -> Bool
+    /// 流す形にした返事のヘッダ（中身より先に 1 回だけ）
+    let onHead: (HTTPHead) -> Void
+    /// 中身（戻したもの。届いた分ずつ）
+    let onData: (Data) -> Void
+
+    init(shouldStream: @escaping (_ status: Int, _ headers: [(String, String)]) -> Bool,
+         onHead: @escaping (HTTPHead) -> Void, onData: @escaping (Data) -> Void) {
+        self.shouldStream = shouldStream
+        self.onHead = onHead
+        self.onData = onData
+    }
 }
 
 struct HTTPResult: Sendable {
@@ -33,6 +63,8 @@ struct HTTPResult: Sendable {
     var url: URL
     /// CookieJar に入れた Cookie の変更（リダイレクトの途中の分も）。ブラウザ（WebKit）の Cookie の置き場にも同じことをする
     var cookieChanges: [CookieChange] = []
+    /// 中身は流す形で StreamSink に渡した（body は空）
+    var streamed = false
     func header(_ name: String) -> String? { headers.value(for: name) }
 }
 
@@ -110,13 +142,22 @@ final class HTTPConn: @unchecked Sendable {
     /// 要求を 1 つ送る（返事を読み終わったら done）。何回目の要求か（取り消しに使う番号）を返す
     /// onGrow: 返事の中身が増えたとき（増えたバイト数）
     @discardableResult
+    /// decide: ヘッダを読んだところで呼ぶ。中身を受け取る関数を返したら、流す形にする
     func send(_ bytes: Data, isHead: Bool, limits: ResponseParser.Limits = ResponseParser.Limits(),
-              onGrow: ((Int) -> Void)? = nil, done: @escaping Completion) -> Int {
+              onGrow: ((Int) -> Void)? = nil, decide: ((ResponseParser) -> ((Data) -> Void)?)? = nil,
+              done: @escaping Completion) -> Int {
         uses += 1
         serial += 1
         if !alive { done(.failure(FetchError("接続が閉じています", kind: .reset)), false, true); return serial }
         let p = ResponseParser(isHead: isHead, limits: limits)
         p.onBodyGrow = onGrow
+        if let decide {
+            p.decideStreaming = { [unowned p] in
+                guard let h = decide(p) else { return false }
+                p.onChunk = h
+                return true
+            }
+        }
         parser = p
         onDone = done
         lastActivity = Date()
@@ -361,13 +402,20 @@ final class HTTPPool: @unchecked Sendable {
                     return
                 }
                 var held = 0
+                let stream = StreamState()
+                let decide: ((ResponseParser) -> ((Data) -> Void)?)? = req.sink.map { sink in
+                    { [weak self] p in self?.startStream(p, req: req, sink: sink, state: stream) }
+                }
                 let serial = c.send(bytes, isHead: req.method == "HEAD", limits: self.parserLimits(),
-                                    onGrow: { [weak self] n in held += n; self?.bufferedBytes += n }) { [weak self] r, reusable, gotNothing in
+                                    onGrow: { [weak self] n in held += n; self?.bufferedBytes += n },
+                                    decide: decide) { [weak self] r, reusable, gotNothing in
                     guard let self else { return }
                     self.bufferedBytes -= held
                     held = 0
                     self.release(c, reusable: reusable)
                     switch r {
+                    case .success(let p) where p.streaming:
+                        done(self.finishStream(p, req: req, state: stream))
                     case .success(let p):
                         done(self.result(p, req: req))
                     case .failure(let e):
@@ -384,6 +432,63 @@ final class HTTPPool: @unchecked Sendable {
                               cancel: { done(.failure(HTTPPool.cancelled)) }, fail: { done(.failure($0)) }, run: run)
             }
         }
+    }
+
+    /// 流す形の途中の様子（1 つの要求の間だけ）
+    private final class StreamState {
+        var sink: StreamSink?
+        var decoder: StreamDecoder?
+        var head: HTTPHead?
+        var failure: FetchError?
+        var bytes = 0
+    }
+
+    /// ヘッダを読んだところで、流す形にするかを決める。流すなら、Cookie を入れて onHead を呼び、中身を受け取る関数を返す
+    private func startStream(_ p: ResponseParser, req: HTTPRequest, sink: StreamSink, state: StreamState) -> ((Data) -> Void)? {
+        guard sink.shouldStream(p.status, p.headers) else { return nil }
+        var headers = p.headers
+        let enc = headers.value(for: "Content-Encoding") ?? ""
+        let decoder: StreamDecoder?
+        switch StreamDecoder.make(encoding: enc) {
+        case .success(let d): decoder = d
+        case .failure: return nil            // 流す形で戻せない縮め方（重ねてあるなど）: 貯める形で読む
+        }
+        if decoder != nil { headers.removeAll(named: ["content-encoding", "content-length"]) }
+        headers.removeAll(named: ["transfer-encoding"])
+        var changes: [CookieChange] = []
+        let lines = headers.values(for: "Set-Cookie")
+        if !lines.isEmpty, let jar = cookieJar { changes = jar.receive(lines, url: req.url, method: req.method, ctx: req.context) }
+        let head = HTTPHead(status: p.status, headers: headers, url: req.url, cookieChanges: changes)
+        state.sink = sink
+        state.decoder = decoder
+        state.head = head
+        sink.onHead(head)
+        return { [weak state] chunk in
+            guard let state, state.failure == nil else { return }
+            state.bytes += chunk.count
+            guard let d = state.decoder else { sink.onData(chunk); return }
+            switch d.feed(chunk) {
+            case .success(let out): if !out.isEmpty { sink.onData(out) }
+            case .failure(let f): state.failure = FetchError(f.description, kind: .malformed)
+            }
+        }
+    }
+
+    /// 流す形の返事を読み終えた
+    private func finishStream(_ p: ResponseParser, req: HTTPRequest, state: StreamState) -> Result<HTTPResult, FetchError> {
+        if let d = state.decoder, state.failure == nil {
+            switch d.finish() {
+            case .success(let out): if !out.isEmpty { state.sink?.onData(out) }
+            case .failure(let f): state.failure = FetchError(f.description, kind: .malformed)
+            }
+        }
+        if let f = state.failure {
+            stack.trace?("流す形の中身を戻せませんでした: \(req.url.absoluteString)（\(f.description)）")
+            return .failure(f)
+        }
+        let h = state.head
+        return .success(HTTPResult(status: p.status, headers: h?.headers ?? p.headers, body: Data(), url: req.url,
+                                   cookieChanges: h?.cookieChanges ?? [], streamed: true))
     }
 
     private func parserLimits() -> ResponseParser.Limits {

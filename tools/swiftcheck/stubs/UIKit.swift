@@ -166,3 +166,11 @@ public extension _KeyValueCodingAndObserving {
     func observe<Value>(_ keyPath: KeyPath<Self, Value>, options: NSKeyValueObservingOptions = [],
                         changeHandler: @escaping (Self, NSKeyValueObservedChange<Value>) -> Void) -> NSKeyValueObservation { NSKeyValueObservation() }
 }
+
+// MARK: - 共有シート
+
+open class UIActivity: NSObject {}
+
+open class UIActivityViewController: UIViewController {
+    public init(activityItems: [Any], applicationActivities: [UIActivity]?) { super.init() }
+}

@@ -22,6 +22,9 @@ struct BrowserView: View {
             if store.tabs.count > 1 {
                 TabStrip(store: store)
             }
+            if !store.isOnline {
+                OfflineBanner()
+            }
             Divider()
             PageArea(store: store)
         }
@@ -46,6 +49,7 @@ struct TopBar: View {
                 NavButtons(tab: tab)
                 AddressField(store: store, tab: tab)
                 ReloadButton(tab: tab)
+                DownloadsButton(manager: store.downloads, show: $store.showDownloads)
                 MoreMenu(store: store, tab: tab)
                 Button { store.newTab(url: nil) } label: { Image(systemName: "plus") }
                     .keyboardShortcut("t", modifiers: .command)
@@ -57,6 +61,22 @@ struct TopBar: View {
             LoadingBar(progress: tab.progress, visible: tab.isLoading)
         }
         .background(Color(UIColor.secondarySystemBackground))
+        .sheet(isPresented: $store.showDownloads) { DownloadsView(manager: store.downloads) }
+    }
+}
+
+/// ネットワークにつながっていないときの帯
+struct OfflineBanner: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "wifi.slash")
+            Text("ネットワークにつながっていません")
+        }
+        .font(.system(size: 13, weight: .semibold))
+        .foregroundColor(.white)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 5)
+        .background(Color.orange)
     }
 }
 

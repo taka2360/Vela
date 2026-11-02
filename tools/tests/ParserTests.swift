@@ -86,6 +86,29 @@ func parserTests() {
         expectEqual(grown, 6)
     }
 
+    test("流す形: 中身を貯めずに渡す・上限をかけない・少しずつ届いても同じ") {
+        var l = ResponseParser.Limits(); l.maxBody = 4
+        let p = ResponseParser(isHead: false, limits: l)
+        var got = Data()
+        p.decideStreaming = { true }
+        p.onChunk = { got.append($0) }
+        p.feed(Data("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel".utf8))
+        p.feed(Data("lo\r\n6\r\n world\r\n0\r\n\r\n".utf8))
+        expect(p.complete); expect(p.failure == nil); expect(p.streaming)
+        expectEqual(String(decoding: got, as: UTF8.self), "hello world")
+        expect(p.body.isEmpty, "貯めていない"); expectEqual(p.bodyCount, 11)
+        let q = ResponseParser(isHead: false, limits: l)
+        var n = 0
+        q.decideStreaming = { true }
+        q.onChunk = { n += $0.count }
+        q.feed(Data("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789extra".utf8))
+        expect(q.complete); expectEqual(n, 10)
+        let r = ResponseParser(isHead: false)
+        r.decideStreaming = { false }
+        r.feed(Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nab".utf8))
+        expect(!r.streaming); expectEqual(r.body.count, 2)
+    }
+
     print("ContentDecoding")
     test("知らない縮め方は失敗（生のまま渡さない）") {
         if case .failure(.unsupported("zstd")) = ContentDecoding.decode(Data([1, 2, 3]), encoding: "zstd") {} else { expect(false) }
