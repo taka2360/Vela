@@ -260,8 +260,28 @@ enum TCPSegment {
 
 // MARK: DHCP
 
+/// よく使うポート番号
+enum Port {
+    static let dns: UInt16 = 53
+    static let dhcpServer: UInt16 = 67
+    static let dhcpClient: UInt16 = 68
+}
+
 enum DHCP {
     static let magicCookie: [UInt8] = [99, 130, 83, 99]
+    /// オプションの番号（RFC 2132）
+    enum Opt {
+        static let subnetMask: UInt8 = 1
+        static let router: UInt8 = 3
+        static let dnsServer: UInt8 = 6
+        static let mtu: UInt8 = 26
+        static let requestedIP: UInt8 = 50
+        static let leaseTime: UInt8 = 51
+        static let messageType: UInt8 = 53
+        static let serverID: UInt8 = 54
+        static let paramList: UInt8 = 55
+        static let end: UInt8 = 255
+    }
     static let discover: UInt8 = 1
     static let offer: UInt8 = 2
     static let request: UInt8 = 3

@@ -322,8 +322,8 @@ final class GuestStack: @unchecked Sendable {
 
     private func handleUDP(_ b: [UInt8]) {
         guard let u = UDPDatagram(b) else { return }
-        if u.sport == 67 && u.dport == 68 { handleDHCP(u.payload) }
-        else if u.sport == 53, let q = dnsQueries.removeValue(forKey: u.dport) { q.finish(u.payload) }
+        if u.sport == Port.dhcpServer && u.dport == Port.dhcpClient { handleDHCP(u.payload) }
+        else if u.sport == Port.dns, let q = dnsQueries.removeValue(forKey: u.dport) { q.finish(u.payload) }
     }
 
     private func allocPort() -> UInt16 {
@@ -350,16 +350,16 @@ final class GuestStack: @unchecked Sendable {
         m[10] = 0x80                                       // ブロードキャストで返してほしい
         m.replaceSubrange(28..<34, with: mac)
         m += DHCP.magicCookie
-        m += [53, 1, type]
+        m += [DHCP.Opt.messageType, 1, type]
         if let r = requested {
             // 配列を + でつなぐと型チェックがとても遅いので、1 つずつ足す
-            m.append(contentsOf: [50, 4] as [UInt8])
+            m.append(contentsOf: [DHCP.Opt.requestedIP, 4] as [UInt8])
             m.append(contentsOf: r)
-            m.append(contentsOf: [54, 4] as [UInt8])
+            m.append(contentsOf: [DHCP.Opt.serverID, 4] as [UInt8])
             m.append(contentsOf: router)
         }
-        m += [55, 3, 1, 3, 6, 255]                         // ほしいもの: サブネット・ルーター・DNS
-        sendUDP(sport: 68, dst: Net.broadcastIP, dport: 67, m, broadcast: true)
+        m += [DHCP.Opt.paramList, 3, DHCP.Opt.subnetMask, DHCP.Opt.router, DHCP.Opt.dnsServer, DHCP.Opt.end]                         // ほしいもの: サブネット・ルーター・DNS
+        sendUDP(sport: Port.dhcpClient, dst: Net.broadcastIP, dport: Port.dhcpServer, m, broadcast: true)
         dhcpSentAt = Date()
         trace?(type == DHCP.discover ? "→ DHCP DISCOVER（IP アドレスをください）" : "→ DHCP REQUEST")
     }
@@ -370,7 +370,7 @@ final class GuestStack: @unchecked Sendable {
         let opts = DHCP.options(p)
         if let r = opts[3], r.count >= 4 { router = Array(r[0..<4]) }
         if let d = opts[6], d.count >= 4 { dns = Array(d[0..<4]) }
-        let type = opts[53]?.first ?? 0
+        let type = opts[DHCP.Opt.messageType]?.first ?? 0
         if type == DHCP.offer {
             trace?("← DHCP OFFER \(yiaddr.ipString)")
             sendDHCP(type: DHCP.request, requested: yiaddr)
@@ -413,7 +413,7 @@ final class GuestStack: @unchecked Sendable {
             done(ip)
         }
         trace?("→ DNS \(name) は？")
-        sendUDP(sport: port, dst: dns, dport: 53, packet)
+        sendUDP(sport: port, dst: dns, dport: Port.dns, packet)
     }
 
     // MARK: TCP
@@ -456,7 +456,7 @@ final class GuestStack: @unchecked Sendable {
             q.tries += 1
             if q.tries > 3 { dnsQueries[port] = nil; q.finish(nil); continue }
             q.sentAt = now
-            sendUDP(sport: port, dst: dns, dport: 53, q.packet)
+            sendUDP(sport: port, dst: dns, dport: Port.dns, q.packet)
         }
         for c in Array(tcps.values) { c.tick(now) }
     }
@@ -1044,8 +1044,28 @@ enum TCPSegment {
 
 // MARK: DHCP
 
+/// よく使うポート番号
+enum Port {
+    static let dns: UInt16 = 53
+    static let dhcpServer: UInt16 = 67
+    static let dhcpClient: UInt16 = 68
+}
+
 enum DHCP {
     static let magicCookie: [UInt8] = [99, 130, 83, 99]
+    /// オプションの番号（RFC 2132）
+    enum Opt {
+        static let subnetMask: UInt8 = 1
+        static let router: UInt8 = 3
+        static let dnsServer: UInt8 = 6
+        static let mtu: UInt8 = 26
+        static let requestedIP: UInt8 = 50
+        static let leaseTime: UInt8 = 51
+        static let messageType: UInt8 = 53
+        static let serverID: UInt8 = 54
+        static let paramList: UInt8 = 55
+        static let end: UInt8 = 255
+    }
     static let discover: UInt8 = 1
     static let offer: UInt8 = 2
     static let request: UInt8 = 3
