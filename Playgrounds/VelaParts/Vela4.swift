@@ -168,8 +168,7 @@ enum LibraryKey {
     static func bare(_ s: String) -> String {
         var t = s.lowercased()
         for p in ["https://", "http://"] where t.hasPrefix(p) { t.removeFirst(p.count) }
-        if t.hasPrefix("www.") { t.removeFirst(4) }
-        return t
+        return SiteUtil.stripWWW(t)
     }
 }
 
@@ -487,9 +486,8 @@ enum AddressInput {
     static func shortDisplay(_ url: URL?) -> String {
         guard let u = url else { return "" }
         if u.scheme == "about" { return "" }
-        guard var h = u.host, !h.isEmpty else { return u.absoluteString }
-        if h.hasPrefix("www.") { h.removeFirst(4) }
-        return h
+        guard let h = u.host, !h.isEmpty else { return u.absoluteString }
+        return SiteUtil.stripWWW(h)
     }
 
     /// 検索の結果のページなら、その検索語（アドレス欄に戻すため）
@@ -879,7 +877,7 @@ final class AdBlocker: ObservableObject {
 
     nonisolated static func isDisabled(host: String, in sites: Set<String>) -> Bool {
         let h = host.lowercased()
-        return sites.contains { h == $0 || h.hasSuffix("." + $0) }
+        return sites.contains { SiteUtil.hostMatches(h, domain: $0) }
     }
 
     // MARK: 始める
@@ -925,9 +923,9 @@ final class AdBlocker: ObservableObject {
 
     /// そのサイトで止める・使う
     func toggleSite(_ host: String) {
-        let h = host.lowercased().hasPrefix("www.") ? String(host.lowercased().dropFirst(4)) : host.lowercased()
+        let h = SiteUtil.stripWWW(host.lowercased())
         if AdBlocker.isDisabled(host: h, in: disabledSites) {
-            disabledSites = disabledSites.filter { !(h == $0 || h.hasSuffix("." + $0)) }
+            disabledSites = disabledSites.filter { !SiteUtil.hostMatches(h, domain: $0) }
             log("\(h) で広告ブロックを使います")
         } else {
             disabledSites.insert(h)

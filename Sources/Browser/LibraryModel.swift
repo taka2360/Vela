@@ -27,8 +27,7 @@ enum LibraryKey {
     static func bare(_ s: String) -> String {
         var t = s.lowercased()
         for p in ["https://", "http://"] where t.hasPrefix(p) { t.removeFirst(p.count) }
-        if t.hasPrefix("www.") { t.removeFirst(4) }
-        return t
+        return SiteUtil.stripWWW(t)
     }
 }
 

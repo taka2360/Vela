@@ -44,9 +44,14 @@ enum DownloadFiles {
         return s.isEmpty ? "download" : s
     }
 
+    /// 「Text/HTML; charset=utf-8」→「text/html」（「;」の前の部分を小文字に。空の部分は飛ばす）
+    static func mimeEssence(_ raw: String) -> String {
+        raw.split(separator: ";").first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
+    }
+
     /// ページとして表示できる種類か（できないものはダウンロードにする）
     static func isDisplayable(mime raw: String) -> Bool {
-        let m = raw.split(separator: ";").first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
+        let m = mimeEssence(raw)
         if m.isEmpty { return true }                         // 種類が無い: WebKit に任せる（中身から判断する）
         for p in ["text/", "image/", "video/", "audio/", "multipart/"] where m.hasPrefix(p) { return true }
         let shown: Set<String> = ["application/xhtml+xml", "application/xml", "application/json", "application/javascript",
@@ -84,7 +89,7 @@ enum DownloadFiles {
     }
 
     static func extensionFor(mime raw: String) -> String? {
-        let m = raw.split(separator: ";").first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
+        let m = mimeEssence(raw)
         let map = ["application/pdf": "pdf", "application/zip": "zip", "application/json": "json", "text/plain": "txt",
                    "text/csv": "csv", "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "video/mp4": "mp4",
                    "audio/mpeg": "mp3", "application/gzip": "gz", "application/x-tar": "tar", "application/epub+zip": "epub"]

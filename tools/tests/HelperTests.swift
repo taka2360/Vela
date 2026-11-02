@@ -24,7 +24,18 @@ func helperTests() {
         expectEqual(AddressInput.shortDisplay(url("https://wwwa.com/")), "wwwa.com")
         expectEqual(AddressInput.shortDisplay(url("https://sub.www.a.com/")), "sub.www.a.com")
     }
+    test("SiteUtil.hostMatches / stripWWW") {
+        expect(SiteUtil.hostMatches("a.example.com", domain: "example.com"))
+        expect(!SiteUtil.hostMatches("badexample.com", domain: "example.com"))
+        expect(!SiteUtil.hostMatches("Example.com", domain: "example.com"))
+        expectEqual(SiteUtil.stripWWW("www.a.com"), "a.com")
+        expectEqual(SiteUtil.stripWWW("WWW.a.com"), "WWW.a.com")
+        expectEqual(SiteUtil.stripWWW("www.www.a"), "www.a")
+        expectEqual(SiteUtil.stripWWW("www"), "www")
+    }
     test("MIME の種類（DownloadFiles）") {
+        expectEqual(DownloadFiles.mimeEssence(" Text/HTML ; charset=utf-8"), "text/html")
+        expectEqual(DownloadFiles.mimeEssence(";a"), "a")
         expect(DownloadFiles.isDisplayable(mime: ""))
         expect(DownloadFiles.isDisplayable(mime: "  "))
         expect(DownloadFiles.isDisplayable(mime: "Text/HTML; charset=utf-8"))

@@ -403,7 +403,7 @@ final class BlockEngine: @unchecked Sendable {
     }
 
     static func domainMatches(_ host: String, _ d: String) -> Bool {
-        host == d || host.hasSuffix("." + d)
+        SiteUtil.hostMatches(host, domain: d)
     }
 
     /// URL のホストの位置（"scheme://" の後から、/ ? # : の前まで）

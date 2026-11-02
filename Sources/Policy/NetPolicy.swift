@@ -28,6 +28,16 @@ enum SiteUtil {
         return normalizeHost(h)
     }
 
+    /// host が domain そのもの、またはその下（a.domain）か。小文字にはしない（呼ぶ側でそろえる）
+    static func hostMatches(_ host: String, domain: String) -> Bool {
+        host == domain || host.hasSuffix("." + domain)
+    }
+
+    /// 先頭の「www.」を 1 回だけ外す。小文字にはしない（呼ぶ側でそろえる）
+    static func stripWWW(_ s: String) -> String {
+        s.hasPrefix("www.") ? String(s.dropFirst(4)) : s
+    }
+
     /// IPv4 か IPv6 の数字のアドレスか
     static func isIPLiteral(_ host: String) -> Bool {
         let h = normalizeHost(host)

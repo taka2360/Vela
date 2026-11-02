@@ -105,9 +105,8 @@ enum AddressInput {
     static func shortDisplay(_ url: URL?) -> String {
         guard let u = url else { return "" }
         if u.scheme == "about" { return "" }
-        guard var h = u.host, !h.isEmpty else { return u.absoluteString }
-        if h.hasPrefix("www.") { h.removeFirst(4) }
-        return h
+        guard let h = u.host, !h.isEmpty else { return u.absoluteString }
+        return SiteUtil.stripWWW(h)
     }
 
     /// 検索の結果のページなら、その検索語（アドレス欄に戻すため）

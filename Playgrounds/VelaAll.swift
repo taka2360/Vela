@@ -2163,9 +2163,14 @@ enum DownloadFiles {
         return s.isEmpty ? "download" : s
     }
 
+    /// 「Text/HTML; charset=utf-8」→「text/html」（「;」の前の部分を小文字に。空の部分は飛ばす）
+    static func mimeEssence(_ raw: String) -> String {
+        raw.split(separator: ";").first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
+    }
+
     /// ページとして表示できる種類か（できないものはダウンロードにする）
     static func isDisplayable(mime raw: String) -> Bool {
-        let m = raw.split(separator: ";").first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
+        let m = mimeEssence(raw)
         if m.isEmpty { return true }                         // 種類が無い: WebKit に任せる（中身から判断する）
         for p in ["text/", "image/", "video/", "audio/", "multipart/"] where m.hasPrefix(p) { return true }
         let shown: Set<String> = ["application/xhtml+xml", "application/xml", "application/json", "application/javascript",
@@ -2203,7 +2208,7 @@ enum DownloadFiles {
     }
 
     static func extensionFor(mime raw: String) -> String? {
-        let m = raw.split(separator: ";").first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
+        let m = mimeEssence(raw)
         let map = ["application/pdf": "pdf", "application/zip": "zip", "application/json": "json", "text/plain": "txt",
                    "text/csv": "csv", "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "video/mp4": "mp4",
                    "audio/mpeg": "mp3", "application/gzip": "gz", "application/x-tar": "tar", "application/epub+zip": "epub"]
@@ -3737,8 +3742,7 @@ enum LibraryKey {
     static func bare(_ s: String) -> String {
         var t = s.lowercased()
         for p in ["https://", "http://"] where t.hasPrefix(p) { t.removeFirst(p.count) }
-        if t.hasPrefix("www.") { t.removeFirst(4) }
-        return t
+        return SiteUtil.stripWWW(t)
     }
 }
 
@@ -4056,9 +4060,8 @@ enum AddressInput {
     static func shortDisplay(_ url: URL?) -> String {
         guard let u = url else { return "" }
         if u.scheme == "about" { return "" }
-        guard var h = u.host, !h.isEmpty else { return u.absoluteString }
-        if h.hasPrefix("www.") { h.removeFirst(4) }
-        return h
+        guard let h = u.host, !h.isEmpty else { return u.absoluteString }
+        return SiteUtil.stripWWW(h)
     }
 
     /// 検索の結果のページなら、その検索語（アドレス欄に戻すため）
@@ -4448,7 +4451,7 @@ final class AdBlocker: ObservableObject {
 
     nonisolated static func isDisabled(host: String, in sites: Set<String>) -> Bool {
         let h = host.lowercased()
-        return sites.contains { h == $0 || h.hasSuffix("." + $0) }
+        return sites.contains { SiteUtil.hostMatches(h, domain: $0) }
     }
 
     // MARK: 始める
@@ -4494,9 +4497,9 @@ final class AdBlocker: ObservableObject {
 
     /// そのサイトで止める・使う
     func toggleSite(_ host: String) {
-        let h = host.lowercased().hasPrefix("www.") ? String(host.lowercased().dropFirst(4)) : host.lowercased()
+        let h = SiteUtil.stripWWW(host.lowercased())
         if AdBlocker.isDisabled(host: h, in: disabledSites) {
-            disabledSites = disabledSites.filter { !(h == $0 || h.hasSuffix("." + $0)) }
+            disabledSites = disabledSites.filter { !SiteUtil.hostMatches(h, domain: $0) }
             log("\(h) で広告ブロックを使います")
         } else {
             disabledSites.insert(h)
@@ -5097,7 +5100,7 @@ final class BlockEngine: @unchecked Sendable {
     }
 
     static func domainMatches(_ host: String, _ d: String) -> Bool {
-        host == d || host.hasSuffix("." + d)
+        SiteUtil.hostMatches(host, domain: d)
     }
 
     /// URL のホストの位置（"scheme://" の後から、/ ? # : の前まで）
@@ -6993,6 +6996,16 @@ enum SiteUtil {
     static func host(of url: URL) -> String? {
         guard let h = url.host, !h.isEmpty else { return nil }
         return normalizeHost(h)
+    }
+
+    /// host が domain そのもの、またはその下（a.domain）か。小文字にはしない（呼ぶ側でそろえる）
+    static func hostMatches(_ host: String, domain: String) -> Bool {
+        host == domain || host.hasSuffix("." + domain)
+    }
+
+    /// 先頭の「www.」を 1 回だけ外す。小文字にはしない（呼ぶ側でそろえる）
+    static func stripWWW(_ s: String) -> String {
+        s.hasPrefix("www.") ? String(s.dropFirst(4)) : s
     }
 
     /// IPv4 か IPv6 の数字のアドレスか
