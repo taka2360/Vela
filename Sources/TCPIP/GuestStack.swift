@@ -45,11 +45,10 @@ final class GuestStack: @unchecked Sendable {
     // MARK: 受け取り
 
     func input(_ f: [UInt8]) {
-        guard f.count >= Ethernet.headerSize else { return }
-        let body = Array(f[Ethernet.headerSize...])
-        switch f.be16(at: 12) {
-        case EtherType.arp: handleARP(body)
-        case EtherType.ipv4: handleIPv4(body)
+        guard let e = EthernetFrame(f) else { return }
+        switch e.type {
+        case EtherType.arp: handleARP(e.body)
+        case EtherType.ipv4: handleIPv4(e.body)
         default: break
         }
     }
@@ -67,9 +66,8 @@ final class GuestStack: @unchecked Sendable {
     }
 
     private func handleARP(_ p: [UInt8]) {
-        guard p.count >= 28 else { return }
-        let op = p.be16(at: 6)
-        let senderMAC = Array(p[8..<14]), senderIP = Array(p[14..<18]), target = Array(p[24..<28])
+        guard let a = ARPPacket(p) else { return }
+        let op = a.op, senderMAC = a.senderMAC, senderIP = a.senderIP, target = a.targetIP
         if op == ARP.reply && senderIP == router {
             if routerMAC == nil { trace?("← ARP \(router.ipString) は \(senderMAC.macString)") }
             routerMAC = senderMAC

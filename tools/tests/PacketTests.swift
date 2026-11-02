@@ -38,6 +38,26 @@ func packetTests() {
         expectEqual(Checksum.internet(Array(ip[0..<20])), 0)       // 正しいヘッダーは 0 になる
     }
 
+    test("EthernetFrame・ARPPacket を読む") {
+        let mac: [UInt8] = [2, 0, 0, 0, 0, 9]
+        let f = arpFrame(op: ARP.request, srcMAC: mac, senderIP: [10, 0, 2, 9], targetIP: Net.dns)
+        guard let e = EthernetFrame(f) else { expect(false, "nil"); return }
+        expectEqual(e.type, EtherType.arp)
+        expectEqual(e.src, mac)
+        expect(e.srcIsUnicast)
+        expectEqual(e.body.count, 28)
+        guard let a = ARPPacket(e.body) else { expect(false, "nil"); return }
+        expectEqual(a.op, ARP.request)
+        expectEqual(a.senderMAC, mac)
+        expectEqual(a.senderIP, [10, 0, 2, 9])
+        expectEqual(a.targetIP, Net.dns)
+        expect(EthernetFrame(Array(f.prefix(13))) == nil)
+        expect(EthernetFrame(Array(f.prefix(14)))?.body == [])
+        expect(ARPPacket(Array(e.body.prefix(27))) == nil)
+        let multi = Ethernet.frame(dst: Net.broadcastMAC, src: [1, 0, 0, 0, 0, 1], type: EtherType.ipv4, [])
+        expect(EthernetFrame(multi)?.srcIsUnicast == false)
+    }
+
     test("DNS の問い合わせと返事") {
         let q = DNSMessage.query(name: "a.example.com", id: 0x1234)
         expectEqual(Array(q[0..<12]), [0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0])

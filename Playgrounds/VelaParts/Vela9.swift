@@ -256,11 +256,10 @@ final class GuestStack: @unchecked Sendable {
     // MARK: 受け取り
 
     func input(_ f: [UInt8]) {
-        guard f.count >= Ethernet.headerSize else { return }
-        let body = Array(f[Ethernet.headerSize...])
-        switch f.be16(at: 12) {
-        case EtherType.arp: handleARP(body)
-        case EtherType.ipv4: handleIPv4(body)
+        guard let e = EthernetFrame(f) else { return }
+        switch e.type {
+        case EtherType.arp: handleARP(e.body)
+        case EtherType.ipv4: handleIPv4(e.body)
         default: break
         }
     }
@@ -278,9 +277,8 @@ final class GuestStack: @unchecked Sendable {
     }
 
     private func handleARP(_ p: [UInt8]) {
-        guard p.count >= 28 else { return }
-        let op = p.be16(at: 6)
-        let senderMAC = Array(p[8..<14]), senderIP = Array(p[14..<18]), target = Array(p[24..<28])
+        guard let a = ARPPacket(p) else { return }
+        let op = a.op, senderMAC = a.senderMAC, senderIP = a.senderIP, target = a.targetIP
         if op == ARP.reply && senderIP == router {
             if routerMAC == nil { trace?("← ARP \(router.ipString) は \(senderMAC.macString)") }
             routerMAC = senderMAC
@@ -865,6 +863,35 @@ enum Ethernet {
         var f = dst + src
         f.appendBE16(type)
         return f + payload
+    }
+}
+
+/// 届いたイーサネットのフレームを読む（短すぎれば nil）
+struct EthernetFrame {
+    let raw: [UInt8]
+    init?(_ f: [UInt8]) {
+        guard f.count >= Ethernet.headerSize else { return nil }
+        raw = f
+    }
+    var type: UInt16 { raw.be16(at: 12) }
+    var src: [UInt8] { Array(raw[6..<12]) }
+    /// ブロードキャスト・マルチキャストでない送り元か（送り元の先頭のバイトの一番下のビットが 0）
+    var srcIsUnicast: Bool { raw[6] & 1 == 0 }
+    var body: [UInt8] { Array(raw[Ethernet.headerSize...]) }
+}
+
+/// 届いた ARP を読む（イーサネット・IPv4 用。短すぎれば nil）
+struct ARPPacket {
+    let op: UInt16
+    let senderMAC: [UInt8]
+    let senderIP: [UInt8]
+    let targetIP: [UInt8]
+    init?(_ p: [UInt8]) {
+        guard p.count >= 28 else { return nil }
+        op = p.be16(at: 6)
+        senderMAC = Array(p[8..<14])
+        senderIP = Array(p[14..<18])
+        targetIP = Array(p[24..<28])
     }
 }
 

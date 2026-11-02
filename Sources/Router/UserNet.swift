@@ -73,12 +73,11 @@ final class UserNet: @unchecked Sendable {
     // MARK: イーサネット
 
     private func handleFrame(_ f: [UInt8]) {
-        guard f.count >= Ethernet.headerSize else { return }
-        if f[6] & 1 == 0 { guestMAC = Array(f[6..<12]) }
-        let body = Array(f[Ethernet.headerSize...])
-        switch f.be16(at: 12) {
-        case EtherType.arp: handleARP(body)
-        case EtherType.ipv4: handleIPv4(body)
+        guard let e = EthernetFrame(f) else { return }
+        if e.srcIsUnicast { guestMAC = e.src }
+        switch e.type {
+        case EtherType.arp: handleARP(e.body)
+        case EtherType.ipv4: handleIPv4(e.body)
         default: break        // IPv6 などは使わない
         }
     }
@@ -90,10 +89,10 @@ final class UserNet: @unchecked Sendable {
     // MARK: ARP
 
     private func handleARP(_ p: [UInt8]) {
-        guard p.count >= 28, p.be16(at: 6) == ARP.request else { return }     // 問い合わせだけ
-        let target = Array(p[24..<28])
+        guard let a = ARPPacket(p), a.op == ARP.request else { return }      // 問い合わせだけ
+        let target = a.targetIP
         guard Net.isLocal(target), target != Net.guestIP else { return }
-        let senderMAC = Array(p[8..<14]), senderIP = Array(p[14..<18])
+        let senderMAC = a.senderMAC, senderIP = a.senderIP
         let r = ARP.packet(op: ARP.reply, senderMAC: Net.routerMAC, senderIP: target, targetMAC: senderMAC, targetIP: senderIP)
         sendEthernet(EtherType.arp, r, to: senderMAC)
     }
