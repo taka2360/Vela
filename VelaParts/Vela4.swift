@@ -1,5 +1,5 @@
 // このファイルは merge_swift.py で自動生成したものです（直接編集しないでください）
-// VelaParts の 4 / 4。全部まとめて Playgrounds に入れる（VelaAll.swift とは一緒に入れない）
+// VelaParts の 4 / 6。全部まとめて Playgrounds に入れる（VelaAll.swift とは一緒に入れない）
 
 import SwiftUI
 import WebKit
@@ -16,1295 +16,1176 @@ import Security
 #endif
 
 // ======================================================================
-// MARK: - VNetMachine.swift
+// MARK: - HSTSStore.swift
 // ======================================================================
 
-// MARK: - 全部をつなぐ
+// MARK: - HSTS（「このサイトは https だけで開く」の記録）
 //
-//  [ゲスト側]  HTTPPool（http・https）→ GuestStack → VirtioNetDriver
-//                                         ↓ ↑（RAM の中のキューと、レジスタ）
-//  [カード]                             VirtioNet
-//                                         ↓ onTransmit      ↑ receive
-//  [ルーター]                           UserNet（小さなルーター）→ iPad の通信 → インターネット
-//
-// ゲスト側とカードは queue の上で動く。ルーターは自分のキューで動き、フレームを渡すときだけ行き来する
+// 決まり（README と開発者パネルにも書く）:
+//  ・VNet が受け取った https の応答で、トップレベルかファーストパーティ（トップと同じサイト）のものからだけ登録する
+//    （サードパーティの応答・http の応答・数字のアドレスのホストは無視する。サードパーティから登録させると、追跡に使えてしまう）
+//  ・max-age で期限を決める。max-age=0 は消す。includeSubDomains に対応
+//  ・ホスト名は SiteUtil.normalizeHost でそろえる
+//  ・Application Support に保存する（期限切れは読み込むときに消す。最大 maxEntries 件。あふれたら期限の近いものから消す）
+//  ・使い道: http:// への移動とリダイレクトを https に上げる
 
-final class VNetMachine: @unchecked Sendable {
-    let queue = DispatchQueue(label: "vnet-guest")
-    let ram = GuestRAM(megabytes: 4)
-    let card: VirtioNet
-    let driver: VirtioNetDriver
-    let stack: GuestStack
-    let router: UserNet
-    let pool: HTTPPool
-    /// ログ（どのスレッドからも呼ばれる）
-    var log: (@Sendable (String) -> Void)?
-    private var ready = false
-    private var waiting: [() -> Void] = []
-    /// 統計: カードを通ったフレームの数とバイト数
-    private var framesOut = 0, framesIn = 0, bytesOut = 0, bytesIn = 0
-
-    init(factory: UserNetSocketFactory) {
-        card = VirtioNet(memory: ram)
-        driver = VirtioNetDriver(dev: card, ram: ram)
-        stack = GuestStack(queue: queue)
-        router = UserNet(factory: factory)
-        pool = HTTPPool(stack: stack)
-        // ゲスト → カード → ルーター
-        stack.output = { [unowned self] f in self.driver.send(f) }
-        card.onTransmit = { [unowned self] f in
-            self.framesOut += 1; self.bytesOut += f.count
-            self.router.input(f)
-        }
-        // ルーター → カード → ゲスト（カードとゲストは queue の上で触る）
-        router.onFrame = { [weak self] f in
-            guard let self else { return }
-            self.queue.async {
-                self.framesIn += 1; self.bytesIn += f.count
-                self.card.receive(f)
-                self.driver.poll()          // 割り込みを見て、届いたフレームを取り出す
-            }
-        }
-        driver.onReceive = { [unowned self] f in self.stack.input(f) }
-        stack.trace = { [weak self] s in self?.log?(s) }
-        router.log = { [weak self] s in self?.log?(s) }
-    }
-
-    /// カードを準備して DHCP で IP アドレスをもらう
-    func boot() {
-        queue.async {
-            do {
-                try self.driver.start()
-                self.stack.mac = self.driver.mac
-                self.log?("カードの準備ができました（MAC \(self.driver.mac.macString)）")
-            } catch {
-                self.log?("カードを準備できません: \(error)")
-                return
-            }
-            self.stack.start {
-                self.ready = true
-                let w = self.waiting
-                self.waiting = []
-                for f in w { f() }
-            }
-        }
-    }
-
-    /// 送って返事を受け取る（結果は done に、queue の上で返る）
-    /// followRedirects: false なら 3xx もそのまま返す（移動はブラウザに任せる）
-    func send(_ req: HTTPRequest, followRedirects: Bool = true, _ done: @escaping @Sendable (Result<HTTPResult, FetchError>) -> Void) {
-        queue.async {
-            let go = { self.pool.send(req, followRedirects: followRedirects) { r in done(r) } }
-            if self.ready { go() } else { self.waiting.append(go) }
-        }
-    }
-
-    /// ブラウザの User-Agent を使う
-    func setUserAgent(_ ua: String) { queue.async { self.pool.userAgent = ua } }
-
-    /// 守りの決まり（Cookie の写し・HSTS・LAN の保護）を渡す。pool は queue の上でしか触らない
-    func configurePolicies(cookieJar: CookieJar, hsts: HSTSStore, localNetworkProtection: Bool) {
-        queue.async {
-            self.pool.cookieJar = cookieJar
-            self.pool.hsts = hsts
-            self.pool.localNetworkProtection = localNetworkProtection
-            self.pool.policyLog = { [weak self] s in self?.log?(s) }
-        }
-    }
-
-    /// 開発者向けの数字のスナップショット
-    struct Stats: Sendable {
-        var framesOut = 0, framesIn = 0, bytesOut = 0, bytesIn = 0
-        var pool = PoolStats()
-        var droppedRx = 0
-        var tcpRetransmits = 0
-        /// 順番を飛ばして届き、取っておいたセグメント
-        var tcpReordered = 0
-        /// IP アドレスをもらえたか・もらった IP
-        var ready = false
-        var ip = ""
-
-        var summary: String {
-            "フレーム 送 \(framesOut)（\(bytesOut / 1024)KB）・受 \(framesIn)（\(bytesIn / 1024)KB）・接続 新 \(pool.opened) 使い回し \(pool.reused)"
-                + "・使用中 \(pool.busy) 待ち \(pool.waiting)" + (pool.bufferedBytes > 0 ? "・読み途中 \(pool.bufferedBytes / 1024)KB" : "")
-                + (droppedRx > 0 ? "・捨てたフレーム \(droppedRx)" : "") + (tcpRetransmits > 0 ? "・TCP 送り直し \(tcpRetransmits)" : "")
-        }
-    }
-
-    /// 数字を queue の上で集めて、done に渡す（画面のスレッドから直接読むと、値を書き換えている途中とぶつかるため）
-    func stats(_ done: @escaping @Sendable (Stats) -> Void) {
-        queue.async {
-            let s = Stats(framesOut: self.framesOut, framesIn: self.framesIn, bytesOut: self.bytesOut, bytesIn: self.bytesIn,
-                          pool: self.pool.stats(), droppedRx: self.card.droppedRx, tcpRetransmits: self.stack.retransmits,
-                          tcpReordered: self.stack.reordered,
-                          ready: self.stack.ready, ip: self.stack.ready ? self.stack.ip.ipString : "")
-            done(s)
-        }
-    }
+struct HSTSEntry: Codable, Equatable, Sendable {
+    var host: String
+    var expires: Date
+    var includeSubDomains: Bool
 }
 
-// ======================================================================
-// MARK: - VNetCore.swift
-// ======================================================================
-
-// MARK: - 実験用の「機械」の部品
-//
-// Android エミュレータと同じ virtio-net（仮想 LAN カード）を使う。
-// 本物のエミュレータでは Linux（ゲスト）がこのカードを動かすが、この実験アプリでは
-// ゲストの代わりに、Swift で書いた小さな「ドライバ」と「TCP/IP」（GuestStack）が動かす。
-//
-//   ブラウザ（WKWebView）→ HTTPPool → GuestStack（TCP/IP）→ VirtioNetDriver
-//     → VirtioNet（仮想 LAN カード）→ UserNet（小さなルーター）→ iPad の通信
-
-/// ゲストの RAM（virtio のキューと、フレームの入れ物を置く）。アドレスは 0x4000_0000 から
-final class GuestRAM: @unchecked Sendable {
-    let base: UInt64 = 0x4000_0000
-    let size: UInt64
-    private let words: UnsafeMutablePointer<UInt64>
-    private var next: UInt64 = 0
-
-    init(megabytes: Int) {
-        size = UInt64(megabytes) << 20
-        words = .allocate(capacity: Int(size / 8))
-        words.initialize(repeating: 0, count: Int(size / 8))
-    }
-    deinit { words.deallocate() }
-
-    /// 置き場所をもらう（align の倍数に揃える）。戻り値はゲストの物理アドレス
-    func alloc(_ count: Int, align: UInt64 = 16) -> UInt64 {
-        next = (next + align - 1) / align * align
-        let a = base + next
-        next += UInt64(count)
-        precondition(next <= size, "GuestRAM が足りません")
-        return a
-    }
-
-    /// ドライバ用（自分で置いた場所なので確かめない）
-    func pointer(_ pa: UInt64) -> UnsafeMutableRawPointer { UnsafeMutableRawPointer(words) + Int(pa - base) }
-    /// カード用（ゲストが書いたアドレスなので、RAM の中に収まるか確かめる）
-    func pointer(_ pa: UInt64, count: Int) -> UnsafeMutableRawPointer? {
-        let off = pa &- base
-        guard pa >= base, off <= size, UInt64(count) <= size - off else { return nil }
-        return UnsafeMutableRawPointer(words) + Int(off)
-    }
-
-    func load16(_ pa: UInt64) -> UInt16 { pointer(pa).loadUnaligned(as: UInt16.self) }
-    func load32(_ pa: UInt64) -> UInt32 { pointer(pa).loadUnaligned(as: UInt32.self) }
-    func store16(_ pa: UInt64, _ v: UInt16) { pointer(pa).storeBytes(of: v, as: UInt16.self) }
-    func store32(_ pa: UInt64, _ v: UInt32) { pointer(pa).storeBytes(of: v, as: UInt32.self) }
-    func store64(_ pa: UInt64, _ v: UInt64) { pointer(pa).storeBytes(of: v, as: UInt64.self) }
-}
-
-// MARK: - virtio-mmio の決まり（カードとドライバの両方が使う）
-
-enum VirtioMMIO {
-    /// レジスタの位置
-    enum Reg {
-        static let magic: UInt64 = 0x000
-        static let version: UInt64 = 0x004
-        static let deviceID: UInt64 = 0x008
-        static let vendorID: UInt64 = 0x00C
-        static let deviceFeatures: UInt64 = 0x010
-        static let deviceFeaturesSel: UInt64 = 0x014
-        static let driverFeatures: UInt64 = 0x020
-        static let driverFeaturesSel: UInt64 = 0x024
-        static let guestPageSize: UInt64 = 0x028          // legacy
-        static let queueSel: UInt64 = 0x030
-        static let queueNumMax: UInt64 = 0x034
-        static let queueNum: UInt64 = 0x038
-        static let queueAlign: UInt64 = 0x03C             // legacy
-        static let queuePFN: UInt64 = 0x040               // legacy
-        static let queueReady: UInt64 = 0x044
-        static let queueNotify: UInt64 = 0x050
-        static let interruptStatus: UInt64 = 0x060
-        static let interruptACK: UInt64 = 0x064
-        static let status: UInt64 = 0x070
-        static let queueDescLow: UInt64 = 0x080
-        static let queueDescHigh: UInt64 = 0x084
-        static let queueAvailLow: UInt64 = 0x090
-        static let queueAvailHigh: UInt64 = 0x094
-        static let queueUsedLow: UInt64 = 0x0A0
-        static let queueUsedHigh: UInt64 = 0x0A4
-        static let config: UInt64 = 0x100                 // ここから先がカードごとの設定（ネットワークなら MAC アドレス）
-    }
-    static let magicValue: UInt32 = 0x7472_6976           // "virt"
-    static let vendorQEMU: UInt32 = 0x554D_4551           // "QEMU"
-    static let deviceNet: UInt32 = 1
-
-    /// 状態（status）のビット
-    static let statusAcknowledge: UInt32 = 1
-    static let statusDriver: UInt32 = 2
-    static let statusDriverOK: UInt32 = 4
-
-    /// 機能のビット
-    static let featureNetMAC: UInt64 = 1 << 5
-    static let featureVersion1: UInt64 = 1 << 32
-
-    /// 記述子の flags
-    static let descNext: UInt16 = 1
-    static let descWrite: UInt16 = 2
-
-    /// キューの番号（ネットワーク）
-    static let rxQueue = 0
-    static let txQueue = 1
-
-    /// virtio_net_hdr の大きさ（古い形 = legacy、MRG_RXBUF なし）
-    static let netHeaderSize = 10
-}
-
-// MARK: - virtio-mmio のネットワーク（Linux では eth0 になる）
-//
-// キューは 2 つ: 0 = 受け取り用（OS が空の入れ物を並べておく）、1 = 送り出し用。
-// 1 つの入れ物 = [virtio_net_hdr 10 バイト] [イーサネットのフレーム]
-// 送り出されたフレームは onTransmit に渡す。外から届いたフレームは receive(_:) で受け取り、
-// OS が並べた入れ物に書き込む（入れ物が無ければ、来るまで取っておく）。
-// receive はほかのスレッドから呼んでもよい（鍵で守る）。入れ物に書くのは CPU の側（interruptLine を見るとき）
-final class VirtioNet: @unchecked Sendable {
-    let legacy: Bool
-    let mac = Net.guestMAC
-    /// OS が送り出したフレーム（ヘッダを除いたイーサネットのフレーム）
-    var onTransmit: (([UInt8]) -> Void)?
-
-    static let queueMax: UInt32 = 256
-    static let maxPending = 512
-
-    private let ram: GuestRAM
-
-    private struct Queue {
-        var num: UInt32 = 0
-        var ready: UInt32 = 0
-        var desc: UInt64 = 0
-        var avail: UInt64 = 0
-        var used: UInt64 = 0
-        var lastAvail: UInt16 = 0
-        var align: UInt32 = 4096
-        var pfn: UInt32 = 0
-        /// 入れ物の数（ドライバが決めていなければ最大）
-        var size: UInt16 { UInt16(num == 0 ? VirtioNet.queueMax : num) }
-    }
-    private var queues = [Queue(), Queue()]
-    private var status: UInt32 = 0
-    private var deviceFeaturesSel: UInt32 = 0
-    private var driverFeaturesSel: UInt32 = 0
-    private var driverFeatures: UInt64 = 0
-    private var queueSel: UInt32 = 0
-    private var interruptStatus: UInt32 = 0
-    private var guestPageSize: UInt32 = 4096
-
-    /// まだ OS に渡していない受け取ったフレーム
-    private var pending: [[UInt8]] = []
-    /// RX キューがいっぱいで捨てたフレームの数（lock で守る）
-    private var dropped = 0
-    var droppedRx: Int { lock.lock(); defer { lock.unlock() }; return dropped }
-    private let lock = NSLock()
-    private var hasPending = false
-
-    init(memory: GuestRAM, legacy: Bool = true) {
-        ram = memory
-        self.legacy = legacy
-    }
-
-    var interruptLine: Bool {
-        if hasPending { deliverPending() }
-        return interruptStatus != 0
-    }
-
-    /// 外から届いたフレームを受け取る（どのスレッドからでもよい）
-    func receive(_ frame: [UInt8]) {
-        lock.lock()
-        if pending.count >= VirtioNet.maxPending { pending.removeFirst(); dropped += 1 }
-        pending.append(frame)
-        hasPending = true
-        lock.unlock()
-    }
-
-    /// 持っている機能: MAC。バージョン 2 なら VERSION_1 も
-    private var deviceFeatures: UInt64 { (legacy ? 0 : VirtioMMIO.featureVersion1) | VirtioMMIO.featureNetMAC }
-
-    private func reset() {
-        status = 0
-        deviceFeaturesSel = 0
-        driverFeaturesSel = 0
-        driverFeatures = 0
-        queueSel = 0
-        interruptStatus = 0
-        guestPageSize = 4096
-        queues = [Queue(), Queue()]
-    }
-
-    // MARK: レジスタ
-
-    func read(_ offset: UInt64, size width: Int) -> UInt64 {
-        typealias R = VirtioMMIO.Reg
-        if offset >= R.config {
-            // 設定領域: 先頭 6 バイトが MAC アドレス
-            var r: UInt64 = 0
-            for k in 0..<width {
-                let i = Int(offset - R.config) + k
-                if i < mac.count { r |= UInt64(mac[i]) << UInt64(8 * k) }
+enum HSTSPolicy {
+    /// Strict-Transport-Security の値を読む。読めなければ nil
+    static func parse(_ header: String) -> (maxAge: Int, includeSubDomains: Bool)? {
+        var maxAge: Int?
+        var sub = false
+        var seen = Set<String>()
+        for raw in header.split(separator: ";") {
+            let d = raw.trimmingCharacters(in: .whitespaces)
+            if d.isEmpty { continue }
+            let k: String, v: String
+            if let eq = d.firstIndex(of: "=") {
+                k = d[..<eq].trimmingCharacters(in: .whitespaces).lowercased()
+                v = d[d.index(after: eq)...].trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            } else {
+                k = d.lowercased(); v = ""
             }
-            return r
-        }
-        let qs = Int(queueSel)
-        let ok = qs < queues.count
-        switch offset {
-        case R.magic: return UInt64(VirtioMMIO.magicValue)
-        case R.version: return legacy ? 1 : 2
-        case R.deviceID: return UInt64(VirtioMMIO.deviceNet)
-        case R.vendorID: return UInt64(VirtioMMIO.vendorQEMU)
-        case R.deviceFeatures: return deviceFeaturesSel < 2 ? (deviceFeatures >> UInt64(32 * deviceFeaturesSel)) & 0xFFFF_FFFF : 0
-        case R.queueNumMax: return ok ? UInt64(VirtioNet.queueMax) : 0
-        case R.queuePFN: return legacy && ok ? UInt64(queues[qs].pfn) : 0
-        case R.queueReady: return ok ? UInt64(queues[qs].ready) : 0
-        case R.interruptStatus: return UInt64(interruptStatus)
-        case R.status: return UInt64(status)
-        default: return 0
-        }
-    }
-
-    func write(_ offset: UInt64, size width: Int, value: UInt64) {
-        typealias R = VirtioMMIO.Reg
-        let v = UInt32(truncatingIfNeeded: value)
-        let qs = Int(queueSel)
-        let ok = qs < queues.count
-        switch offset {
-        case R.deviceFeaturesSel: deviceFeaturesSel = v
-        case R.driverFeatures:
-            if driverFeaturesSel < 2 {
-                let shift = UInt64(32 * driverFeaturesSel)
-                driverFeatures = (driverFeatures & ~(0xFFFF_FFFF << shift)) | (UInt64(v) << shift)
-            }
-        case R.driverFeaturesSel: driverFeaturesSel = v
-        case R.guestPageSize: if legacy { guestPageSize = v == 0 ? 4096 : v }
-        case R.queueSel: queueSel = v
-        case R.queueNum: if ok { queues[qs].num = min(v, VirtioNet.queueMax) }
-        case R.queueAlign: if legacy && ok { queues[qs].align = v == 0 ? 4096 : v }
-        case R.queuePFN: if legacy && ok { setLegacyQueue(qs, pfn: v) }
-        case R.queueReady: if ok { queues[qs].ready = v & 1 }
-        case R.queueNotify:
-            if v == UInt32(VirtioMMIO.txQueue) { transmit() } else if v == UInt32(VirtioMMIO.rxQueue) { deliverPending() }
-        case R.interruptACK: interruptStatus &= ~v
-        case R.status: if v == 0 { reset() } else { status = v }
-        case R.queueDescLow: if ok { queues[qs].desc = setLow(queues[qs].desc, v) }
-        case R.queueDescHigh: if ok { queues[qs].desc = setHigh(queues[qs].desc, v) }
-        case R.queueAvailLow: if ok { queues[qs].avail = setLow(queues[qs].avail, v) }
-        case R.queueAvailHigh: if ok { queues[qs].avail = setHigh(queues[qs].avail, v) }
-        case R.queueUsedLow: if ok { queues[qs].used = setLow(queues[qs].used, v) }
-        case R.queueUsedHigh: if ok { queues[qs].used = setHigh(queues[qs].used, v) }
-        default: break
-        }
-    }
-
-    /// 古い形: ページ番号（PFN）から、記述子表・avail・used の場所を決める
-    private func setLegacyQueue(_ i: Int, pfn: UInt32) {
-        queues[i].pfn = pfn
-        if pfn == 0 { queues[i].ready = 0; queues[i].lastAvail = 0; return }
-        let num = UInt64(queues[i].size)
-        let desc = UInt64(pfn) * UInt64(guestPageSize)
-        let avail = desc + 16 * num
-        let align = UInt64(queues[i].align)
-        let availEnd = avail + 4 + 2 * num + 2
-        queues[i].desc = desc
-        queues[i].avail = avail
-        queues[i].used = (availEnd + align - 1) / align * align
-        queues[i].lastAvail = 0
-        queues[i].ready = 1
-    }
-
-    private func setLow(_ x: UInt64, _ v: UInt32) -> UInt64 { (x & 0xFFFF_FFFF_0000_0000) | UInt64(v) }
-    private func setHigh(_ x: UInt64, _ v: UInt32) -> UInt64 { (x & 0xFFFF_FFFF) | (UInt64(v) << 32) }
-
-    // MARK: キュー（RAM はゲストが書いた場所なので、確かめながら読み書きする）
-
-    private func load16(_ pa: UInt64) -> UInt16 { ram.pointer(pa, count: 2)?.loadUnaligned(as: UInt16.self) ?? 0 }
-    private func load32(_ pa: UInt64) -> UInt32 { ram.pointer(pa, count: 4)?.loadUnaligned(as: UInt32.self) ?? 0 }
-    private func load64(_ pa: UInt64) -> UInt64 { ram.pointer(pa, count: 8)?.loadUnaligned(as: UInt64.self) ?? 0 }
-    private func store16(_ pa: UInt64, _ v: UInt16) { ram.pointer(pa, count: 2)?.storeBytes(of: v, as: UInt16.self) }
-    private func store32(_ pa: UInt64, _ v: UInt32) { ram.pointer(pa, count: 4)?.storeBytes(of: v, as: UInt32.self) }
-
-    /// ドライバが並べた番号（avail.idx）
-    private func availIdx(_ q: Queue) -> UInt16 { load16(q.avail + 2) }
-    /// 次に取り出す入れ物の先頭の記述子
-    private func nextAvailHead(_ q: Queue) -> UInt16 { load16(q.avail + 4 + 2 * UInt64(q.lastAvail % q.size)) }
-
-    /// 記述子のつながり: (アドレス, 長さ, 書き込み用か)
-    private func chain(_ q: Queue, head: UInt16) -> [(addr: UInt64, len: Int, writable: Bool)] {
-        var out: [(addr: UInt64, len: Int, writable: Bool)] = []
-        var i = head
-        let num = q.size
-        for _ in 0..<Int(num) {
-            let d = q.desc + 16 * UInt64(i % num)
-            let flags = load16(d + 12)
-            out.append((load64(d), Int(load32(d + 8)), flags & VirtioMMIO.descWrite != 0))
-            if flags & VirtioMMIO.descNext == 0 { break }
-            i = load16(d + 14)
-        }
-        return out
-    }
-
-    /// 使い終わった入れ物を used リングに返す
-    private func pushUsed(_ q: Queue, head: UInt16, len: Int) {
-        let usedIdx = load16(q.used + 2)
-        let slot = q.used + 4 + 8 * UInt64(usedIdx % q.size)
-        store32(slot, UInt32(head))
-        store32(slot + 4, UInt32(len))
-        store16(q.used + 2, usedIdx &+ 1)
-    }
-
-    /// 送り出し用のキューに並んだフレームを取り出して onTransmit に渡す
-    private func transmit() {
-        let qi = VirtioMMIO.txQueue
-        guard queues[qi].ready != 0 else { return }
-        let end = availIdx(queues[qi])
-        var did = false
-        var guardCount = 0
-        while queues[qi].lastAvail != end && guardCount < Int(queues[qi].size) * 2 {
-            guardCount += 1
-            let head = nextAvailHead(queues[qi])
-            var bytes: [UInt8] = []
-            for d in chain(queues[qi], head: head) where !d.writable {
-                guard d.len > 0, d.len <= 65536, let p = ram.pointer(d.addr, count: d.len) else { continue }
-                bytes.append(contentsOf: UnsafeRawBufferPointer(start: p, count: d.len))
-            }
-            if bytes.count > VirtioMMIO.netHeaderSize {
-                onTransmit?(Array(bytes[VirtioMMIO.netHeaderSize...]))
-            }
-            pushUsed(queues[qi], head: head, len: 0)
-            queues[qi].lastAvail &+= 1
-            did = true
-        }
-        if did { interruptStatus |= 1 }
-    }
-
-    /// 取っておいたフレームを、OS が並べた受け取り用の入れ物に書く
-    private func deliverPending() {
-        let qi = VirtioMMIO.rxQueue
-        guard queues[qi].ready != 0 else { return }
-        var did = false
-        lock.lock()
-        while !pending.isEmpty {
-            if queues[qi].lastAvail == availIdx(queues[qi]) { break }       // 入れ物が無い: あとで
-            let head = nextAvailHead(queues[qi])
-            // ヘッダ（10 バイトの 0）+ フレームを、入れ物の記述子に順に詰める
-            let full = [UInt8](repeating: 0, count: VirtioMMIO.netHeaderSize) + pending.removeFirst()
-            var written = 0
-            for d in chain(queues[qi], head: head) where d.writable {
-                if written >= full.count { break }
-                let n = min(d.len, full.count - written)
-                guard n > 0, let p = ram.pointer(d.addr, count: n) else { continue }
-                full.withUnsafeBytes { src in p.copyMemory(from: src.baseAddress! + written, byteCount: n) }
-                written += n
-            }
-            pushUsed(queues[qi], head: head, len: written)
-            queues[qi].lastAvail &+= 1
-            did = true
-        }
-        hasPending = !pending.isEmpty
-        lock.unlock()
-        if did { interruptStatus |= 1 }
-    }
-}
-
-// ======================================================================
-// MARK: - VNetDriver.swift
-// ======================================================================
-
-// MARK: - ゲスト側の virtio-net ドライバ（Linux の virtio_net ドライバの代わり）
-//
-// 仮想 LAN カード（VirtioNet）のレジスタを、Linux と同じ順番で読み書きして使えるようにする。
-// ・キューは 2 つ: 0 = 受け取り用、1 = 送り出し用（古い形 = legacy の virtio-mmio）
-// ・受け取り用には、あらかじめ空の入れ物（2KB）を並べておく。カードが届いたフレームを書いてくれる
-// ・送るときは、入れ物に [ヘッダ 10 バイト][フレーム] を書いて、avail リングに並べて「通知」する
-// すべて 1 本のキュー（VNetMachine.queue）の上で呼ぶこと
-final class VirtioNetDriver: @unchecked Sendable {
-    let dev: VirtioNet
-    let ram: GuestRAM
-    let qsize = 256
-    let bufSize = 2048
-    private(set) var mac: [UInt8] = []
-
-    /// 1 本のキュー（記述子表・avail・used と、入れ物）
-    private struct Ring {
-        let ram: GuestRAM
-        let size: Int
-        var desc: UInt64 = 0, avail: UInt64 = 0, used: UInt64 = 0
-        var bufs: [UInt64] = []
-        var lastUsed: UInt16 = 0
-        var availIdx: UInt16 = 0
-
-        func writeDesc(_ i: Int, len: Int, writable: Bool) {
-            let d = desc + 16 * UInt64(i)
-            ram.store64(d, bufs[i])
-            ram.store32(d + 8, UInt32(len))
-            ram.store16(d + 12, writable ? VirtioMMIO.descWrite : 0)
-            ram.store16(d + 14, 0)
-        }
-
-        /// 入れ物 i を avail リングに積む（カードに見せるのは publish で）
-        mutating func offer(_ i: Int) {
-            ram.store16(avail + 4 + 2 * UInt64(Int(availIdx) % size), UInt16(i))
-            availIdx &+= 1
-        }
-
-        /// 積んだ分をカードに見せる
-        func publish() { ram.store16(avail + 2, availIdx) }
-
-        /// カードが使い終わった入れ物を 1 つ取る（無ければ nil）
-        mutating func takeUsed() -> (id: Int, len: Int)? {
-            guard lastUsed != ram.load16(used + 2) else { return nil }
-            let slot = used + 4 + 8 * UInt64(Int(lastUsed) % size)
-            lastUsed &+= 1
-            return (Int(ram.load32(slot)), Int(ram.load32(slot + 4)))
-        }
-    }
-    private var rx: Ring
-    private var tx: Ring
-    private var txFree: [Int] = []
-    /// まだ入れ物が空かず送れていないフレーム
-    private var txWaiting: [[UInt8]] = []
-
-    /// 届いたフレーム（ヘッダを除いたイーサネットのフレーム）
-    var onReceive: (([UInt8]) -> Void)?
-
-    init(dev: VirtioNet, ram: GuestRAM) {
-        self.dev = dev
-        self.ram = ram
-        rx = Ring(ram: ram, size: qsize)
-        tx = Ring(ram: ram, size: qsize)
-    }
-
-    struct DriverError: Error, CustomStringConvertible { let description: String; init(_ s: String) { description = s } }
-
-    private func r32(_ off: UInt64) -> UInt32 { UInt32(truncatingIfNeeded: dev.read(off, size: 4)) }
-    private func w32(_ off: UInt64, _ v: UInt32) { dev.write(off, size: 4, value: UInt64(v)) }
-
-    /// Linux の virtio_mmio + virtio_net と同じ手順でカードを準備する
-    func start() throws {
-        typealias R = VirtioMMIO.Reg
-        guard r32(R.magic) == VirtioMMIO.magicValue else { throw DriverError("virtio の目印がありません") }
-        guard r32(R.deviceID) == VirtioMMIO.deviceNet else { throw DriverError("ネットワークのカードではありません") }
-        let ackDriver = VirtioMMIO.statusAcknowledge | VirtioMMIO.statusDriver
-        w32(R.status, 0)                                   // リセット
-        w32(R.status, VirtioMMIO.statusAcknowledge)        // 見つけた
-        w32(R.status, ackDriver)                           // 使い方が分かる
-        w32(R.deviceFeaturesSel, 0)
-        let features = r32(R.deviceFeatures)
-        w32(R.driverFeaturesSel, 0)
-        w32(R.driverFeatures, features & UInt32(VirtioMMIO.featureNetMAC))   // MAC アドレスだけ使う
-        w32(R.guestPageSize, 4096)
-        mac = (0..<6).map { UInt8(truncatingIfNeeded: dev.read(R.config + UInt64($0), size: 1)) }
-        rx = setupQueue(VirtioMMIO.rxQueue)
-        tx = setupQueue(VirtioMMIO.txQueue)
-        // 受け取り用: 空の入れ物を全部並べる
-        for i in 0..<qsize {
-            rx.writeDesc(i, len: bufSize, writable: true)
-            rx.offer(i)
-        }
-        rx.publish()
-        txFree = Array(0..<qsize)
-        w32(R.status, ackDriver | VirtioMMIO.statusDriverOK)   // 使い始める
-        w32(R.queueNotify, UInt32(VirtioMMIO.rxQueue))
-    }
-
-    /// キューを 1 つ用意する（古い形: ページ番号 = PFN で場所を伝える）
-    private func setupQueue(_ q: Int) -> Ring {
-        typealias R = VirtioMMIO.Reg
-        w32(R.queueSel, UInt32(q))
-        precondition(Int(r32(R.queueNumMax)) >= qsize)
-        w32(R.queueNum, UInt32(qsize))
-        w32(R.queueAlign, 4096)
-        // 記述子表 (16 × n) + avail (4 + 2n + 2)、used は 4096 の倍数から (4 + 8n + 2)
-        let n = UInt64(qsize)
-        let availEnd = 16 * n + 4 + 2 * n + 2
-        let usedOff = (availEnd + 4095) / 4096 * 4096
-        let total = Int(usedOff + 4 + 8 * n + 2)
-        let area = ram.alloc(total, align: 4096)
-        var r = Ring(ram: ram, size: qsize)
-        r.desc = area
-        r.avail = area + 16 * n
-        r.used = area + usedOff
-        r.bufs = (0..<qsize).map { _ in ram.alloc(bufSize, align: 64) }
-        w32(R.queuePFN, UInt32(area / 4096))
-        return r
-    }
-
-    /// フレームを送る（入れ物が無ければ、空くまで待たせる）
-    func send(_ frame: [UInt8]) {
-        txWaiting.append(frame)
-        reclaimTX()
-        flushTX()
-    }
-
-    private func flushTX() {
-        let hdr = VirtioMMIO.netHeaderSize
-        var did = false
-        while !txWaiting.isEmpty, let i = txFree.popLast() {
-            let frame = txWaiting.removeFirst()
-            let p = ram.pointer(tx.bufs[i])
-            p.initializeMemory(as: UInt8.self, repeating: 0, count: hdr)
-            let n = min(frame.count, bufSize - hdr)
-            frame.withUnsafeBytes { (p + hdr).copyMemory(from: $0.baseAddress!, byteCount: n) }
-            tx.writeDesc(i, len: hdr + n, writable: false)
-            tx.offer(i)
-            did = true
-        }
-        if did {
-            tx.publish()
-            w32(VirtioMMIO.Reg.queueNotify, UInt32(VirtioMMIO.txQueue))   // → カードが onTransmit に渡す
-        }
-    }
-
-    /// 送り終わった入れ物を回収する
-    private func reclaimTX() {
-        while let u = tx.takeUsed() {
-            if u.id < qsize { txFree.append(u.id) }
-        }
-    }
-
-    /// 割り込みが来ていれば、届いたフレームを取り出す（カードから知らせがあったときに呼ぶ）
-    func poll() {
-        guard dev.interruptLine else { return }
-        w32(VirtioMMIO.Reg.interruptACK, r32(VirtioMMIO.Reg.interruptStatus))   // 割り込みを受け取った
-        reclaimTX()
-        flushTX()
-        let hdr = VirtioMMIO.netHeaderSize
-        var reposted = false
-        while let u = rx.takeUsed() {
-            guard u.id < qsize else { continue }
-            if u.len > hdr {
-                let p = ram.pointer(rx.bufs[u.id]) + hdr
-                onReceive?([UInt8](UnsafeRawBufferPointer(start: p, count: min(u.len, bufSize) - hdr)))
-            }
-            rx.offer(u.id)                                 // 入れ物を戻す
-            reposted = true
-        }
-        if reposted {
-            rx.publish()
-            w32(VirtioMMIO.Reg.queueNotify, UInt32(VirtioMMIO.rxQueue))
-        }
-    }
-}
-
-// ======================================================================
-// MARK: - UserNet.swift
-// ======================================================================
-
-// MARK: - アプリの中の小さなルーター（ユーザーモードの NAT。QEMU の「SLIRP」と同じ考え方）
-//
-// ゲストの eth0 から出たイーサネットのフレームを受け取り、中身の TCP / UDP を
-// iPad の普通の通信（Network.framework）に置き換えて外に出す。返事はフレームに組み立て直してゲストに返す。
-//
-//   ゲスト 10.0.2.15 ── ルーター 10.0.2.2（＝このクラス）── iPad の通信 ── インターネット
-//                        DNS は 10.0.2.3（iPad の名前解決を使う）
-//
-// ・ARP: 10.0.2.x を聞かれたら、自分の MAC で答える
-// ・DHCP: 10.0.2.15 を配る（ルーター 10.0.2.2、DNS 10.0.2.3）
-// ・DNS: A レコードは iPad で名前解決して答える。AAAA などは「無し」と答える（IPv4 だけ使う）
-// ・TCP: ゲストとの TCP はここで終わらせ、外へは iPad の TCP 接続でつなぐ（中身だけ中継する）
-// ・UDP: 宛先ごとに iPad の UDP 接続を作って中継する
-// ・ping（ICMP）: 10.0.2.x にだけ答える（iPad のアプリは外へ ping を打てない）
-// すべて queue（1 本の直列キュー）の上で動く。
-
-/// 外への接続（TCP か UDP）。受け取りは readMore() を呼ぶたびに 1 回分ずつ届く
-protocol UserNetSocket: AnyObject, Sendable {
-    func send(_ data: Data)
-    /// 送り終わったら閉じる（TCP の FIN）
-    func finish()
-    func close()
-    func readMore()
-}
-
-/// 外への接続を作るもの（iPad では Network.framework）。
-/// 呼び出し（onReady など）は必ず queue の上で行うこと
-protocol UserNetSocketFactory {
-    func tcp(host: String, port: UInt16, queue: DispatchQueue,
-             onReady: @escaping @Sendable () -> Void, onData: @escaping @Sendable (Data) -> Void,
-             onClose: @escaping @Sendable (_ error: Bool) -> Void) -> UserNetSocket
-    func udp(host: String, port: UInt16, queue: DispatchQueue,
-             onData: @escaping @Sendable (Data) -> Void, onClose: @escaping @Sendable () -> Void) -> UserNetSocket
-}
-
-final class UserNet: @unchecked Sendable {
-    let queue = DispatchQueue(label: "usernet")
-    let factory: UserNetSocketFactory
-    /// ゲストへ送るフレーム（queue の上で呼ばれる）
-    var onFrame: (([UInt8]) -> Void)?
-    /// ログ
-    var log: ((String) -> Void)?
-    /// ゲストの MAC アドレス（届いたフレームから覚える）
-    private var guestMAC = Net.guestMAC
-
-    private var ipID: UInt16 = 1
-    private var tcps: [TCPKey: TCPConn] = [:]
-    private var udps: [UDPKey: UDPFlow] = [:]
-    private var timer: DispatchSourceTimer?
-    /// 名前を IPv4 にする方法（テストでは偽物に差し替える）。どのスレッドから呼ばれてもよいこと
-    var resolver: @Sendable (String) -> [[UInt8]]? = { UserNet.resolveIPv4($0) }
-    /// ゲストへの送り直しの回数（queue の上で数える。読むときは queue の上で）
-    private(set) var retransmits = 0
-
-    init(factory: UserNetSocketFactory) {
-        self.factory = factory
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + .milliseconds(200), repeating: .milliseconds(200))
-        t.setEventHandler { [weak self] in self?.tick() }
-        t.resume()
-        timer = t
-    }
-
-    deinit { timer?.cancel() }
-
-    /// ゲストから出たフレーム（どのスレッドからでもよい）
-    func input(_ frame: [UInt8]) {
-        queue.async { self.handleFrame(frame) }
-    }
-
-    // MARK: イーサネット
-
-    private func handleFrame(_ f: [UInt8]) {
-        guard f.count >= Ethernet.headerSize else { return }
-        if f[6] & 1 == 0 { guestMAC = Array(f[6..<12]) }
-        let body = Array(f[Ethernet.headerSize...])
-        switch f.be16(at: 12) {
-        case EtherType.arp: handleARP(body)
-        case EtherType.ipv4: handleIPv4(body)
-        default: break        // IPv6 などは使わない
-        }
-    }
-
-    private func sendEthernet(_ type: UInt16, _ payload: [UInt8], to dst: [UInt8]? = nil) {
-        onFrame?(Ethernet.frame(dst: dst ?? guestMAC, src: Net.routerMAC, type: type, payload))
-    }
-
-    // MARK: ARP
-
-    private func handleARP(_ p: [UInt8]) {
-        guard p.count >= 28, p.be16(at: 6) == ARP.request else { return }     // 問い合わせだけ
-        let target = Array(p[24..<28])
-        guard Net.isLocal(target), target != Net.guestIP else { return }
-        let senderMAC = Array(p[8..<14]), senderIP = Array(p[14..<18])
-        let r = ARP.packet(op: ARP.reply, senderMAC: Net.routerMAC, senderIP: target, targetMAC: senderMAC, targetIP: senderIP)
-        sendEthernet(EtherType.arp, r, to: senderMAC)
-    }
-
-    // MARK: IPv4
-
-    private func handleIPv4(_ p: [UInt8]) {
-        guard let pkt = IPv4Packet(p), !pkt.isFragment else { return }   // 分割されたものは扱わない（MTU 1500 なので普通は来ない）
-        switch pkt.proto {
-        case IPProto.icmp: handleICMP(src: pkt.src, dst: pkt.dst, pkt.body)
-        case IPProto.tcp: handleTCP(dst: pkt.dst, pkt.body)
-        case IPProto.udp: handleUDP(dst: pkt.dst, pkt.body)
-        default: break
-        }
-    }
-
-    private func sendIPv4(proto: UInt8, src: [UInt8], dst: [UInt8], dontFragment: Bool = true, _ body: [UInt8], to mac: [UInt8]? = nil) {
-        let pkt = IPv4Packet.build(proto: proto, id: ipID, src: src, dst: dst, dontFragment: dontFragment, body)
-        ipID &+= 1
-        sendEthernet(EtherType.ipv4, pkt, to: mac)
-    }
-
-    /// ゲストが指定した宛先 IP を、iPad 側でつなぐ相手の名前にする（10.0.2.x・ループバック・マルチキャストはつながない）
-    private func hostFor(_ ip: [UInt8]) -> String? {
-        if Net.isLocal(ip) || ip[0] == 127 || ip[0] == 0 || ip[0] >= 224 { return nil }
-        return ip.ipString
-    }
-
-    // MARK: ICMP（ping）
-
-    private func handleICMP(src: [UInt8], dst: [UInt8], _ b: [UInt8]) {
-        guard b.count >= 8, b[0] == 8, Net.isLocal(dst) else { return }    // echo request だけ
-        var r = b
-        r[0] = 0; r[2] = 0; r[3] = 0                                        // echo reply
-        r.setBE16(Checksum.internet(r), at: 2)
-        sendIPv4(proto: IPProto.icmp, src: dst, dst: src, r)
-    }
-
-    // MARK: UDP
-
-    private struct UDPKey: Hashable, Sendable { let sport: UInt16; let dst: [UInt8]; let dport: UInt16 }
-    private final class UDPFlow: @unchecked Sendable {
-        var sock: UserNetSocket?
-        var last = Date()
-    }
-
-    private func sendUDP(src: [UInt8], sport: UInt16, dport: UInt16, _ payload: [UInt8]) {
-        let u = UDPDatagram.build(src: src, dst: Net.guestIP, sport: sport, dport: dport, payload)
-        sendIPv4(proto: IPProto.udp, src: src, dst: Net.guestIP, u)
-    }
-
-    private func handleUDP(dst: [UInt8], _ b: [UInt8]) {
-        guard let d = UDPDatagram(b) else { return }
-        if d.dport == 67 { handleDHCP(d.payload); return }
-        if dst == Net.dns && d.dport == 53 { handleDNS(d.payload, sport: d.sport); return }
-        guard let host = hostFor(dst) else { return }
-        let sport = d.sport, dport = d.dport
-        let key = UDPKey(sport: sport, dst: dst, dport: dport)
-        let flow: UDPFlow
-        if let f = udps[key] { flow = f } else {
-            let f = UDPFlow()
-            let sock = factory.udp(host: host, port: dport, queue: queue, onData: { [weak self, weak f] data in
-                guard let self else { return }
-                f?.last = Date()
-                self.sendUDP(src: dst, sport: dport, dport: sport, Array(data))
-            }, onClose: { [weak self] in self?.udps[key] = nil })
-            f.sock = sock
-            flow = f
-            udps[key] = f
-            sock.readMore()
-        }
-        flow.last = Date()
-        flow.sock?.send(Data(d.payload))
-    }
-
-    // MARK: DHCP
-
-    private func handleDHCP(_ p: [UInt8]) {
-        guard p.count >= 240, p[0] == 1, Array(p[236..<240]) == DHCP.magicCookie else { return }
-        let reply: UInt8
-        switch DHCP.options(p)[53]?.first ?? 0 {
-        case DHCP.discover: reply = DHCP.offer
-        case DHCP.request: reply = DHCP.ack
-        default: return
-        }
-        var r = [UInt8](repeating: 0, count: 236)
-        r[0] = 2; r[1] = 1; r[2] = 6
-        r.replaceSubrange(4..<8, with: p[4..<8])           // xid
-        r[10] = p[10]; r[11] = p[11]                       // flags
-        r.replaceSubrange(16..<20, with: Net.guestIP)      // yiaddr
-        r.replaceSubrange(20..<24, with: Net.gateway)      // siaddr
-        r.replaceSubrange(28..<44, with: p[28..<44])       // chaddr
-        r += DHCP.magicCookie
-        r += [53, 1, reply]
-        r += [54, 4] + Net.gateway
-        r += [51, 4, 0, 1, 0x51, 0x80]                     // 86400 秒
-        r += [1, 4, 255, 255, 255, 0]
-        r += [3, 4] + Net.gateway
-        r += [6, 4] + Net.dns
-        r += [26, 2, 0x05, 0xDC]                           // MTU 1500
-        r += [255]
-        // ブロードキャストで返す（ゲストはまだ IP を持っていないので）
-        let u = UDPDatagram.build(src: Net.gateway, dst: Net.broadcastIP, sport: 67, dport: 68, r)
-        sendIPv4(proto: IPProto.udp, src: Net.gateway, dst: Net.broadcastIP, dontFragment: false, u, to: Net.broadcastMAC)
-        log?("[ネット] DHCP \(reply == DHCP.offer ? "OFFER" : "ACK") \(Net.guestIP.ipString)")
-    }
-
-    // MARK: DNS
-
-    private func handleDNS(_ q: [UInt8], sport: UInt16) {
-        guard q.count >= 12 else { return }
-        guard q.be16(at: 4) == 1 else {                    // 質問が 1 つでなければ「できません」
-            sendDNS(DNSMessage.reply(to: q, questionEnd: 12, rcode: 4, answers: []), sport: sport)
-            return
-        }
-        guard let question = DNSMessage.question(q) else { return }
-        if question.type != 1 || question.name.isEmpty {   // A 以外は「無し」
-            sendDNS(DNSMessage.reply(to: q, questionEnd: question.end, rcode: 0, answers: []), sport: sport)
-            return
-        }
-        let queue = self.queue
-        let resolver = self.resolver
-        DispatchQueue.global(qos: .userInitiated).async {
-            let addrs = resolver(question.name)
-            let r = DNSMessage.reply(to: q, questionEnd: question.end, rcode: addrs == nil ? 3 : 0, answers: addrs ?? [])
-            queue.async { [weak self] in self?.sendDNS(r, sport: sport) }
-        }
-    }
-
-    private func sendDNS(_ r: [UInt8], sport: UInt16) {
-        sendUDP(src: Net.dns, sport: 53, dport: sport, r)
-    }
-
-    /// 名前を IPv4 アドレスにする（nil = 見つからない）
-    static func resolveIPv4(_ name: String) -> [[UInt8]]? {
-        var hints = addrinfo()
-        hints.ai_family = AF_INET
-        #if canImport(Glibc)
-        hints.ai_socktype = Int32(SOCK_STREAM.rawValue)
-        #else
-        hints.ai_socktype = SOCK_STREAM
-        #endif
-        var res: UnsafeMutablePointer<addrinfo>?
-        guard getaddrinfo(name, nil, &hints, &res) == 0, let first = res else { return nil }
-        defer { freeaddrinfo(first) }
-        var out: [[UInt8]] = []
-        var p: UnsafeMutablePointer<addrinfo>? = first
-        while let a = p {
-            if a.pointee.ai_family == AF_INET, let sa = a.pointee.ai_addr {
-                sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
-                    let v = sin.pointee.sin_addr.s_addr       // ネットワークの順（ビッグエンディアン）のまま
-                    let b = [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8(v >> 24)]
-                    if !out.contains(b) { out.append(b) }
-                }
-            }
-            p = a.pointee.ai_next
-        }
-        return out.isEmpty ? nil : Array(out.prefix(8))
-    }
-
-    // MARK: TCP
-
-    private struct TCPKey: Hashable, Sendable { let sport: UInt16; let dst: [UInt8]; let dport: UInt16 }
-
-    private final class TCPConn: @unchecked Sendable {
-        let key: TCPKey
-        var sock: UserNetSocket?
-        var state = State.connecting
-        enum State { case connecting, synSent, established, closed }
-        var rcvNxt: UInt32 = 0            // ゲストから次に来るはずの番号
-        let iss: UInt32                   // こちらの最初の番号
-        var sndUna: UInt32                // ゲストがまだ受け取ったと言っていない最初の番号
-        var sndNxt: UInt32                // 次に送る番号
-        /// 外から来た（まだ受け取りの返事が無い）データ。buf[bufPos...] が sndUna から先。
-        /// 先頭を消すとそのたびに全部ずらすことになって遅いので、位置で覚えてときどき詰める
-        var buf = [UInt8]()
-        var bufPos = 0
-        var pending: Int { buf.count - bufPos }
-        var window: UInt32 = 65535
-        var mss = 536
-        var remoteEOF = false             // 外の相手が閉じた
-        var finSent = false
-        var guestFIN = false
-        var lastProgress = Date()
-        var retries = 0
-        var reading = false
-        var lastActivity = Date()
-        init(key: TCPKey) {
-            self.key = key
-            iss = UInt32.random(in: 0...UInt32.max)
-            sndUna = iss
-            sndNxt = iss
-        }
-
-        /// ゲストが受け取ったと言った分を buf から外す
-        func dropAcked(_ n: Int) {
-            guard n > 0 else { return }
-            bufPos += n
-            if bufPos == buf.count { buf.removeAll(keepingCapacity: true); bufPos = 0 }
-            else if bufPos > 131072 && bufPos * 2 > buf.count { buf.removeFirst(bufPos); bufPos = 0 }
-        }
-    }
-
-    static let maxBuffered = 512 * 1024
-
-    /// 外の相手のふりをして、ゲストへセグメントを送る
-    private func sendTCP(_ c: TCPConn, _ flags: TCPFlags, seq: UInt32, payload: ArraySlice<UInt8> = [], mss: Bool = false) {
-        // こちらの受け取り窓は 65535 のまま: 外へ送り切れていない分は気にしない（iPad の接続が受け取る）
-        let seg = TCPSegment.build(src: c.key.dst, dst: Net.guestIP, sport: c.key.dport, dport: c.key.sport,
-                                   seq: seq, ack: c.rcvNxt, flags: flags, mss: mss, payload: payload)
-        sendIPv4(proto: IPProto.tcp, src: c.key.dst, dst: Net.guestIP, seg)
-    }
-
-    private func sendSYNACK(_ c: TCPConn) { sendTCP(c, [.syn, .ack], seq: c.iss, mss: true) }
-
-    /// 外の相手のふりをして、ゲストへ RST を送る
-    private func sendRST(remote: [UInt8], remotePort: UInt16, guestPort: UInt16, seq: UInt32, ack: UInt32) {
-        let seg = TCPSegment.build(src: remote, dst: Net.guestIP, sport: remotePort, dport: guestPort,
-                                   seq: seq, ack: ack, flags: [.rst, .ack], window: 0)
-        sendIPv4(proto: IPProto.tcp, src: remote, dst: Net.guestIP, seg)
-    }
-
-    private func sendRST(_ c: TCPConn, seq: UInt32) {
-        sendRST(remote: c.key.dst, remotePort: c.key.dport, guestPort: c.key.sport, seq: seq, ack: c.rcvNxt)
-    }
-
-    private func handleTCP(dst: [UInt8], _ b: [UInt8]) {
-        guard let h = TCPHeader(b) else { return }
-        let payload = b[h.headerLength...]
-        let key = TCPKey(sport: h.sport, dst: dst, dport: h.dport)
-        guard let c = tcps[key] else {
-            open(key, h, b)
-            return
-        }
-
-        c.lastActivity = Date()
-        if h.flags.contains(.rst) { remove(c); return }
-        if h.flags.contains(.syn) {
-            // SYN の送り直し: SYN+ACK を送り直す
-            if c.state == .synSent { sendSYNACK(c) }
-            return
-        }
-        if h.flags.contains(.ack) {
-            let acked = h.ack &- c.sndUna
-            let inFlight = c.sndNxt &- c.sndUna
-            if acked > 0 && acked <= inFlight {
-                var n = Int(acked)
-                if c.state == .synSent { c.state = .established; n -= 1 }     // SYN の分
-                c.dropAcked(min(n, c.pending))
-                c.sndUna = h.ack
-                c.lastProgress = Date()
-                c.retries = 0
-                readIfRoom(c)
-            }
-            c.window = UInt32(h.window)
-        }
-        if c.state == .synSent || c.state == .connecting { return }
-        // データ
-        var needAck = false
-        if !payload.isEmpty {
-            // 送り直しで前の分と重なっていたら、新しい所だけ外へ送る（先の分は捨てて、送り直してもらう）
-            let before = Int32(bitPattern: c.rcvNxt &- h.seq)
-            if before >= 0 && Int(before) < payload.count {
-                let rest = payload.dropFirst(Int(before))
-                c.sock?.send(Data(rest))
-                c.rcvNxt &+= UInt32(rest.count)
-            }
-            needAck = true
-        }
-        if h.flags.contains(.fin) && h.seq &+ UInt32(payload.count) == c.rcvNxt && !c.guestFIN {
-            c.guestFIN = true
-            c.rcvNxt &+= 1
-            c.sock?.finish()
-            needAck = true
-        }
-        let before = c.sndNxt
-        pump(c)
-        if needAck && c.sndNxt == before { sendTCP(c, .ack, seq: c.sndNxt) }
-        checkDone(c)
-    }
-
-    /// 知らない接続のセグメント: SYN なら外へつなぎに行く（つながったら SYN+ACK を返す）。ほかは RST で終わらせてもらう
-    private func open(_ key: TCPKey, _ h: TCPHeader, _ b: [UInt8]) {
-        if h.flags.contains(.rst) { return }
-        guard h.flags.contains(.syn), !h.flags.contains(.ack), let host = hostFor(key.dst) else {
-            let payloadCount = UInt32(b.count - h.headerLength)
-            let extra: UInt32 = h.flags.isDisjoint(with: [.syn, .fin]) ? 0 : 1
-            sendRST(remote: key.dst, remotePort: key.dport, guestPort: key.sport,
-                    seq: h.flags.contains(.ack) ? h.ack : 0, ack: h.seq &+ payloadCount &+ extra)
-            return
-        }
-        let c = TCPConn(key: key)
-        c.rcvNxt = h.seq &+ 1
-        c.window = UInt32(h.window)
-        if let m = TCPHeader.mss(b, headerLength: h.headerLength) { c.mss = min(1460, m) }
-        tcps[key] = c
-        c.sock = factory.tcp(host: host, port: key.dport, queue: queue, onReady: { [weak self, weak c] in
-            guard let self, let c, c.state == .connecting else { return }
-            c.state = .synSent
-            self.sendSYNACK(c)
-            c.sndNxt = c.iss &+ 1
-            c.lastProgress = Date()
-            self.readIfRoom(c)
-        }, onData: { [weak self, weak c] d in
-            guard let self, let c else { return }
-            c.reading = false
-            c.buf.append(contentsOf: d)
-            c.lastActivity = Date()
-            self.pump(c)
-            self.readIfRoom(c)
-        }, onClose: { [weak self, weak c] error in
-            guard let self, let c else { return }
-            c.reading = false
-            if c.state == .connecting || (error && c.state != .established) {
-                // つながらなかった
-                self.sendRST(c, seq: c.iss &+ 1)
-                self.remove(c)
-                return
-            }
-            c.remoteEOF = true
-            self.pump(c)
-        })
-    }
-
-    /// 外から来たデータを、ゲストの窓の分だけ送る。外が閉じていて全部送ったら FIN
-    private func pump(_ c: TCPConn) {
-        guard c.state == .established else { return }
-        while !c.finSent {
-            let sent = Int(c.sndNxt &- c.sndUna)
-            let unsent = c.pending - sent
-            if unsent <= 0 {
-                if c.remoteEOF {
-                    sendTCP(c, [.fin, .ack], seq: c.sndNxt)
-                    c.sndNxt &+= 1
-                    c.finSent = true
-                    c.lastProgress = Date()
-                }
-                break
-            }
-            let room = Int(c.window) - sent
-            if room <= 0 { break }
-            let n = min(unsent, c.mss, room)
-            let start = c.bufPos + sent
-            sendTCP(c, [.ack, .psh], seq: c.sndNxt, payload: c.buf[start..<(start + n)])
-            c.sndNxt &+= UInt32(n)
-        }
-        checkDone(c)
-    }
-
-    private func readIfRoom(_ c: TCPConn) {
-        guard !c.reading, !c.remoteEOF, c.state == .established || c.state == .synSent,
-              c.pending < UserNet.maxBuffered, let s = c.sock else { return }
-        c.reading = true
-        s.readMore()
-    }
-
-    private func checkDone(_ c: TCPConn) {
-        // 両方が閉じて、こちらの FIN も受け取ってもらえたら終わり
-        if c.guestFIN && c.finSent && c.sndUna == c.sndNxt { remove(c) }
-    }
-
-    private func remove(_ c: TCPConn) {
-        if c.state == .closed { return }
-        c.state = .closed
-        c.sock?.close()
-        c.sock = nil
-        if tcps[c.key] === c { tcps[c.key] = nil }
-    }
-
-    // MARK: 時間で見るもの（送り直しと、古い接続の片付け）
-
-    private func tick() {
-        let now = Date()
-        for c in Array(tcps.values) {
-            if c.state == .synSent && now.timeIntervalSince(c.lastProgress) > 1 {
-                c.retries += 1
-                if c.retries > 6 { remove(c); continue }
-                sendSYNACK(c)
-                c.lastProgress = now
-            } else if c.state == .established && c.sndNxt == c.sndUna && c.window == 0 && c.pending > 0
-                        && now.timeIntervalSince(c.lastProgress) > 1 {
-                // ゲストの窓が 0 のまま（送っている途中のものは無い）: 1 バイトだけ送って、窓が開いたかを探る（持続タイマー）
-                c.window = 1
-                c.lastProgress = now
-                pump(c)
-            } else if c.state == .established && c.sndNxt != c.sndUna && now.timeIntervalSince(c.lastProgress) > 1 {
-                // 受け取りの返事が来ない: 先頭から送り直す（窓が 0 で探っているだけのときは、回数に数えない）
-                if c.window > 1 { c.retries += 1 }
-                retransmits += 1
-                if c.retries > 10 {
-                    sendRST(c, seq: c.sndNxt)
-                    remove(c); continue
-                }
-                c.sndNxt = c.sndUna
-                c.finSent = false
-                c.lastProgress = now
-                if c.window == 0 { c.window = 1 }       // 窓が 0 のままなら 1 バイトだけ送って様子を見る
-                pump(c)
-            } else if now.timeIntervalSince(c.lastActivity) > 600 {
-                remove(c)
-            }
-        }
-        for (k, u) in udps where now.timeIntervalSince(u.last) > 60 {
-            u.sock?.close()
-            udps[k] = nil
-        }
-    }
-}
-
-// ======================================================================
-// MARK: - UserNetApple.swift
-// ======================================================================
-
-#if canImport(Network)
-import Foundation
-import Network
-
-// MARK: - UserNet の外への接続を、iPad の Network.framework で作る
-
-final class NWUserNetFactory: UserNetSocketFactory, @unchecked Sendable {
-    func tcp(host: String, port: UInt16, queue: DispatchQueue,
-             onReady: @escaping @Sendable () -> Void, onData: @escaping @Sendable (Data) -> Void,
-             onClose: @escaping @Sendable (Bool) -> Void) -> UserNetSocket {
-        let opts = NWProtocolTCP.Options()
-        opts.noDelay = true
-        opts.connectionTimeout = 15
-        let params = NWParameters(tls: nil, tcp: opts)
-        // iPad の「プロキシ」（iCloud プライベートリレーなど）を通さず、相手に直接つなぐ。
-        // プロキシを通ると、暗号化していない http の要求がプロキシに読まれて「400 Bad Request」で断られることがある
-        params.preferNoProxies = true
-        let c = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port) ?? 80, using: params)
-        let s = NWUserNetSocket(c, datagram: false, onData: onData, onClose: onClose)
-        c.stateUpdateHandler = { [weak s] st in
-            guard let s else { return }
-            switch st {
-            case .ready:
-                if !s.readyCalled { s.readyCalled = true; onReady() }
-            case .failed, .cancelled:
-                s.closed(error: true)
-            default:
-                // .waiting（つながらない・ネットが無いなど）は、iPad が自分でやり直すので切らない
-                // （connectionTimeout を過ぎると failed になる）
-                break
-            }
-        }
-        c.start(queue: queue)
-        return s
-    }
-
-    func udp(host: String, port: UInt16, queue: DispatchQueue,
-             onData: @escaping @Sendable (Data) -> Void, onClose: @escaping @Sendable () -> Void) -> UserNetSocket {
-        let params = NWParameters.udp
-        params.preferNoProxies = true
-        let c = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port) ?? 53, using: params)
-        let s = NWUserNetSocket(c, datagram: true, onData: onData, onClose: { _ in onClose() })
-        c.stateUpdateHandler = { [weak s] st in
-            switch st {
-            case .failed, .cancelled: s?.closed(error: true)
+            if !seen.insert(k).inserted { return nil }     // 同じ指示が 2 回あるものは無効（RFC 6797）
+            switch k {
+            case "max-age":
+                guard let n = Int(v), n >= 0 else { return nil }
+                maxAge = n
+            case "includesubdomains": sub = true
             default: break
             }
         }
-        c.start(queue: queue)
-        return s
+        guard let m = maxAge else { return nil }
+        return (m, sub)
+    }
+
+    /// この応答から登録してよいか
+    static func mayRecord(url: URL, ctx: RequestContext) -> Bool {
+        guard url.scheme?.lowercased() == "https", let h = SiteUtil.host(of: url), !SiteUtil.isIPLiteral(h) else { return false }
+        if ctx.isTopLevel { return true }
+        guard let top = ctx.topURL else { return false }
+        return SiteUtil.isSameSite(top, url)
     }
 }
 
-final class NWUserNetSocket: UserNetSocket, @unchecked Sendable {
-    let conn: NWConnection
-    let datagram: Bool
-    let onData: @Sendable (Data) -> Void
-    let onClose: @Sendable (Bool) -> Void
-    var readyCalled = false
-    private var done = false
+/// HSTS の記録（どのスレッドからでも使える）
+final class HSTSStore: @unchecked Sendable {
+    static let maxEntries = 5000
+    private let lock = NSLock()
+    private var entries: [String: HSTSEntry] = [:]
+    private let fileURL: URL?
+    private var saveScheduled = false
+    private let saveQueue = DispatchQueue(label: "vela-hsts-save")
+    /// ログ（どのスレッドからでもよい）
+    var log: (@Sendable (String) -> Void)?
 
-    init(_ c: NWConnection, datagram: Bool, onData: @escaping @Sendable (Data) -> Void, onClose: @escaping @Sendable (Bool) -> Void) {
-        conn = c; self.datagram = datagram; self.onData = onData; self.onClose = onClose
+    /// fileURL が nil なら保存しない（テスト用）
+    init(fileURL: URL?, now: Date = Date()) {
+        self.fileURL = fileURL
+        if let f = fileURL, let d = try? Data(contentsOf: f), let list = try? JSONDecoder().decode([HSTSEntry].self, from: d) {
+            for e in list where e.expires > now { entries[e.host] = e }
+        }
     }
 
-    func closed(error: Bool) {
-        if done { return }
-        done = true
-        conn.cancel()
-        onClose(error)
+    /// 既定の置き場（Application Support/Vela/hsts.json）
+    static func defaultFileURL() -> URL? {
+        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+        let dir = base.appendingPathComponent("Vela", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("hsts.json")
     }
 
-    func send(_ data: Data) {
-        if done { return }
-        conn.send(content: data, completion: .contentProcessed { _ in })
+    /// このホストを https に上げるべきか
+    func shouldUpgrade(_ host: String, now: Date = Date()) -> Bool {
+        let h = SiteUtil.normalizeHost(host)
+        if SiteUtil.isIPLiteral(h) { return false }
+        lock.lock(); defer { lock.unlock() }
+        if let e = entries[h], e.expires > now { return true }
+        // 親のドメインが includeSubDomains で登録されているか
+        var labels = h.split(separator: ".")
+        while labels.count > 1 {
+            labels.removeFirst()
+            if let e = entries[labels.joined(separator: ".")], e.includeSubDomains, e.expires > now { return true }
+        }
+        return false
     }
 
-    func finish() {
-        if done || datagram { return }
-        conn.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in })
+    /// 応答の Strict-Transport-Security を記録する（mayRecord を満たすときだけ）
+    func record(header: String, url: URL, ctx: RequestContext, now: Date = Date()) {
+        guard HSTSPolicy.mayRecord(url: url, ctx: ctx), let h = SiteUtil.host(of: url) else { return }
+        guard let (maxAge, sub) = HSTSPolicy.parse(header) else { log?("HSTS の値が読めません（\(h)）: \(header)"); return }
+        lock.lock()
+        var changed = false
+        if maxAge == 0 {
+            changed = entries.removeValue(forKey: h) != nil
+        } else {
+            let e = HSTSEntry(host: h, expires: now.addingTimeInterval(TimeInterval(maxAge)), includeSubDomains: sub)
+            let old = entries[h]
+            entries[h] = e
+            // 期限が少し延びただけなら保存しない（毎回書くと重い）
+            changed = old == nil || old!.includeSubDomains != sub || abs(old!.expires.timeIntervalSince(e.expires)) > 86400
+            if entries.count > HSTSStore.maxEntries {
+                let drop = entries.values.sorted { $0.expires < $1.expires }.prefix(entries.count - HSTSStore.maxEntries)
+                for d in drop { entries[d.host] = nil }
+            }
+        }
+        lock.unlock()
+        if changed {
+            log?(maxAge == 0 ? "HSTS を消しました: \(h)" : "HSTS を記録: \(h)（\(maxAge / 86400) 日\(sub ? "・サブドメインも" : "")）")
+            scheduleSave()
+        }
+    }
+
+    func all() -> [HSTSEntry] {
+        lock.lock(); defer { lock.unlock() }
+        return entries.values.sorted { $0.host < $1.host }
+    }
+
+    func remove(_ host: String) {
+        lock.lock(); entries[SiteUtil.normalizeHost(host)] = nil; lock.unlock()
+        scheduleSave()
+    }
+
+    func removeAll() {
+        lock.lock(); entries = [:]; lock.unlock()
+        scheduleSave()
+    }
+
+    /// まとめて 2 秒後に書く
+    private func scheduleSave() {
+        guard fileURL != nil else { return }
+        lock.lock()
+        if saveScheduled { lock.unlock(); return }
+        saveScheduled = true
+        lock.unlock()
+        saveQueue.asyncAfter(deadline: .now() + 2) { [weak self] in self?.saveNow() }
+    }
+
+    func saveNow() {
+        guard let f = fileURL else { return }
+        lock.lock()
+        saveScheduled = false
+        let list = Array(entries.values)
+        lock.unlock()
+        if let d = try? JSONEncoder().encode(list) { try? d.write(to: f, options: .atomic) }
+    }
+}
+
+// ======================================================================
+// MARK: - HTTPClient.swift
+// ======================================================================
+
+// MARK: - 自作の TCP/IP（GuestStack）の上の http / https
+//
+// 速くするための工夫:
+// ・接続を使い回す（HTTP/1.1 の keep-alive）。https は暗号の握手（TLS）に時間がかかるので、とても効く
+// ・同じ相手には同時に 6 本まで（ブラウザと同じ）。それ以上は空くまで待つ
+// ・名前（DNS）の答えを覚えておく
+// ・gzip・br で縮めて送ってもらう（HTML・JavaScript・CSS が数分の 1 になる）
+// ほかに: クッキーを送る（CookieJar と CookiePolicy で判定）・リダイレクトを追いかける（RedirectPolicy）・POST も送れる
+// 守り: 名前を引いた後、LAN への接続を LocalNetworkPolicy で判定する（DNS リバインディングも、ここで止める）
+// 「ロボットだ」と思われないよう、ヘッダは Safari と同じものを、毎回同じ順番で送る
+// 返事が来ないまま止まった接続は、時間切れで切る（でないと、その相手への読み込みがずっと止まる）
+
+struct HTTPRequest: Sendable {
+    var method = "GET"
+    var url: URL
+    var headers: [(String, String)] = []
+    var body: Data?
+    /// どんな場面の要求か（Cookie・リダイレクト・LAN の判定に使う）
+    var context = RequestContext()
+    /// 取り消しの印（WebKit が読み込みをやめたら cancel される）
+    var token: RequestToken?
+}
+
+struct HTTPResult: Sendable {
+    var status: Int
+    var headers: [(String, String)]
+    var body: Data
+    var url: URL
+    /// CookieJar に入れた Cookie の変更（リダイレクトの途中の分も）。ブラウザ（WebKit）の Cookie の置き場にも同じことをする
+    var cookieChanges: [CookieChange] = []
+    func header(_ name: String) -> String? { headers.value(for: name) }
+}
+
+struct FetchError: Error, Sendable, CustomStringConvertible {
+    /// 失敗の種類（エラーページの説明・標準の通信へ切り替える案内に使う）
+    enum Kind: String, Sendable {
+        case other, dns, timeout, tls, connect, reset, malformed, tooLarge, redirect, notReady, cancelled
+        /// TLS の版が合わない（相手が TLS 1.3 だけなど。VNet の TLS は 1.2 まで）
+        case tlsVersion
+        /// 決まり（LAN の保護など）で止めた
+        case blocked
+        /// ページが LAN へ移動しようとした。ユーザーが許可すれば開ける
+        case localNetworkConsent
+        /// 要求が多すぎて受け付けられない（待ち行列がいっぱい）
+        case busy
+    }
+    let description: String
+    var kind: Kind
+    init(_ description: String, kind: Kind = .other) { self.description = description; self.kind = kind }
+}
+
+// MARK: - 1 本の接続
+
+/// 1 本の接続（TCP、https ならその上に TLS）。使い終わったら、次の要求に使い回す
+final class HTTPConn: @unchecked Sendable {
+    /// 返事を読み終わった（または失敗した）。reusable: 次の要求に使える。gotNothing: 何も届かずに切れた
+    typealias Completion = (Result<ResponseParser, FetchError>, _ reusable: Bool, _ gotNothing: Bool) -> Void
+
+    let key: String
+    private(set) var alive = true
+    private(set) var uses = 0
+    /// 最後に何か届いた（または送り始めた）時刻。時間切れを見る
+    private var lastActivity = Date()
+    /// 使い終わって置き場に戻った時刻
+    var idleSince = Date()
+    /// 何回目の要求か（時間切れの見張りが、前の要求の分を見ないように）
+    private var serial = 0
+    private var queue: DispatchQueue?
+    /// 返事を待っている間に、これだけ何も届かなければ切る（秒）
+    static let timeout: TimeInterval = 30
+    private var tcp: GuestTCP?
+    private var tls: TLSStream?
+    private var ready = false
+    /// TCP がつながったか（失敗の種類を「つながらない」と「途中で切れた」に分ける）
+    private var tcpConnected = false
+    private var queued: Data?
+    private var parser: ResponseParser?
+    private var onDone: Completion?
+
+    init(key: String) { self.key = key }
+
+    func open(stack: GuestStack, ip: [UInt8], port: UInt16, host: String, https: Bool) {
+        queue = stack.queue
+        guard https else {
+            tcp = stack.connect(ip, port, handler: .init(
+                connected: { [weak self] in self?.tcpConnected = true; self?.becameReady() },
+                data: { [weak self] d in self?.got(d) },
+                closed: { [weak self] err in self?.ended(err) }))
+            return
+        }
+        guard let t = TLSStream(host: host, port: port) else { fail("TLS を用意できません", kind: .tls); return }
+        tls = t
+        t.onReady = { [weak self, weak t] in
+            stack.trace?("TLS つながった（\(host)・\(t?.version ?? "")）")
+            self?.becameReady()
+        }
+        t.onData = { [weak self] d in self?.got(d) }
+        t.onClosed = { [weak self] err in self?.ended(err) }
+        tcp = stack.connect(ip, port, handler: .init(
+            connected: { [weak self] in guard let self, let tc = self.tcp else { return }; self.tcpConnected = true; self.tls?.attach(tc) },
+            data: { [weak self] d in self?.lastActivity = Date(); self?.tls?.tcpData(d) },
+            closed: { [weak self] err in self?.tls?.tcpClosed(err) }))
+    }
+
+    /// 要求を 1 つ送る（返事を読み終わったら done）。何回目の要求か（取り消しに使う番号）を返す
+    /// onGrow: 返事の中身が増えたとき（増えたバイト数）
+    @discardableResult
+    func send(_ bytes: Data, isHead: Bool, limits: ResponseParser.Limits = ResponseParser.Limits(),
+              onGrow: ((Int) -> Void)? = nil, done: @escaping Completion) -> Int {
+        uses += 1
+        serial += 1
+        if !alive { done(.failure(FetchError("接続が閉じています", kind: .reset)), false, true); return serial }
+        let p = ResponseParser(isHead: isHead, limits: limits)
+        p.onBodyGrow = onGrow
+        parser = p
+        onDone = done
+        lastActivity = Date()
+        watch(serial)
+        if ready { write(bytes) } else { queued = bytes }
+        return serial
+    }
+
+    /// 読んでいる途中の要求を取り消す（その要求の番号のときだけ）。接続は切って、使い回さない
+    func cancel(serial s: Int) {
+        guard s == serial, onDone != nil else { return }
+        alive = false
+        finishCurrent(.failure(HTTPPool.cancelled), reusable: false)
+        tcp?.abort()
+    }
+
+    /// 時間切れの見張り（5 秒ごと）。返事を待っている間に長く何も届かなければ切る
+    private func watch(_ s: Int) {
+        queue?.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self, self.serial == s, self.onDone != nil else { return }
+            if Date().timeIntervalSince(self.lastActivity) < HTTPConn.timeout { self.watch(s); return }
+            self.alive = false
+            self.finishCurrent(.failure(FetchError("時間切れ（\(Int(HTTPConn.timeout)) 秒なにも届きません）", kind: .timeout)), reusable: false)
+            self.tcp?.abort()
+        }
     }
 
     func close() {
-        if done { return }
-        done = true
-        conn.cancel()
+        alive = false
+        tcp?.close()
     }
 
-    func readMore() {
-        if done { return }
-        if datagram {
-            conn.receiveMessage { [weak self] data, _, _, error in
-                guard let self, !self.done else { return }
-                if let d = data, !d.isEmpty { self.onData(d) }
-                if error != nil { self.closed(error: true); return }
-                self.readMore()          // UDP は続けて受け取る
-            }
+    private func write(_ d: Data) {
+        if let tls { tls.write(d) } else { tcp?.write(d) }
+    }
+
+    private func becameReady() {
+        ready = true
+        if let q = queued { queued = nil; write(q) }
+    }
+
+    private func got(_ d: Data) {
+        lastActivity = Date()
+        guard let p = parser else { return }
+        p.feed(d)
+        if let f = p.failure {
+            // おかしな返事: その要求は失敗にして、接続は切る（続きのバイトの区切りが信用できないため）
+            alive = false
+            let kind: FetchError.Kind
+            if case .tooLarge = f { kind = .tooLarge } else { kind = .malformed }
+            finishCurrent(.failure(FetchError(f.description, kind: kind)), reusable: false)
+            tcp?.abort()
             return
         }
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
-            guard let self, !self.done else { return }
-            if let d = data, !d.isEmpty {
-                self.onData(d)
-                if isComplete { self.closed(error: false) }
+        if p.complete { finishCurrent(.success(p), reusable: p.keepAlive && alive) }
+    }
+
+    private func ended(_ err: String?) {
+        alive = false
+        guard let p = parser else { return }
+        if p.closed() { finishCurrent(.success(p), reusable: false) }
+        else if let t = tls, t.handshakeError != 0 {
+            finishCurrent(.failure(FetchError(err ?? "TLS の握手に失敗", kind: t.versionMismatch ? .tlsVersion : .tls)), reusable: false)
+        }
+        else { finishCurrent(.failure(FetchError(err ?? "途中で切れました", kind: tcpConnected ? .reset : .connect)), reusable: false, gotNothing: p.received == 0) }
+    }
+
+    private func fail(_ s: String, kind: FetchError.Kind = .other) {
+        alive = false
+        finishCurrent(.failure(FetchError(s, kind: kind)), reusable: false, gotNothing: true)
+    }
+
+    private func finishCurrent(_ r: Result<ResponseParser, FetchError>, reusable: Bool, gotNothing: Bool = false) {
+        let cb = onDone
+        onDone = nil
+        parser = nil
+        cb?(r, reusable, gotNothing)
+    }
+}
+
+// MARK: - 取り消し
+
+/// 要求の取り消しの印。WebKit が読み込みをやめたら（VNetScheme.stop）cancel() する。
+/// HTTPPool は、待っている要求は列から外し、読んでいる途中の接続は切る（使い回さない）
+final class RequestToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var handlers: [() -> Void] = []
+
+    init() {}
+
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+
+    /// 取り消す（何度呼んでもよい）。登録された処理は、呼んだスレッドで 1 回ずつ動く
+    func cancel() {
+        lock.lock()
+        if cancelled { lock.unlock(); return }
+        cancelled = true
+        let hs = handlers
+        handlers = []
+        lock.unlock()
+        for h in hs { h() }
+    }
+
+    /// 取り消されたときの処理を登録する（もう取り消されていれば、すぐ動く）
+    func onCancel(_ h: @escaping () -> Void) {
+        lock.lock()
+        if cancelled { lock.unlock(); h(); return }
+        handlers.append(h)
+        lock.unlock()
+    }
+}
+
+// MARK: - 接続の置き場と、要求の受付
+
+/// 資源の上限（メモリ・接続の数・待ち行列）
+struct PoolLimits: Sendable {
+    /// 同じ相手への同時の接続（ブラウザと同じ）
+    var maxPerHost = 6
+    /// 全部の相手への接続の合計（使っていないものも含む）
+    var maxTotalConnections = 32
+    /// 待っている要求の合計（これを超えたら失敗にする）
+    var maxWaiting = 256
+    /// 1 つの返事の中身の上限（縮めたものを戻した後も同じ）
+    var maxBodyPerRequest = 32 << 20
+    /// 読んでいる途中の返事の中身の合計。超えている間は、新しい要求を待たせる
+    var maxBufferedTotal = 128 << 20
+    init() {}
+}
+
+/// 開発者向けの数字（queue の上で作ったスナップショット）
+struct PoolStats: Sendable {
+    var opened = 0, reused = 0
+    var busy = 0, idle = 0, waiting = 0
+    var bufferedBytes = 0
+    var dnsCached = 0
+}
+
+/// 接続の置き場（相手ごと）と、要求の受付。すべて stack.queue の上で呼ぶ
+final class HTTPPool: @unchecked Sendable {
+    let stack: GuestStack
+    /// ブラウザ（WebKit）が User-Agent を付けてこなかったときに使う
+    var userAgent = BrowserIdentity.userAgent
+    var limits = PoolLimits()
+
+    /// 待っている要求（取り消されたら、順番が来たときに cancel を呼んで飛ばす）
+    private struct Waiter {
+        let token: RequestToken?
+        let run: () -> Void
+        let cancel: () -> Void
+    }
+    private var idle: [String: [HTTPConn]] = [:]
+    private var busy: [String: Int] = [:]
+    /// 相手ごとの待ち（同じ相手への接続が maxPerHost 本使われている）
+    private var waiting: [String: [Waiter]] = [:]
+    /// 全体の待ち（接続の合計が上限・貯めている中身が上限）
+    private var admission: [Waiter] = []
+    private var dnsCache: [String: (ip: [UInt8], at: Date)] = [:]
+    /// 名前を引いて分かったアドレスの種類（トップのページが LAN のものかを見るのに使う）
+    private var hostClass: [String: IPClass] = [:]
+    /// 使っていない接続を、これより長く置いておかない（相手はたいてい黙って閉じている）
+    let idleLimit: TimeInterval = 50
+    private(set) var reused = 0, opened = 0
+    /// 読んでいる途中の返事の中身の合計（バイト）
+    private(set) var bufferedBytes = 0
+    /// Cookie の写し（正本は WebKit）。nil なら Cookie を送らない・受け取らない
+    var cookieJar: CookieJar?
+    /// HSTS の記録（リダイレクトを https に上げる）
+    var hsts: HSTSStore?
+    /// LAN の保護（LocalNetworkPolicy）を使うか
+    var localNetworkProtection = true
+    /// 判定のログ（Cookie を送らなかった理由・LAN を止めた理由など）
+    var policyLog: ((String) -> Void)?
+
+    init(stack: GuestStack) {
+        self.stack = stack
+    }
+
+    func stats() -> PoolStats {
+        pruneIdle()
+        return PoolStats(opened: opened, reused: reused, busy: busy.values.reduce(0, +), idle: idle.values.reduce(0) { $0 + $1.count },
+                         waiting: waitingCount(), bufferedBytes: bufferedBytes, dnsCached: dnsCache.count)
+    }
+
+    /// 送って返事を受け取る（リダイレクトは追いかける）
+    /// followRedirects が false なら 3xx もそのまま返す（移動はブラウザ（WebKit）に任せるとき）
+    func send(_ req: HTTPRequest, followRedirects: Bool = true, redirects: Int = 0, carried: [CookieChange] = [], done: @escaping (Result<HTTPResult, FetchError>) -> Void) {
+        if req.token?.isCancelled == true { done(.failure(HTTPPool.cancelled)); return }
+        sendOnce(req, retry: true) { [weak self] r in
+            guard let self else { return }
+            guard case .success(var res) = r else { done(r); return }
+            if followRedirects, RedirectPolicy.statuses.contains(res.status) {
+                let hsts = self.hsts
+                switch RedirectPolicy.next(from: req.url, method: req.method, headers: req.headers, body: req.body, status: res.status,
+                                           location: res.header("Location"), redirectCount: redirects,
+                                           hsts: { hsts?.shouldUpgrade($0) ?? false }) {
+                case .success(let nx):
+                    var n = req
+                    n.url = nx.url
+                    n.method = nx.method
+                    n.headers = nx.headers
+                    n.body = nx.body
+                    n.context = req.context.redirected(from: req.url, to: nx.url)
+                    let dropped = nx.dropped.isEmpty ? "" : "（外したヘッダ: \(nx.dropped.joined(separator: ", "))）"
+                    self.stack.trace?("↪ \(res.status) → \(nx.url.absoluteString)\(nx.upgradedByHSTS ? "（HSTS で https に）" : "")\(dropped)")
+                    self.send(n, followRedirects: true, redirects: redirects + 1, carried: carried + res.cookieChanges, done: done)
+                    return
+                case .failure(let f):
+                    // 追いかけられない 3xx（Location が無い・javascript: など）は、そのまま返す。回数の上限は失敗にする
+                    if f == .tooMany { done(.failure(FetchError("リダイレクトが多すぎます", kind: .redirect))); return }
+                    self.stack.trace?("↪ \(res.status) を追いかけません: \(f)")
+                }
+            }
+            res.cookieChanges = carried + res.cookieChanges
+            done(.success(res))
+        }
+    }
+
+    static let cancelled = FetchError("取り消しました", kind: .cancelled)
+
+    private func sendOnce(_ req: HTTPRequest, retry: Bool, done: @escaping (Result<HTTPResult, FetchError>) -> Void) {
+        guard let rawHost = req.url.host, let scheme = req.url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+            done(.failure(FetchError("http か https のアドレスではありません"))); return
+        }
+        let host = SiteUtil.normalizeHost(rawHost)
+        let https = scheme == "https"
+        if https && !TLSStream.isSupported { done(.failure(FetchError("この環境では https を使えません", kind: .tls))); return }
+        let port = UInt16(req.url.port ?? (https ? 443 : 80))
+        let key = "\(scheme)://\(host):\(port)"
+        // 先に名前を引いて、LAN への接続かを判定する（接続を使い回すときも、要求ごとに判定する）
+        resolve(host) { [weak self] ip in
+            guard let self else { return }
+            if req.token?.isCancelled == true { done(.failure(HTTPPool.cancelled)); return }
+            guard let ip else { done(.failure(FetchError("名前が見つかりません: \(host)", kind: .dns))); return }
+            if let e = self.checkLocalNetwork(req, host: host, ip: ip) { done(.failure(e)); return }
+            let bytes = self.requestBytes(req, host: host)
+            let run: (HTTPConn) -> Void = { [weak self] c in
+                guard let self else { return }
+                if req.token?.isCancelled == true {
+                    self.release(c, reusable: c.alive)
+                    done(.failure(HTTPPool.cancelled))
+                    return
+                }
+                var held = 0
+                let serial = c.send(bytes, isHead: req.method == "HEAD", limits: self.parserLimits(),
+                                    onGrow: { [weak self] n in held += n; self?.bufferedBytes += n }) { [weak self] r, reusable, gotNothing in
+                    guard let self else { return }
+                    self.bufferedBytes -= held
+                    held = 0
+                    self.release(c, reusable: reusable)
+                    switch r {
+                    case .success(let p):
+                        done(self.result(p, req: req))
+                    case .failure(let e):
+                        // 使い回した接続が、相手に閉じられていた: 新しい接続でもう一度（取り消したものは除く）
+                        if e.kind != .cancelled && retry && gotNothing && c.uses > 1 { self.sendOnce(req, retry: false, done: done) }
+                        else { done(.failure(e)) }
+                    }
+                }
+                let q = self.stack.queue
+                req.token?.onCancel { [weak c] in q.async { c?.cancel(serial: serial) } }
+            }
+            self.admit(req.token, cancel: { done(.failure(HTTPPool.cancelled)) }, fail: { done(.failure($0)) }) { [weak self] in
+                self?.acquire(key: key, host: host, ip: ip, port: port, https: https, token: req.token,
+                              cancel: { done(.failure(HTTPPool.cancelled)) }, fail: { done(.failure($0)) }, run: run)
+            }
+        }
+    }
+
+    private func parserLimits() -> ResponseParser.Limits {
+        var l = ResponseParser.Limits()
+        l.maxBody = limits.maxBodyPerRequest
+        return l
+    }
+
+    /// LAN への接続を判定する。止めるならエラーを返す
+    private func checkLocalNetwork(_ req: HTTPRequest, host: String, ip: [UInt8]) -> FetchError? {
+        let target = LocalNetworkPolicy.classify(ip)
+        hostClass[host] = target
+        // VNet の中のアドレス（ルーター・DNS）には、設定に関係なく接続しない
+        if !localNetworkProtection && target != .vnetInternal { return nil }
+        let ctx = req.context
+        let topClass = ctx.topURL.flatMap { classOf($0) }
+        let from = ctx.previousURL ?? ctx.initiator
+        let fromClass = from.flatMap { classOf($0) }
+        switch LocalNetworkPolicy.decide(target: target, ctx: ctx, topClass: topClass, fromClass: fromClass) {
+        case .allow:
+            return nil
+        case .block(let why):
+            policyLog?("🛡 LAN の保護: \(req.url.absoluteString)（\(ip.ipString)）を止めました: \(why)")
+            return FetchError("\(why)（\(host) → \(ip.ipString)）", kind: .blocked)
+        case .askUser(let why):
+            policyLog?("🛡 LAN の保護: \(req.url.absoluteString)（\(ip.ipString)）は確認が必要です: \(why)")
+            return FetchError("\(why)（\(host) → \(ip.ipString)）", kind: .localNetworkConsent)
+        }
+    }
+
+    /// URL のホストのアドレスの種類（数字のアドレスならそのまま。名前なら、引いたことがあればその結果。分からなければ公開とみなす）
+    private func classOf(_ u: URL) -> IPClass? {
+        guard let h = SiteUtil.host(of: u) else { return nil }
+        return LocalNetworkPolicy.classify(host: h) ?? hostClass[h] ?? .publicAddress
+    }
+
+    // MARK: 待ち行列と上限
+
+    private func waitingCount() -> Int {
+        admission.filter { $0.token?.isCancelled != true }.count
+            + waiting.values.reduce(0) { $0 + $1.filter { $0.token?.isCancelled != true }.count }
+    }
+
+    /// 待ち行列に入れる（いっぱいなら失敗）
+    private func enqueue(_ w: Waiter, key: String?, fail: (FetchError) -> Void) {
+        if waitingCount() >= limits.maxWaiting {
+            fail(FetchError("要求が多すぎます（\(limits.maxWaiting) 件待っています）", kind: .busy))
+            return
+        }
+        if let key { waiting[key, default: []].append(w) } else { admission.append(w) }
+    }
+
+    /// 貯めている中身が上限なら待たせる。空いていればすぐ go
+    private func admit(_ token: RequestToken?, cancel: @escaping () -> Void, fail: (FetchError) -> Void, _ go: @escaping () -> Void) {
+        if bufferedBytes < limits.maxBufferedTotal { go(); return }
+        stack.trace?("読んでいる途中の中身が \(bufferedBytes >> 20)MB あるので、新しい要求を待たせます")
+        enqueue(Waiter(token: token, run: go, cancel: cancel), key: nil, fail: fail)
+    }
+
+    /// 死んだ・古い「使っていない接続」を片付ける
+    private func pruneIdle() {
+        let now = Date()
+        for (k, list) in idle {
+            let keep = list.filter { c in
+                if c.alive && now.timeIntervalSince(c.idleSince) <= idleLimit { return true }
+                c.close()
+                return false
+            }
+            idle[k] = keep.isEmpty ? nil : keep
+        }
+    }
+
+    private var totalConnections: Int { busy.values.reduce(0, +) + idle.values.reduce(0) { $0 + $1.count } }
+
+    /// 空いている接続を使う。無ければ作る（上限まで）。いっぱいなら空くまで待つ
+    private func acquire(key: String, host: String, ip: [UInt8], port: UInt16, https: Bool, token: RequestToken?,
+                         cancel: @escaping () -> Void, fail: @escaping (FetchError) -> Void, run: @escaping (HTTPConn) -> Void) {
+        pruneIdle()
+        if var list = idle[key], let c = list.popLast() {
+            idle[key] = list.isEmpty ? nil : list
+            busy[key, default: 0] += 1
+            reused += 1
+            run(c)
+            return
+        }
+        let again = { [weak self] () -> Void in
+            self?.acquire(key: key, host: host, ip: ip, port: port, https: https, token: token, cancel: cancel, fail: fail, run: run)
+        }
+        if busy[key, default: 0] >= limits.maxPerHost {
+            enqueue(Waiter(token: token, run: again, cancel: cancel), key: key, fail: fail)
+            return
+        }
+        if totalConnections >= limits.maxTotalConnections {
+            // ほかの相手の、使っていない接続を 1 本閉じて場所を空ける。それも無ければ待つ
+            if let (k, list) = idle.first(where: { !$0.value.isEmpty }) {
+                var l = list
+                l.removeFirst().close()
+                idle[k] = l.isEmpty ? nil : l
+            } else {
+                enqueue(Waiter(token: token, run: again, cancel: cancel), key: nil, fail: fail)
                 return
             }
-            if isComplete || error != nil { self.closed(error: error != nil) }
-            else { self.readMore() }
+        }
+        busy[key, default: 0] += 1
+        let c = HTTPConn(key: key)
+        opened += 1
+        c.open(stack: stack, ip: ip, port: port, host: host, https: https)
+        run(c)
+    }
+
+    /// 使い終わった接続を戻す（使い回せなければ閉じる）。待っている要求があれば進める
+    private func release(_ c: HTTPConn, reusable: Bool) {
+        if reusable && c.alive { c.idleSince = Date(); idle[c.key, default: []].append(c) } else { c.close() }
+        busy[c.key, default: 1] -= 1
+        if busy[c.key] == 0 { busy[c.key] = nil }
+        drain(key: c.key)
+    }
+
+    /// 待っている要求を進める（相手ごとの待ち → 全体の待ち）。取り消されたものは飛ばす
+    private func drain(key: String) {
+        while var w = waiting[key], !w.isEmpty {
+            let next = w.removeFirst()
+            waiting[key] = w.isEmpty ? nil : w
+            if next.token?.isCancelled == true { next.cancel(); continue }
+            next.run()
+            break
+        }
+        while !admission.isEmpty && bufferedBytes < limits.maxBufferedTotal && totalConnections < limits.maxTotalConnections {
+            let next = admission.removeFirst()
+            if next.token?.isCancelled == true { next.cancel(); continue }
+            next.run()
+        }
+    }
+
+    private func resolve(_ host: String, _ done: @escaping ([UInt8]?) -> Void) {
+        if let c = dnsCache[host], Date().timeIntervalSince(c.at) < 300 { done(c.ip); return }
+        stack.resolve(host) { [weak self] ip in
+            if let ip { self?.dnsCache[host] = (ip, Date()) }
+            done(ip)
+        }
+    }
+
+    /// こちらで決め直すので、ブラウザから来ても送らないヘッダ
+    private static let ownHeaders: Set<String> = ["host", "connection", "accept-encoding", "content-length", "user-agent",
+                                                  "cookie", "keep-alive", "proxy-connection", "te", "upgrade"]
+
+    /// ヘッダを送る順番（Safari に合わせる）。ここに無い名前は "content-type" の所に、来た順で入れる
+    /// （ブラウザから来るヘッダは辞書なので順番がばらばら。毎回順番が変わると、ロボットだと思われやすい）
+    private static let headerOrder: [String] = ["host", "origin", "content-type", "accept", "sec-fetch-site", "sec-fetch-dest",
+                                                "accept-language", "sec-fetch-mode", "user-agent", "upgrade-insecure-requests",
+                                                "referer", "range", "if-none-match", "if-modified-since", "content-length",
+                                                "accept-encoding", "cookie", "priority", "connection"]
+
+    private func requestBytes(_ req: HTTPRequest, host: String) -> Data {
+        let comps = URLComponents(url: req.url, resolvingAgainstBaseURL: false)
+        var path = comps?.percentEncodedPath ?? "/"
+        if path.isEmpty { path = "/" }
+        if let q = comps?.percentEncodedQuery { path += "?" + q }
+        var h: [(String, String)] = [("Host", req.url.port.map { "\(host):\($0)" } ?? host)]
+        h += req.headers.filter { !HTTPPool.ownHeaders.contains($0.0.lowercased()) }
+        if h.value(for: "Accept") == nil { h.append(("Accept", "*/*")) }
+        if h.value(for: "Accept-Language") == nil { h.append(("Accept-Language", BrowserIdentity.acceptLanguage)) }
+        // User-Agent はブラウザ（WebKit）が付けてきたものを使う（ページの JavaScript から見える navigator.userAgent と同じにする）
+        h.append(("User-Agent", req.headers.value(for: "User-Agent") ?? userAgent))
+        // 途中から読む（Range。動画など）ときは縮めてもらわない。縮めると「何バイト目」がずれる
+        h.append(("Accept-Encoding", req.headers.value(for: "Range") == nil ? ContentDecoding.acceptEncoding : "identity"))
+        if let cookie = cookieHeader(req) { h.append(("Cookie", cookie)) }
+        if let b = req.body { h.append(("Content-Length", String(b.count))) }
+        else if req.method == "POST" || req.method == "PUT" || req.method == "PATCH" { h.append(("Content-Length", "0")) }
+        h.append(("Connection", "keep-alive"))
+        let order = HTTPPool.headerOrder
+        let other = order.firstIndex(of: "content-type") ?? 0
+        let rank = { (name: String) -> Int in order.firstIndex(of: name.lowercased()) ?? other }
+        let sorted = h.enumerated().sorted { a, b in
+            let ra = rank(a.element.0), rb = rank(b.element.0)
+            return ra != rb ? ra < rb : a.offset < b.offset
+        }
+        var s = "\(req.method) \(path) HTTP/1.1\r\n"
+        for (_, kv) in sorted { s += "\(kv.0): \(kv.1)\r\n" }
+        s += "\r\n"
+        var d = Data(s.utf8)
+        if let b = req.body { d.append(b) }
+        return d
+    }
+
+    /// 送る Cookie。WebKit が付けてきたものがあれば、それをそのまま使う（WebKit が自分の決まりで選んだもの）。
+    /// 無ければ CookieJar（WebKit の置き場の写し）から、CookiePolicy で許されたものだけ
+    private func cookieHeader(_ req: HTTPRequest) -> String? {
+        if !req.context.cookiesAllowed { return nil }
+        let fromWebKit = req.headers.values(for: "Cookie").filter { !$0.isEmpty }
+        if !fromWebKit.isEmpty { return fromWebKit.joined(separator: "; ") }
+        guard let jar = cookieJar else { return nil }
+        let (header, skipped) = jar.header(for: req.url, method: req.method, ctx: req.context)
+        if !skipped.isEmpty, let log = policyLog {
+            log("🍪 送らない（\(req.url.host ?? "")）: " + skipped.map { "\($0.0)＝\($0.1)" }.joined(separator: "、"))
+        }
+        return header
+    }
+
+    /// 返事をまとめる（Cookie を CookieJar に入れる・縮めた中身を戻す）
+    private func result(_ p: ResponseParser, req: HTTPRequest) -> Result<HTTPResult, FetchError> {
+        let url = req.url
+        var headers = p.headers
+        let lines = headers.values(for: "Set-Cookie")
+        var changes: [CookieChange] = []
+        if !lines.isEmpty, let jar = cookieJar {
+            changes = jar.receive(lines, url: url, method: req.method, ctx: req.context)
+        }
+        var body = Data(p.body)
+        if let enc = headers.value(for: "Content-Encoding"), !body.isEmpty {
+            switch ContentDecoding.decode(body, encoding: enc, maxOutput: limits.maxBodyPerRequest) {
+            case .success(let g):
+                body = g
+                headers.removeAll(named: ["content-encoding", "content-length"])
+            case .failure(let f):
+                // 戻せない中身をそのまま渡すと、ページには壊れたデータになる。失敗にする
+                stack.trace?("縮めた中身（\(enc)）を戻せませんでした: \(url.absoluteString)（\(f.description)）")
+                if case .tooLarge = f { return .failure(FetchError(f.description, kind: .tooLarge)) }
+                return .failure(FetchError(f.description, kind: .malformed))
+            }
+        }
+        headers.removeAll(named: ["transfer-encoding"])
+        return .success(HTTPResult(status: p.status, headers: headers, body: body, url: url, cookieChanges: changes))
+    }
+}
+
+// ======================================================================
+// MARK: - HTTPResponseParser.swift
+// ======================================================================
+
+// MARK: - http の返事を少しずつ読む
+//
+// ヘッダ → 中身。中身の終わりは「長さ指定（Content-Length）」「chunked」「閉じるまで」のどれか。
+// 100 Continue などの途中の返事は読み飛ばす。
+//
+// 外から来るデータなので、おかしなものは「壊れている（malformed）」「大きすぎる（tooLarge）」として止める（落ちない・貯めすぎない）:
+//  ・Content-Length は 0 以上の整数だけ。違う値が重複していたら拒否（同じ値の重複は 1 つにまとめる）
+//  ・Transfer-Encoding と Content-Length が両方あったら拒否（中身の境目があいまいになり、取り違えの元になるため）
+//  ・chunked: サイズは 16 進の数字だけ。チャンクの後ろは必ず CRLF。行・トレーラーの長さに上限
+//  ・ヘッダの合計・1 行・行数に上限。中身は limits.maxBody まで
+// 止めた接続は使い回さない（呼ぶ側の HTTPConn が閉じる）
+
+final class ResponseParser {
+    struct Limits {
+        var maxHeaderBytes = 64 * 1024
+        var maxHeaderLine = 8 * 1024
+        var maxHeaderCount = 100
+        var maxBody = 32 << 20
+        var maxChunkLine = 1024
+        var maxTrailerBytes = 8 * 1024
+        init() {}
+    }
+
+    enum Failure: Equatable {
+        case malformed(String)
+        case tooLarge(String)
+        var description: String {
+            switch self {
+            case .malformed(let s): return "返事が壊れています（\(s)）"
+            case .tooLarge(let s): return "返事が大きすぎます（\(s)）"
+            }
+        }
+    }
+
+    let isHead: Bool
+    let limits: Limits
+    private(set) var status = 0
+    private(set) var headers: [(String, String)] = []
+    private(set) var body = [UInt8]()
+    private(set) var complete = false
+    private(set) var keepAlive = true
+    /// 届いたバイト数（何も届かずに切れたかを見るため）
+    private(set) var received = 0
+    /// おかしな返事だった（nil なら問題なし）
+    private(set) var failure: Failure?
+    /// 中身が増えたとき（増えたバイト数）。アプリ全体の貯めている量を数えるのに使う
+    var onBodyGrow: ((Int) -> Void)?
+
+    private var head = [UInt8]()
+    private var headDone = false
+    private enum Mode { case length(Int), chunked, untilClose }
+    private var mode = Mode.untilClose
+    private enum Chunk { case size, data(Int), cr, lf, trailer }
+    private var chunk = Chunk.size
+    private var line = [UInt8]()
+    private var trailerBytes = 0
+
+    init(isHead: Bool, limits: Limits = Limits()) {
+        self.isHead = isHead
+        self.limits = limits
+    }
+
+    func feed(_ d: Data) {
+        received += d.count
+        var bytes = [UInt8](d)
+        while !complete && failure == nil && !bytes.isEmpty {
+            if headDone {
+                bytes = consumeBody(bytes)
+                continue
+            }
+            head.append(contentsOf: bytes)
+            guard let end = findHeadEnd() else {
+                if head.count > limits.maxHeaderBytes { fail(.tooLarge("ヘッダが \(limits.maxHeaderBytes / 1024)KB を超えています")) }
+                return
+            }
+            if end > limits.maxHeaderBytes { fail(.tooLarge("ヘッダが \(limits.maxHeaderBytes / 1024)KB を超えています")); return }
+            bytes = Array(head[(end + 4)...])
+            let headBytes = Array(head[0..<end])
+            head = []
+            parseHead(headBytes)
+            if failure != nil { return }
+            if status >= 100 && status < 200 { headDone = false }     // 100 Continue など: 次のヘッダを読む
+        }
+    }
+
+    /// 相手が閉じた: 「閉じるまで」の形なら、ここで終わり
+    func closed() -> Bool {
+        if complete { return true }
+        if failure != nil { return false }
+        if headDone, case .untilClose = mode { complete = true; keepAlive = false; return true }
+        return false
+    }
+
+    private func fail(_ f: Failure) {
+        if failure == nil { failure = f }
+        keepAlive = false
+    }
+
+    private func findHeadEnd() -> Int? {
+        if head.count < 4 { return nil }
+        for i in 0...(head.count - 4) where head[i] == 13 && head[i + 1] == 10 && head[i + 2] == 13 && head[i + 3] == 10 { return i }
+        return nil
+    }
+
+    private func appendBody<C: Collection>(_ b: C) where C.Element == UInt8 {
+        if b.isEmpty { return }
+        if body.count + b.count > limits.maxBody {
+            fail(.tooLarge("中身が \(limits.maxBody >> 20)MB を超えています"))
+            return
+        }
+        body.append(contentsOf: b)
+        onBodyGrow?(b.count)
+    }
+
+    private func parseHead(_ headBytes: [UInt8]) {
+        headDone = true
+        var lines = String(decoding: headBytes, as: UTF8.self).components(separatedBy: "\r\n")
+        let first = lines.removeFirst()
+        // 状態の行: "HTTP/1.1 200 OK"
+        let parts = first.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: false)
+        guard parts.count >= 2, parts[0].hasPrefix("HTTP/1."), parts[1].count == 3, let st = Int(parts[1]), (100...599).contains(st) else {
+            fail(.malformed("状態の行が読めません: \(first.prefix(60))")); return
+        }
+        status = st
+        if lines.count > limits.maxHeaderCount { fail(.tooLarge("ヘッダが \(limits.maxHeaderCount) 行を超えています")); return }
+        var hs: [(String, String)] = []
+        for l in lines {
+            if l.utf8.count > limits.maxHeaderLine { fail(.tooLarge("ヘッダの 1 行が \(limits.maxHeaderLine / 1024)KB を超えています")); return }
+            if l.isEmpty { continue }
+            guard let c = l.firstIndex(of: ":") else {
+                if l.first == " " || l.first == "\t" { fail(.malformed("折り返したヘッダ（obs-fold）")); return }
+                continue
+            }
+            let name = String(l[..<c])
+            if name.isEmpty || name.contains(" ") || name.contains("\t") { fail(.malformed("ヘッダの名前が不正: \(name.prefix(40))")); return }
+            hs.append((name, String(l[l.index(after: c)...]).trimmingCharacters(in: .whitespaces)))
+        }
+        headers = hs
+        let conn = headers.value(for: "Connection")?.lowercased() ?? ""
+        keepAlive = first.hasPrefix("HTTP/1.0") ? conn.contains("keep-alive") : !conn.contains("close")
+        if status >= 100 && status < 200 { return }
+
+        // 中身の長さの決め方
+        let te = headers.values(for: "Transfer-Encoding")
+        let cls = headers.values(for: "Content-Length")
+        if !te.isEmpty && !cls.isEmpty { fail(.malformed("Transfer-Encoding と Content-Length が両方あります")); return }
+        var length: Int?
+        if !cls.isEmpty {
+            var values = Set<String>()
+            for v in cls { for p in v.split(separator: ",", omittingEmptySubsequences: false) { values.insert(p.trimmingCharacters(in: .whitespaces)) } }
+            guard values.count == 1, let v = values.first, !v.isEmpty, v.count <= 18, v.allSatisfy({ $0.isASCII && $0.isNumber }), let n = Int(v) else {
+                fail(.malformed("Content-Length が不正: \(cls.joined(separator: " / ").prefix(60))")); return
+            }
+            length = n
+        }
+        if isHead || status == 204 || status == 304 { complete = true; return }
+        if !te.isEmpty {
+            let codings = te.joined(separator: ",").lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            if codings.last == "chunked" { mode = .chunked }
+            else { mode = .untilClose; keepAlive = false }          // chunked で終わらないなら、閉じるまで（RFC 9112 6.3）
+        } else if let n = length {
+            if n > limits.maxBody { fail(.tooLarge("Content-Length が \(limits.maxBody >> 20)MB を超えています（\(n)）")); return }
+            mode = .length(n)
+            if n == 0 { complete = true }
+        } else {
+            mode = .untilClose; keepAlive = false
+        }
+    }
+
+    /// 中身を読む。余り（次の返事の分。普通は無い）を返す
+    private func consumeBody(_ b: [UInt8]) -> [UInt8] {
+        switch mode {
+        case .untilClose:
+            appendBody(b)
+            return []
+        case .length(let n):
+            let take = min(max(n - body.count, 0), b.count)
+            appendBody(b[0..<take])
+            if body.count >= n { complete = true }
+            return Array(b[take...])
+        case .chunked:
+            var i = 0
+            while i < b.count && !complete && failure == nil {
+                switch chunk {
+                case .size, .trailer:
+                    let c = b[i]; i += 1
+                    if c != 10 {
+                        line.append(c)
+                        if case .trailer = chunk {
+                            trailerBytes += 1
+                            if trailerBytes > limits.maxTrailerBytes { fail(.tooLarge("トレーラーが \(limits.maxTrailerBytes / 1024)KB を超えています")) }
+                        } else if line.count > limits.maxChunkLine {
+                            fail(.malformed("チャンクのサイズの行が長すぎます"))
+                        }
+                        continue
+                    }
+                    if line.last == 13 { line.removeLast() }
+                    let text = String(decoding: line, as: UTF8.self)
+                    line = []
+                    if case .trailer = chunk {
+                        if text.isEmpty { complete = true }
+                    } else {
+                        let sizeText = (text.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? "")
+                            .trimmingCharacters(in: CharacterSet(charactersIn: " \t"))
+                        guard !sizeText.isEmpty, sizeText.count <= 16, sizeText.allSatisfy({ $0.isHexDigit }), let n = Int(sizeText, radix: 16) else {
+                            fail(.malformed("チャンクのサイズが不正: \(sizeText.prefix(20))")); break
+                        }
+                        if n > limits.maxBody - body.count { fail(.tooLarge("チャンクが大きすぎます（\(n)）")); break }
+                        chunk = n == 0 ? .trailer : .data(n)
+                    }
+                case .data(let remain):
+                    let take = min(remain, b.count - i)
+                    appendBody(b[i..<(i + take)])
+                    i += take
+                    chunk = remain - take == 0 ? .cr : .data(remain - take)
+                case .cr:                                     // 中身のあとの \r\n（必ずこの 2 バイト）
+                    guard b[i] == 13 else { fail(.malformed("チャンクの後ろが CRLF ではありません")); break }
+                    i += 1
+                    chunk = .lf
+                case .lf:
+                    guard b[i] == 10 else { fail(.malformed("チャンクの後ろが CRLF ではありません")); break }
+                    i += 1
+                    chunk = .size
+                }
+            }
+            return Array(b[min(i, b.count)...])
         }
     }
 }
-#endif
+
+// ======================================================================
+// MARK: - HTTPSupport.swift
+// ======================================================================
+
+// MARK: - http の小さな道具（ヘッダ・gzip・ブラウザらしさ）
+//
+// Cookie は CookieJar.swift（WebKit の置き場の写し）と NetPolicy.swift の CookiePolicy に移した
+
+/// ヘッダ（名前, 値）の並び。名前の大文字小文字は区別しない
+extension Array where Element == (String, String) {
+    func value(for name: String) -> String? {
+        let n = name.lowercased()
+        return first { $0.0.lowercased() == n }?.1
+    }
+
+    func values(for name: String) -> [String] {
+        let n = name.lowercased()
+        return filter { $0.0.lowercased() == n }.map { $0.1 }
+    }
+
+    /// names は小文字で渡す
+    mutating func removeAll(named names: Set<String>) {
+        removeAll { names.contains($0.0.lowercased()) }
+    }
+}
+
+// MARK: 縮めた中身を戻す（gzip・deflate・br）
+
+enum ContentDecoding {
+    /// 送る Accept-Encoding（Safari と同じ。br は iOS 15 から）
+    static var acceptEncoding: String {
+        #if canImport(Compression)
+        if #available(iOS 15.0, macOS 12.0, *) { return "gzip, deflate, br" }
+        return "gzip, deflate"
+        #else
+        return "identity"
+        #endif
+    }
+
+    enum Failure: Error, Equatable {
+        /// 知らない縮め方（この環境で戻せないものも）
+        case unsupported(String)
+        /// 壊れている・途中で切れている
+        case corrupt(String)
+        /// 戻した大きさが上限を超えた（圧縮爆弾など）
+        case tooLarge(Int)
+
+        var description: String {
+            switch self {
+            case .unsupported(let e): return "戻せない縮め方です（\(e)）"
+            case .corrupt(let e): return "縮めた中身（\(e)）が壊れています"
+            case .tooLarge(let n): return "戻した中身が \(n >> 20)MB を超えます"
+            }
+        }
+    }
+
+    /// Content-Encoding に従って戻す。戻した大きさは maxOutput まで
+    static func decode(_ d: Data, encoding: String, maxOutput: Int = 32 << 20) -> Result<Data, Failure> {
+        // "gzip, br" のように重ねてあるときは、後ろから戻す
+        var out = d
+        for e in encoding.lowercased().split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }).reversed() {
+            let r: Result<Data, Failure>
+            switch e {
+            case "", "identity": continue
+            case "gzip", "x-gzip": r = gunzip(out, maxOutput: maxOutput)
+            case "deflate": r = inflateZlib(out, maxOutput: maxOutput)
+            case "br": r = brotli(out, maxOutput: maxOutput)
+            default: return .failure(.unsupported(e))
+            }
+            switch r {
+            case .success(let g): out = g
+            case .failure(let f): return .failure(f)
+            }
+        }
+        return .success(out)
+    }
+
+    /// gzip: 前（10 バイト〜）と後ろ（8 バイト）を外して、生の deflate として戻す
+    static func gunzip(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
+        let b = [UInt8](d)
+        guard b.count >= 18, b[0] == 0x1F, b[1] == 0x8B, b[2] == 8 else { return .failure(.corrupt("gzip の頭が違います")) }
+        let flags = b[3]
+        var p = 10
+        if flags & 4 != 0 { guard p + 2 <= b.count else { return .failure(.corrupt("gzip")) }; p += 2 + (Int(b[p]) | Int(b[p + 1]) << 8) }   // FEXTRA
+        if flags & 8 != 0 { while p < b.count && b[p] != 0 { p += 1 }; p += 1 }                                      // FNAME
+        if flags & 16 != 0 { while p < b.count && b[p] != 0 { p += 1 }; p += 1 }                                     // FCOMMENT
+        if flags & 2 != 0 { p += 2 }                                                                                  // FHCRC
+        guard p < b.count else { return .failure(.corrupt("gzip")) }
+        return inflateRaw(b[p...], name: "gzip", maxOutput: maxOutput)
+    }
+
+    /// deflate: 本当は zlib の包み（2 バイト＋後ろ 4 バイト）付き。包みの無い生の deflate を送るサーバーもあるので両方受ける
+    static func inflateZlib(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
+        let b = [UInt8](d)
+        if b.count >= 2 && b[0] & 0x0F == 8 && (Int(b[0]) << 8 | Int(b[1])) % 31 == 0 { return inflateRaw(b[2...], name: "deflate", maxOutput: maxOutput) }
+        return inflateRaw(b[...], name: "deflate", maxOutput: maxOutput)
+    }
+
+    static func inflateRaw(_ b: ArraySlice<UInt8>, name: String, maxOutput: Int) -> Result<Data, Failure> {
+        #if canImport(Compression)
+        return stream(b, COMPRESSION_ZLIB, name: name, maxOutput: maxOutput)      // Apple の ZLIB は「生の deflate」
+        #else
+        return .failure(.unsupported(name))
+        #endif
+    }
+
+    static func brotli(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
+        #if canImport(Compression)
+        if #available(iOS 15.0, macOS 12.0, *) { return stream([UInt8](d)[...], COMPRESSION_BROTLI, name: "br", maxOutput: maxOutput) }
+        #endif
+        return .failure(.unsupported("br"))
+    }
+
+    #if canImport(Compression)
+    /// 元の大きさが分からなくても戻せるよう、少しずつ戻す。最後まで戻せなかったら壊れている扱い
+    private static func stream(_ src: ArraySlice<UInt8>, _ algorithm: compression_algorithm, name: String, maxOutput: Int) -> Result<Data, Failure> {
+        if src.isEmpty { return .success(Data()) }
+        let chunk = 1 << 16
+        let out = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
+        defer { out.deallocate() }
+        var s = compression_stream(dst_ptr: out, dst_size: 0, src_ptr: UnsafePointer(out), src_size: 0, state: nil)
+        guard compression_stream_init(&s, COMPRESSION_STREAM_DECODE, algorithm) == COMPRESSION_STATUS_OK else { return .failure(.unsupported(name)) }
+        defer { compression_stream_destroy(&s) }
+        var result = Data()
+        return src.withUnsafeBufferPointer { sb -> Result<Data, Failure> in
+            guard let base = sb.baseAddress else { return .failure(.corrupt(name)) }
+            s.src_ptr = base
+            s.src_size = sb.count
+            while true {
+                s.dst_ptr = out
+                s.dst_size = chunk
+                let st = compression_stream_process(&s, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
+                let produced = chunk - s.dst_size
+                if result.count + produced > maxOutput { return .failure(.tooLarge(maxOutput)) }
+                if produced > 0 { result.append(out, count: produced) }
+                if st == COMPRESSION_STATUS_END { return .success(result) }
+                if st != COMPRESSION_STATUS_OK { return .failure(.corrupt(name)) }
+                if produced == 0 && s.src_size == 0 { return .failure(.corrupt("\(name)・途中で切れています")) }
+            }
+        }
+    }
+    #endif
+}
+
+// MARK: ブラウザらしさ（User-Agent・言語）
+
+enum BrowserIdentity {
+    /// iPad の Safari（デスクトップ用の表示。iPad の Safari の初期設定と同じ）の User-Agent。
+    /// WKWebView の初期値は「Version/… Safari/…」が無く、アプリの中のブラウザやロボットだと思われやすい
+    static let userAgent: String = {
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/\(v.majorVersion).\(v.minorVersion) Safari/605.1.15"
+    }()
+
+    /// Accept-Language（端末の言語の順。例: "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7"）
+    static let acceptLanguage: String = {
+        var langs: [String] = []
+        for l in Locale.preferredLanguages.prefix(3) {
+            let tag = l.replacingOccurrences(of: "_", with: "-")
+            if !langs.contains(tag) { langs.append(tag) }
+            if let base = tag.split(separator: "-").first.map(String.init), base != tag, !langs.contains(base) { langs.append(base) }
+        }
+        if langs.isEmpty { langs = ["ja-JP", "ja"] }
+        return langs.prefix(6).enumerated().map { i, l in
+            i == 0 ? l : "\(l);q=\(String(format: "%.1f", max(0.1, 1.0 - Double(i) * 0.1)))"
+        }.joined(separator: ",")
+    }()
+}

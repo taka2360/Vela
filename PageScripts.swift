@@ -114,6 +114,25 @@ enum PageScripts {
     })();
     """#
 
+    /// VNet を通らない通信（WebSocket）を使ったら、アプリに 1 回だけ知らせる（アドレス欄の札に出す）
+    static let trackNonVNet = #"""
+    (function () {
+      try {
+        const W = window.WebSocket;
+        const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.velaAction;
+        if (!W || !h) return;
+        let told = false;
+        const Tracked = function WebSocket(url, protocols) {
+          if (!told) { told = true; try { h.postMessage({ action: 'usedWebSocket' }); } catch (e) {} }
+          return protocols === undefined ? new W(url) : new W(url, protocols);
+        };
+        Tracked.prototype = W.prototype;
+        for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) Tracked[k] = W[k];
+        window.WebSocket = Tracked;
+      } catch (e) {}
+    })();
+    """#
+
     /// LAN の保護（標準の通信のタブと WebSocket 用）: WebKit のルールで、LAN でないページから数字の LAN のアドレスなどへの読み込みを止める。
     /// トップのページが LAN のもの（ユーザーがアドレス欄で開いた機器のページなど）なら止めない。
     /// WebKit の正規表現は「|」が使えないので、アドレスの範囲ごとに 1 行にする

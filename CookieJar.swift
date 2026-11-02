@@ -53,8 +53,9 @@ final class CookieJar: @unchecked Sendable {
     func receive(_ lines: [String], url: URL, method: String, ctx: RequestContext, now: Date = Date()) -> [CookieChange] {
         var changes: [CookieChange] = []
         let s = settings
-        for line in lines {
-            switch SetCookieParser.parse(line, url: url, now: now) {
+        for (i, line) in lines.enumerated() {
+            // 同じ返事の中の Cookie は、届いた順に作られたことにする（送る順番が毎回変わらないように、1 マイクロ秒ずつずらす）
+            switch SetCookieParser.parse(line, url: url, now: now.addingTimeInterval(Double(i) * 1e-6)) {
             case .rejected(let why):
                 log?("🍪✕ 受け取らない（\(SiteUtil.host(of: url) ?? "")）: \(why)")
             case .cookie(var rec):

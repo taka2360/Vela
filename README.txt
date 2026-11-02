@@ -20,15 +20,16 @@ Android エミュレータと同じ「仮想 LAN カード（virtio-net）」と
 1. 新しい「App」を作る
 2. 最初からある ContentView.swift と MyApp.swift を消す（または中身をこのフォルダのものに入れ替える）
 3. このフォルダの .swift ファイルを全部入れる
-   画面: MyApp / BrowserView / BrowserModel / Persistence / DevLog / VNetScheme / HTTPSTakeover / PageScripts
+   画面: MyApp / BrowserView / TabViews / DevPanel / BrowserStore / BrowserTab / AddressInput / Persistence / DevLog
+   VNet と WebKit: VNetScheme / HTTPSTakeover / PageScripts
    守り: NetPolicy / CookieJar / HSTSStore
    http: HTTPClient / HTTPResponseParser / HTTPSupport / TLSClient
    TCP/IP: GuestStack / GuestTCP / DNSMessage / Packet
    カード: VNetMachine / VNetCore / VNetDriver
    ルーター: UserNet / UserNetApple
-   （全部で 24 ファイル。まとめたものを使うなら VelaParts フォルダの Vela1〜4.swift の 4 つだけを入れる）
+   （全部で 28 ファイル。まとめたものを使うなら VelaParts フォルダの Vela1〜6.swift の 6 つだけを入れる）
    ※ 1 つにまとめた VelaAll.swift は大きすぎて、Playgrounds が「Timed out waiting for a thunk to build after 30.0 seconds」
-     で止まることがあります（1 つのファイルを作るのに 30 秒を超える）。そのときは VelaParts の 4 つを使ってください
+     で止まることがあります（1 つのファイルを作るのに 30 秒を超える）。そのときは VelaParts の 6 つを使ってください
 4. 実行して、アドレスに https://example.com/ などを入れて「開く」
 
 メモ

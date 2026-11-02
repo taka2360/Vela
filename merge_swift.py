@@ -3,8 +3,8 @@
 
 使い方:
   python merge_swift.py                  # → VelaAll.swift（@main 付き。Playgrounds の「App」用）
-                                         #   と VelaParts/Vela1〜4.swift（同じ中身を 4 つに分けたもの）
-  python merge_swift.py --parts 6        # 分ける数を変える（0 なら分けたものは作らない）
+                                         #   と VelaParts/Vela1〜6.swift（同じ中身を 6 つに分けたもの）
+  python merge_swift.py --parts 8        # 分ける数を変える（0 なら分けたものは作らない）
   python merge_swift.py -o out.swift     # 出力先を変える
   python merge_swift.py --playground     # @main を外し、PlaygroundSupport のライブビューで動かす版
                                          # （Xcode / Playgrounds の「.playground」ページ用）
@@ -21,7 +21,7 @@ from pathlib import Path
 
 # README の順（ここに無いファイルは最後に名前順で足す）
 ORDER = [
-    "MyApp", "BrowserView", "BrowserModel", "Persistence", "DevLog", "VNetScheme", "HTTPSTakeover", "PageScripts",
+    "MyApp", "BrowserView", "TabViews", "DevPanel", "BrowserStore", "BrowserTab", "AddressInput", "Persistence", "DevLog", "VNetScheme", "HTTPSTakeover", "PageScripts",
     "NetPolicy", "CookieJar", "HSTSStore",
     "HTTPClient", "HTTPResponseParser", "HTTPSupport", "TLSClient",
     "GuestStack", "GuestTCP", "DNSMessage", "Packet",
@@ -86,7 +86,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-d", "--dir", default=Path(__file__).resolve().parent, type=Path, help="入力フォルダ")
     ap.add_argument("-o", "--output", default="VelaAll.swift", help="出力ファイル名")
-    ap.add_argument("--parts", type=int, default=4,
+    ap.add_argument("--parts", type=int, default=6,
                     help="VelaParts/ に、同じ中身をこの数のファイルに分けたものも作る（0 で作らない）。"
                          "Playgrounds は 1 つのファイルが大きいと、作るのが 30 秒を超えて止まる（thunk の時間切れ）ため")
     ap.add_argument("--playground", action="store_true",

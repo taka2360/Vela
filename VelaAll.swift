@@ -1,5 +1,5 @@
 // このファイルは merge_swift.py で自動生成したものです（直接編集しないでください）
-// 元ファイル: MyApp.swift, BrowserView.swift, BrowserModel.swift, Persistence.swift, DevLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
+// 元ファイル: MyApp.swift, BrowserView.swift, TabViews.swift, DevPanel.swift, BrowserStore.swift, BrowserTab.swift, AddressInput.swift, Persistence.swift, DevLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
 
 import SwiftUI
 import WebKit
@@ -32,79 +32,578 @@ struct VelaApp: App {
 // MARK: - BrowserView.swift
 // ======================================================================
 
-// MARK: - 画面: 自作の通信（virtio-net → 小さなルーター）で読んだページを表示するブラウザ
+// MARK: - 画面（iPad の Safari に近い形）
 //
-// 中身は BrowserModel。ここは見た目だけ
-
-struct WebBox: UIViewRepresentable {
-    let webView: WKWebView
-    func makeUIView(context: Context) -> WKWebView { webView }
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
-}
+//  ┌ ツールバー: [戻る][進む]  [ アドレス欄（触っていないときはドメインと鍵） ]  [再読み込み/止める][…][＋][タブ一覧]
+//  │            └ 下に読み込みの進み具合
+//  ├ タブバー（タブが 2 枚以上のとき）
+//  └ ページ（見ているタブの WKWebView）
+// 中身は BrowserStore と BrowserTab。ここは見た目だけ。
+// Playgrounds で作るのが遅くならないよう、1 つの View を小さく分けている（大きな式は型チェックが遅い）
 
 struct BrowserView: View {
-    @StateObject private var model = BrowserModel()
-    @State private var showLog = true
+    @StateObject private var store = BrowserStore()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        VStack(spacing: 8) {
-            addressBar
-            Text(model.status).font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
-            WebBox(webView: model.webView)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.3)))
-            Toggle("通信のログ（virtio-net → ルーター）", isOn: $showLog).font(.caption)
-            if showLog { logView }
+        VStack(spacing: 0) {
+            if let tab = store.selectedTab {
+                TopBar(store: store, tab: tab)
+            }
+            if store.tabs.count > 1 {
+                TabStrip(store: store)
+            }
+            Divider()
+            PageArea(store: store)
+        }
+        .sheet(isPresented: $store.showDevPanel) { DevPanel(store: store) }
+        .fullScreenCover(isPresented: $store.showTabOverview) { TabOverview(store: store) }
+        .modifier(DialogModifier(store: store))
+        .onChange(of: scenePhase) { phase in
+            if phase != .active { store.saveSessionNow() }
+        }
+    }
+}
+
+// MARK: ツールバー
+
+struct TopBar: View {
+    @ObservedObject var store: BrowserStore
+    @ObservedObject var tab: BrowserTab
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 14) {
+                NavButtons(tab: tab)
+                AddressField(store: store, tab: tab)
+                ReloadButton(tab: tab)
+                MoreMenu(store: store, tab: tab)
+                Button { store.newTab(url: nil) } label: { Image(systemName: "plus") }
+                    .keyboardShortcut("t", modifiers: .command)
+                Button { store.openTabOverview() } label: { Image(systemName: "square.on.square") }
+            }
+            .font(.system(size: 18))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            LoadingBar(progress: tab.progress, visible: tab.isLoading)
+        }
+        .background(Color(UIColor.secondarySystemBackground))
+    }
+}
+
+struct NavButtons: View {
+    @ObservedObject var tab: BrowserTab
+
+    var body: some View {
+        HStack(spacing: 18) {
+            Button { tab.goBack() } label: { Image(systemName: "chevron.backward") }
+                .disabled(!tab.canGoBack)
+                .contextMenu { HistoryMenu(tab: tab, back: true) }
+                .keyboardShortcut("[", modifiers: .command)
+            Button { tab.goForward() } label: { Image(systemName: "chevron.forward") }
+                .disabled(!tab.canGoForward)
+                .contextMenu { HistoryMenu(tab: tab, back: false) }
+                .keyboardShortcut("]", modifiers: .command)
+        }
+    }
+}
+
+/// 戻る・進むボタンの長押しで出す履歴
+struct HistoryMenu: View {
+    let tab: BrowserTab
+    let back: Bool
+
+    var body: some View {
+        let list = tab.webView?.backForwardList
+        let items = (back ? list?.backList.reversed() : list?.forwardList) ?? []
+        ForEach(Array(items.prefix(15).enumerated()), id: \.offset) { _, item in
+            Button(item.title?.isEmpty == false ? item.title! : (VNetURL.toReal(item.url) ?? item.url).absoluteString) {
+                tab.go(to: item)
+            }
+        }
+    }
+}
+
+struct ReloadButton: View {
+    @ObservedObject var tab: BrowserTab
+
+    var body: some View {
+        Button {
+            if tab.isLoading { tab.stop() } else { tab.reload() }
+        } label: {
+            Image(systemName: tab.isLoading ? "xmark" : "arrow.clockwise")
+        }
+        .keyboardShortcut("r", modifiers: .command)
+    }
+}
+
+/// 読み込みの進み具合（ツールバーの下の細い線）
+struct LoadingBar: View {
+    let progress: Double
+    let visible: Bool
+
+    var body: some View {
+        GeometryReader { g in
+            Rectangle()
+                .fill(Color.accentColor)
+                .frame(width: g.size.width * CGFloat(max(0.05, min(progress, 1))), height: 2)
+        }
+        .frame(height: 2)
+        .opacity(visible ? 1 : 0)
+    }
+}
+
+// MARK: アドレス欄
+
+struct AddressField: View {
+    @ObservedObject var store: BrowserStore
+    @ObservedObject var tab: BrowserTab
+    @State private var text = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 10).fill(Color(UIColor.tertiarySystemFill))
+            // TextField はいつも置いておく（focused = true にした時に無いとフォーカスが当たらずキーボードが出ない）
+            editor
+                .opacity(focused ? 1 : 0)
+            if !focused {
+                Button { beginEditing() } label: { display.contentShape(Rectangle()) }
+                    .buttonStyle(.plain)
+            }
+        }
+        .frame(height: 36)
+        .frame(maxWidth: .infinity)
+    }
+
+    private var editor: some View {
+        TextField("検索・アドレスを入力", text: $text)
+            .focused($focused)
+            .textFieldStyle(.plain)
+            .autocorrectionDisabled()
+            .textInputAutocapitalization(.never)
+            .keyboardType(.webSearch)
+            .submitLabel(.go)
+            .onSubmit {
+                store.open(text, in: tab)
+                focused = false
+            }
+            .padding(.horizontal, 10)
+    }
+
+    private var display: some View {
+        HStack(spacing: 6) {
+            if tab.isSecure { Image(systemName: "lock.fill").font(.system(size: 12)).foregroundStyle(.secondary) }
+            Text(displayText)
+                .lineLimit(1)
+                .foregroundColor(tab.url == nil ? .secondary : .primary)
+            ModeBadge(tab: tab, ready: store.vnetReady)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, 10)
+    }
+
+    private var displayText: String {
+        if let q = AddressInput.searchTerms(in: tab.url) { return q }
+        let s = AddressInput.shortDisplay(tab.url)
+        return s.isEmpty ? "検索・アドレスを入力" : s
+    }
+
+    private func beginEditing() {
+        text = AddressInput.searchTerms(in: tab.url) ?? tab.url?.absoluteString ?? ""
+        focused = true
+    }
+}
+
+/// 通信の作りの小さな札（VNet か標準か。VNet を通らない通信を使っていれば知らせる）
+struct ModeBadge: View {
+    @ObservedObject var tab: BrowserTab
+    let ready: Bool
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(label)
+                .font(.system(size: 10, weight: .semibold))
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(RoundedRectangle(cornerRadius: 4).fill(color.opacity(0.18)))
+                .foregroundColor(color)
+            if !tab.nonVNetUsage.isEmpty {
+                Text(tab.nonVNetUsage.sorted().joined(separator: "・"))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var label: String {
+        if tab.mode.usesVNet && !ready { return "VNet 起動中" }
+        return tab.mode.short
+    }
+
+    private var color: Color { tab.mode.usesVNet ? .green : .blue }
+}
+
+// MARK: 「…」メニュー
+
+struct MoreMenu: View {
+    @ObservedObject var store: BrowserStore
+    @ObservedObject var tab: BrowserTab
+
+    var body: some View {
+        Menu {
+            if tab.mode.usesVNet {
+                Button { tab.switchMode(to: .native) } label: { Label("標準の通信で開き直す", systemImage: "network") }
+            } else if store.defaultMode.usesVNet {
+                Button { tab.switchMode(to: store.defaultMode) } label: { Label("VNet で開き直す", systemImage: "cpu") }
+            }
+            if store.canReopenClosedTab {
+                Button { store.reopenClosedTab() } label: { Label("閉じたタブを戻す", systemImage: "arrow.uturn.backward") }
+            }
+            Button { store.close(tab) } label: { Label("このタブを閉じる", systemImage: "xmark.square") }
+            Divider()
+            Button { store.showDevPanel = true } label: { Label("開発者パネル", systemImage: "wrench.and.screwdriver") }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+    }
+}
+
+// MARK: ページ
+
+struct PageArea: View {
+    @ObservedObject var store: BrowserStore
+
+    var body: some View {
+        ZStack {
+            Color(UIColor.systemBackground)
+            if let tab = store.selectedTab {
+                TabPage(tab: tab)
+            }
+        }
+    }
+}
+
+struct TabPage: View {
+    @ObservedObject var tab: BrowserTab
+
+    var body: some View {
+        ZStack {
+            WebHost(webView: tab.webView)
+            if tab.url == nil {
+                StartPage()
+            }
+        }
+    }
+}
+
+/// 新しいタブ（何も開いていないとき）
+struct StartPage: View {
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "globe").font(.system(size: 44)).foregroundStyle(.secondary)
+            Text("上のアドレス欄に、URL か調べたいことを入れてください").foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(UIColor.systemBackground))
+    }
+}
+
+/// 見ているタブの WKWebView を入れる箱（タブを切り替えたら中身を入れ替える）
+struct WebHost: UIViewRepresentable {
+    let webView: WKWebView?
+
+    func makeUIView(context: Context) -> UIView {
+        let v = UIView()
+        v.backgroundColor = .systemBackground
+        return v
+    }
+
+    func updateUIView(_ container: UIView, context: Context) {
+        guard let wv = webView else {
+            for s in container.subviews { s.removeFromSuperview() }
+            return
+        }
+        if wv.superview === container { return }
+        for s in container.subviews where s !== wv { s.removeFromSuperview() }
+        wv.frame = container.bounds
+        wv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        container.addSubview(wv)
+    }
+}
+
+// MARK: ダイアログ（JavaScript の alert・confirm・prompt）
+
+@MainActor
+struct DialogModifier: ViewModifier {
+    @ObservedObject var store: BrowserStore
+
+    func body(content: Content) -> some View {
+        content.alert(title, isPresented: shown) {
+            DialogButtons(store: store)
+        } message: {
+            Text(store.dialog?.message ?? "")
+        }
+    }
+
+    private var title: String {
+        guard let d = store.dialog else { return "" }
+        return String(d.origin.drop(while: { $0 != " " }).dropFirst()) + " より"
+    }
+
+    private var shown: Binding<Bool> {
+        Binding(get: { store.dialog != nil }, set: { v in if !v && store.dialog != nil { store.answerDialog(ok: false) } })
+    }
+}
+
+struct DialogButtons: View {
+    @ObservedObject var store: BrowserStore
+
+    var body: some View {
+        switch store.dialog?.kind {
+        case .prompt?:
+            TextField("", text: $store.dialogInput)
+            Button("キャンセル", role: .cancel) { store.answerDialog(ok: false) }
+            Button("OK") { store.answerDialog(ok: true) }
+        case .confirm?:
+            Button("キャンセル", role: .cancel) { store.answerDialog(ok: false) }
+            Button("OK") { store.answerDialog(ok: true) }
+        default:
+            Button("OK") { store.answerDialog(ok: true) }
+        }
+    }
+}
+
+// ======================================================================
+// MARK: - TabViews.swift
+// ======================================================================
+
+// MARK: - タブバー（ツールバーの下）と、タブ一覧（全画面）
+
+struct TabStrip: View {
+    @ObservedObject var store: BrowserStore
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(store.tabs) { tab in
+                    TabChip(store: store, tab: tab, selected: tab.id == store.selectedID)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+        }
+        .background(Color(UIColor.secondarySystemBackground))
+    }
+}
+
+struct TabChip: View {
+    @ObservedObject var store: BrowserStore
+    @ObservedObject var tab: BrowserTab
+    let selected: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if tab.isLoading { ProgressView().scaleEffect(0.6).frame(width: 14, height: 14) }
+            Text(tabTitle(tab)).font(.system(size: 13)).lineLimit(1)
+            Spacer(minLength: 0)
+            Button { store.close(tab) } label: {
+                Image(systemName: "xmark").font(.system(size: 10, weight: .bold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 10)
+        .frame(width: 180, height: 30)
+        .background(RoundedRectangle(cornerRadius: 8).fill(selected ? Color(UIColor.systemBackground) : Color(UIColor.tertiarySystemFill)))
+        .onTapGesture { store.select(tab) }
+        .contextMenu {
+            Button { store.closeOthers(tab) } label: { Label("ほかのタブを閉じる", systemImage: "xmark.square") }
+            if let u = tab.url {
+                Button { store.newTab(url: u, select: true, mode: tab.mode, after: tab) } label: { Label("タブを複製", systemImage: "plus.square.on.square") }
+            }
+        }
+    }
+}
+
+/// タブの見出し（タイトルが無ければホスト名）
+@MainActor
+func tabTitle(_ tab: BrowserTab) -> String {
+    if !tab.title.isEmpty { return tab.title }
+    let h = AddressInput.shortDisplay(tab.url)
+    return h.isEmpty ? "新しいタブ" : h
+}
+
+struct TabOverview: View {
+    @ObservedObject var store: BrowserStore
+    @Environment(\.dismiss) private var dismiss
+
+    private let columns = [GridItem(.adaptive(minimum: 220), spacing: 16)]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("タブ \(store.tabs.count) 枚").font(.headline)
+                Spacer()
+                Button {
+                    store.newTab(url: nil)
+                    dismiss()
+                } label: { Image(systemName: "plus").font(.system(size: 20)) }
+                Button("完了") { dismiss() }.padding(.leading, 16)
+            }
+            .padding()
+            ScrollView {
+                LazyVGrid(columns: columns, spacing: 16) {
+                    ForEach(store.tabs) { tab in
+                        TabCard(store: store, tab: tab, selected: tab.id == store.selectedID) {
+                            store.select(tab)
+                            dismiss()
+                        }
+                    }
+                }
+                .padding()
+            }
+        }
+        .background(Color(UIColor.systemGroupedBackground))
+    }
+}
+
+struct TabCard: View {
+    @ObservedObject var store: BrowserStore
+    @ObservedObject var tab: BrowserTab
+    let selected: Bool
+    let open: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ZStack(alignment: .topTrailing) {
+                preview
+                    .frame(height: 160)
+                    .frame(maxWidth: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(selected ? Color.accentColor : Color.secondary.opacity(0.3), lineWidth: selected ? 3 : 1))
+                Button { store.close(tab) } label: {
+                    Image(systemName: "xmark.circle.fill").font(.system(size: 22)).foregroundStyle(.secondary)
+                }
+                .padding(6)
+            }
+            Text(tabTitle(tab)).font(.system(size: 13)).lineLimit(1)
+            Text("\(tab.mode.short)・\(tab.state.rawValue)").font(.system(size: 11)).foregroundStyle(.secondary)
+        }
+        .onTapGesture { open() }
+    }
+
+    @ViewBuilder private var preview: some View {
+        if let img = tab.snapshot {
+            Image(uiImage: img).resizable().aspectRatio(contentMode: .fill)
+        } else {
+            ZStack {
+                Color(UIColor.secondarySystemBackground)
+                Image(systemName: "globe").font(.system(size: 30)).foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+// ======================================================================
+// MARK: - DevPanel.swift
+// ======================================================================
+
+// MARK: - 開発者パネル（簡易版。完成版はフェーズ G）
+//
+// 通信の様子・タブごとの状態・ログ。普段の画面とは分けて、「…」メニューから開く
+
+struct DevPanel: View {
+    @ObservedObject var store: BrowserStore
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("開発者パネル").font(.headline)
+                Spacer()
+                Button("ログをコピー") { UIPasteboard.general.string = store.logs.export() }
+                Button("閉じる") { dismiss() }.padding(.leading, 12)
+            }
+            DevStatus(store: store)
+            DevTabList(store: store)
+            DevLogView(text: store.logText)
         }
         .padding()
     }
+}
 
-    private var addressBar: some View {
-        HStack {
-            Button { model.webView.goBack() } label: { Image(systemName: "chevron.backward") }
-            Button { model.webView.goForward() } label: { Image(systemName: "chevron.forward") }
-            TextField("アドレス", text: $model.address)
-                .textFieldStyle(.roundedBorder)
-                .autocorrectionDisabled()
-                .textInputAutocapitalization(.never)
-                .keyboardType(.URL)
-                .onSubmit { model.go() }
-            Button("開く") { model.go() }.buttonStyle(.borderedProminent)
+struct DevStatus: View {
+    @ObservedObject var store: BrowserStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(store.takeover.description)
+            Text("新しいタブの通信: \(store.defaultMode.rawValue)")
+            Text("VNet: \(store.vnetStatus)")
+            Text("タブ \(store.tabs.count) 枚・動いている WebView \(store.liveWebViewCount) / \(BrowserStore.maxLiveWebViews)")
+            Text("Cookie（写し）\(store.cookieJar.count) 個・HSTS \(store.hsts.all().count) 件")
         }
+        .font(.system(size: 12, design: .monospaced))
     }
+}
 
-    private var logView: some View {
+struct DevTabList: View {
+    @ObservedObject var store: BrowserStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(store.tabs) { tab in
+                DevTabRow(tab: tab, selected: tab.id == store.selectedID)
+            }
+        }
+        .font(.system(size: 11, design: .monospaced))
+    }
+}
+
+struct DevTabRow: View {
+    @ObservedObject var tab: BrowserTab
+    let selected: Bool
+
+    var body: some View {
+        Text("\(selected ? "▶" : " ") #\(tab.id) [\(tab.mode.short)・\(tab.state.rawValue)\(tab.isLoading ? "・読み込み中 \(Int(tab.progress * 100))%" : "")] \(tab.url?.absoluteString ?? "（空）")")
+            .lineLimit(1)
+    }
+}
+
+struct DevLogView: View {
+    let text: String
+
+    var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                Text(model.logText)
+                Text(text)
                     .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(Color.green)
+                    .foregroundColor(.green)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
                 Color.clear.frame(height: 1).id("end")
             }
-            .frame(height: 180)
             .background(Color.black)
             .clipShape(RoundedRectangle(cornerRadius: 6))
-            .onChange(of: model.logText) { _ in proxy.scrollTo("end", anchor: .bottom) }
+            .onChange(of: text) { _ in proxy.scrollTo("end", anchor: .bottom) }
         }
     }
 }
 
 // ======================================================================
-// MARK: - BrowserModel.swift
+// MARK: - BrowserStore.swift
 // ======================================================================
 
-// MARK: - ブラウザの中身: WKWebView と自作の通信（VNetMachine）をつなぐ
+// MARK: - アプリ全体（タブ・共有の部品・保存）
 //
-// ふつうは https・http の読み込みを全部 VNetScheme が引き受ける（HTTPSTakeover）。
-// それができないときは予備の作り: WKWebView には「vnets://…」（https）・「vnet://…」（http）という自分用のアドレスで読ませ、
-// ・ページの中の「https://…」の部品（画像・CSS など）も、HTML と CSS を書き換えて自作の通信で読む
-// ・JavaScript が作るアドレス（fetch・XMLHttpRequest・img.src など）も、ページに入れた小さなスクリプトで書き換える
-// ・それでも直接読もうとするものは止める（実験なので、混ざらないように）
+// ・タブ 1 枚 = BrowserTab（WKWebView は必要なときだけ作る。動いている WebView は maxLiveWebViews 枚まで）
+// ・通信（VNetMachine）・Cookie の写し・HSTS・ログ・LAN の保護のルールは、全部のタブで 1 つを共有する
+// ・タブの並び（と各タブの戻る/進むの履歴）を session.json に保存して、次に起動したときに戻す
+// ・メモリが足りなくなったら（メモリ警告）、見ていないタブの WebView を捨てる（スナップショットと履歴は残す）
 
-/// 通信の作り
-enum NetMode: String {
+/// 通信の作り（タブごと）
+enum NetMode: String, Codable {
     /// https・http をそのまま VNetScheme が引き受ける（アドレスは本物の https://…）
     case vnetDirect = "VNet"
     /// 予備の vnets://… の作り（開発者向けの実験。CSP などを外すので安全ではない）
@@ -113,175 +612,716 @@ enum NetMode: String {
     case native = "標準"
 
     var usesVNet: Bool { self != .native }
+    var short: String {
+        switch self { case .vnetDirect: return "VNet"; case .vnetsLegacy: return "vnets"; case .native: return "標準" }
+    }
+}
+
+/// ページの JavaScript からのダイアログ（alert・confirm・prompt）
+struct JSDialog: Identifiable {
+    enum Kind { case alert, confirm, prompt(String) }
+    let id = UUID()
+    let kind: Kind
+    let message: String
+    let origin: String
+    /// (OK か, prompt の入力)
+    let respond: (Bool, String?) -> Void
+}
+
+/// 保存するタブ
+struct SavedTab: Codable {
+    var id: Int
+    var url: String?
+    var title: String
+    var mode: NetMode
+    /// WebKit の戻る/進むの履歴（WKWebView.interactionState）
+    var state: Data?
+}
+
+struct SessionData: Codable {
+    var tabs: [SavedTab]
+    var selected: Int?
 }
 
 @MainActor
-final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
-    @Published var address = "https://example.com/"
-    @Published var logText = ""
-    @Published var status = "準備中…"
-    @Published var pageTitle = ""
-    let webView: WKWebView
+final class BrowserStore: ObservableObject {
+    @Published private(set) var tabs: [BrowserTab] = []
+    @Published private(set) var selectedID: Int?
+    @Published var showTabOverview = false
+    @Published var showDevPanel = false
+    /// いま出しているダイアログ（順番待ちは dialogQueue）
+    @Published private(set) var dialog: JSDialog?
+    @Published var dialogInput = ""
+    /// VNet の様子（ツールバー・開発者パネル用）
+    @Published private(set) var vnetReady = false
+    @Published private(set) var vnetStatus = "準備中…"
+    /// 開発者パネルのログ（パネルを開いている間だけ更新する）
+    @Published private(set) var logText = ""
+
     let machine = VNetMachine(factory: NWUserNetFactory())
-    /// 通信の作り（起動のときに決める）
-    let mode: NetMode
-    /// https の横取りの結果
-    let takeover: HTTPSTakeover.Outcome
     /// Cookie の写し（正本は WebKit の置き場）
     let cookieJar = CookieJar()
     /// HSTS の記録
     let hsts = HSTSStore(fileURL: HSTSStore.defaultFileURL())
-    private let scheme = VNetScheme()
-    private let cookies = CookieBridge()
-    private let actions = PageActionBridge()
-    private var cookieSync: WebCookieSync?
-    /// 開発者向けのログ（どのスレッドからでも書ける。画面には 0.3 秒ごとにまとめて出す）
+    /// 開発者向けのログ（どのスレッドからでも書ける）
     let logs = DevLog()
-    private var timer: Timer?
-    private var logTimer: Timer?
+    /// https の横取りの結果・新しいタブの通信の作り（setUp で決める）
+    private(set) var takeover: HTTPSTakeover.Outcome = .disabledBySetting
+    private(set) var defaultMode: NetMode = .native
+    /// 全部のタブに入れる WebKit のルール（LAN の保護など）
+    private(set) var contentRuleLists: [WKContentRuleList] = []
+    private var cookieSync: WebCookieSync?
+    private var nextTabID = 1
+    /// 閉じたタブ（⌘⇧T で戻す。新しいものが後ろ）
+    private var closedTabs: [SavedTab] = []
+    private var dialogQueue: [JSDialog] = []
+    private let session = JSONFile<SessionData>(name: "session.json")
+    private var timers: [Timer] = []
+    private var memoryObserver: NSObjectProtocol?
+    private var didSetUp = false
 
-    override init() {
-        let config = WKWebViewConfiguration()
-        let outcome = HTTPSTakeover.install()
-        takeover = outcome
-        if outcome == .installed { mode = .vnetDirect }
-        else if VelaSettings.legacyVNetsFallback && !VelaSettings.vnetDisabled { mode = .vnetsLegacy }
-        else { mode = .native }
-        let content = config.userContentController
-        switch mode {
-        case .vnetDirect:
-            config.setURLSchemeHandler(scheme, forURLScheme: "https")
-            config.setURLSchemeHandler(scheme, forURLScheme: "http")
-        case .vnetsLegacy:
-            config.setURLSchemeHandler(scheme, forURLScheme: "vnet")
-            config.setURLSchemeHandler(scheme, forURLScheme: "vnets")
-            content.addUserScript(WKUserScript(source: PageScripts.rewriteURLs, injectionTime: .atDocumentStart, forMainFrameOnly: false))
-        case .native:
-            break
-        }
-        if mode.usesVNet {
-            // Cookie: ページの JavaScript が変えたら「合図」だけもらって、WebKit の置き場（正本）を読み直す
-            content.addUserScript(WKUserScript(source: PageScripts.watchCookies, injectionTime: .atDocumentStart, forMainFrameOnly: false))
-            content.add(cookies, name: PageScripts.cookieHandlerName)
-        }
-        // LAN の保護: WebSocket は VNet を通らないので、ページの中でも止める
-        if VelaSettings.localNetworkProtection {
-            content.addUserScript(WKUserScript(source: PageScripts.webSocketGuard, injectionTime: .atDocumentStart, forMainFrameOnly: false))
-        }
-        content.add(actions, name: PageScripts.actionHandlerName)
-        // 動画: 全画面にせずページの中で再生する・自動再生を許す
-        config.allowsInlineMediaPlayback = true
-        config.mediaTypesRequiringUserActionForPlayback = []
-        // iPad の Safari と同じ「デスクトップ用の表示」にする（User-Agent と、ページから見える端末の情報を揃えるため）
-        config.defaultWebpagePreferences.preferredContentMode = .desktop
-        webView = WKWebView(frame: .zero, configuration: config)
-        // User-Agent を iPad の Safari と同じにする。WKWebView の初期値には「Version/… Safari/…」が無く、
-        // アプリの中のブラウザやロボットだと思われて、エラーや「不審なトラフィック」の画面になりやすい
-        webView.customUserAgent = BrowserIdentity.userAgent
-        super.init()
-        webView.navigationDelegate = self
-        // 残りの準備は、画面のスレッドで改めて行う。
-        // NSObject の override init は、iPad の Swift だと MainActor の中と見なされないことがあり、
-        // 自分の @MainActor のメソッド（startTimers など）をここから呼ぶとエラーになるため
+    /// 動いている WebView の上限（これを超えたら、長く見ていないタブから WebView を捨てる）
+    static let maxLiveWebViews = 6
+    static let maxClosedTabs = 20
+
+    /// @StateObject から作られる。iPad の Swift ではここが MainActor の中と見なされないことがあるので、
+    /// 自分の @MainActor のものは触らず、準備は setUp に回す
+    nonisolated init() {
         Task { @MainActor in self.setUp() }
     }
 
-    /// init の続き（画面のスレッドで 1 回だけ）
-    private func setUp() {
-        let lb = logs
-        logs.add(takeover.description)
-        switch mode {
-        case .vnetDirect: logs.add("https・http をそのまま自作の通信で読みます（アドレスは本物の https://…）")
-        case .vnetsLegacy:
-            logs.add("⚠️ 予備の vnets://… の作りで読みます（開発者向けの実験。CSP などを外すので安全ではありません）")
-            blockDirectLoads()
-        case .native: logs.add("標準の通信（WebKit）で読みます。VNet は使いません")
-        }
-        if VelaSettings.localNetworkProtection { installLocalNetworkRules() } else { logs.add("⚠️ LAN の保護は切ってあります") }
-        actions.onAction = { [weak self] body, isMain, origin in
-            let model = self
-            Task { @MainActor in model?.handleAction(body, isMainFrame: isMain, origin: origin) }
-        }
+    var selectedTab: BrowserTab? { tabs.first { $0.id == selectedID } }
+    var searchEngine: SearchEngine { VelaSettings.searchEngine }
+    var liveWebViewCount: Int { tabs.filter { $0.webView != nil }.count }
 
-        guard mode.usesVNet else { startTimers(); return }
+    private func setUp() {
+        if didSetUp { return }
+        didSetUp = true
+        let lb = logs
+        takeover = HTTPSTakeover.install()
+        if takeover == .installed { defaultMode = .vnetDirect }
+        else if VelaSettings.legacyVNetsFallback && !VelaSettings.vnetDisabled { defaultMode = .vnetsLegacy }
+        else { defaultMode = .native }
+        logs.add(takeover.description)
+        logs.add("新しいタブの通信: \(defaultMode.rawValue)")
+        if defaultMode == .vnetsLegacy { logs.add("⚠️ 予備の vnets://… の作りで読みます（開発者向けの実験。CSP などを外すので安全ではありません）") }
+        session.log = { s in lb.add(s) }
+
         // VNet: Cookie の正本は WebKit の置き場。CookieJar はその写し
         cookieJar.settings = VelaSettings.cookiePolicy
         cookieJar.log = { s in lb.add(s) }
         hsts.log = { s in lb.add(s) }
-        let sync = WebCookieSync(store: webView.configuration.websiteDataStore.httpCookieStore, jar: cookieJar)
-        sync.log = { s in lb.add(s) }
-        cookieSync = sync
-        cookies.onSignal = { [weak sync] in
-            let target = sync   // weak の変数は並行の閉包から直接さわれないので、let に受け直す
-            Task { @MainActor in target?.scheduleRefresh() }
-        }
-        scheme.machine = machine
-        scheme.hsts = hsts
-        scheme.pushCookies = { [weak sync] changes, done in
-            let target = sync
-            Task { @MainActor in
-                await target?.apply(changes)
-                done()
-            }
-        }
         machine.log = { s in lb.add(s) }
-        scheme.log = { s in lb.add(s) }
-        cookies.log = { s in lb.add(s) }
-        machine.configurePolicies(cookieJar: cookieJar, hsts: hsts, localNetworkProtection: VelaSettings.localNetworkProtection)
-        // 自作の通信で送る User-Agent も同じもの（ページの JavaScript から見えるものと食い違うと、ロボットだと思われる）
-        machine.setUserAgent(BrowserIdentity.userAgent)
-        machine.boot()
-        startTimers()
+        if takeover == .installed || defaultMode == .vnetsLegacy {
+            let sync = WebCookieSync(store: WKWebsiteDataStore.default().httpCookieStore, jar: cookieJar)
+            sync.log = { s in lb.add(s) }
+            cookieSync = sync
+            machine.configurePolicies(cookieJar: cookieJar, hsts: hsts, localNetworkProtection: VelaSettings.localNetworkProtection)
+            // 自作の通信で送る User-Agent も同じもの（ページの JavaScript から見えるものと食い違うと、ロボットだと思われる）
+            machine.setUserAgent(BrowserIdentity.userAgent)
+            machine.boot()
+        }
+        if VelaSettings.localNetworkProtection { compileLocalNetworkRules() } else { logs.add("⚠️ LAN の保護は切ってあります") }
+        if defaultMode == .vnetsLegacy { compileVNetOnlyRules() }
+
+        restoreSession()
+        if tabs.isEmpty { newTab(url: nil) }
+
+        memoryObserver = NotificationCenter.default.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification,
+                                                                object: nil, queue: .main) { [weak self] _ in
+            let store = self
+            Task { @MainActor in store?.handleMemoryWarning() }
+        }
+        timers.append(Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            let store = self
+            Task { @MainActor in store?.refreshStatus() }
+        })
+        timers.append(Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            let store = self
+            Task { @MainActor in store?.flushLogIfVisible() }
+        })
     }
 
-    /// ブラウザが自分で外へ読みに行くのを止める（予備の作りのとき。自作の通信だけで読む実験のため）
-    private func blockDirectLoads() {
-        let rules = #"[{"trigger":{"url-filter":"^https?://"},"action":{"type":"block"}}]"#
-        WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "vnet-only", encodedContentRuleList: rules) { [weak self] list, _ in
-            let model = self
-            if let list { Task { @MainActor in model?.webView.configuration.userContentController.add(list) } }
+    // MARK: タブ
+
+    /// 新しいタブ（url が nil なら空のタブ）。select: すぐ見るか
+    @discardableResult
+    func newTab(url: URL?, select: Bool = true, mode: NetMode? = nil, after: BrowserTab? = nil) -> BrowserTab {
+        let tab = BrowserTab(id: nextTabID, store: self, mode: mode ?? defaultMode)
+        nextTabID += 1
+        if let after, let i = tabs.firstIndex(where: { $0 === after }) { tabs.insert(tab, at: i + 1) } else { tabs.append(tab) }
+        if let url { tab.load(url, userInitiated: true) }
+        if select { self.select(tab) }
+        saveSession()
+        return tab
+    }
+
+    /// ページが開いた新しい窓（target=_blank・window.open）。WebKit が渡した設定で WebView を作ってタブにする
+    func adoptPopup(configuration: WKWebViewConfiguration, opener: BrowserTab) -> WKWebView {
+        let tab = BrowserTab(id: nextTabID, store: self, mode: opener.mode)
+        nextTabID += 1
+        if let i = tabs.firstIndex(where: { $0 === opener }) { tabs.insert(tab, at: i + 1) } else { tabs.append(tab) }
+        let wv = tab.adopt(configuration: configuration, scheme: opener.scheme)
+        select(tab)
+        logs.add("新しい窓をタブにしました（#\(opener.id) から）", level: .info, category: .nav, tab: tab.id)
+        return wv
+    }
+
+    func select(_ tab: BrowserTab) {
+        selectedID = tab.id
+        tab.lastSelected = Date()
+        tab.ensureWebView()
+        trimLiveWebViews()
+        saveSession()
+    }
+
+    func close(_ tab: BrowserTab) {
+        guard let i = tabs.firstIndex(where: { $0 === tab }) else { return }
+        closedTabs.append(tab.saved())
+        if closedTabs.count > BrowserStore.maxClosedTabs { closedTabs.removeFirst(closedTabs.count - BrowserStore.maxClosedTabs) }
+        tab.tearDown()
+        tabs.remove(at: i)
+        logs.add("タブを閉じました", level: .info, category: .nav, tab: tab.id)
+        if tabs.isEmpty { newTab(url: nil); return }
+        if selectedID == tab.id { select(tabs[min(i, tabs.count - 1)]) }
+        saveSession()
+    }
+
+    func closeOthers(_ keep: BrowserTab) {
+        for t in tabs where t !== keep { close(t) }
+    }
+
+    var canReopenClosedTab: Bool { !closedTabs.isEmpty }
+
+    func reopenClosedTab() {
+        guard let s = closedTabs.popLast() else { return }
+        let tab = BrowserTab(id: nextTabID, store: self, mode: s.mode)
+        nextTabID += 1
+        tab.restore(from: s)
+        tabs.append(tab)
+        select(tab)
+    }
+
+    func selectNextTab(_ step: Int) {
+        guard let cur = selectedTab, let i = tabs.firstIndex(where: { $0 === cur }), !tabs.isEmpty else { return }
+        select(tabs[(i + step + tabs.count) % tabs.count])
+    }
+
+    /// アドレス欄から開く（URL か検索語か）
+    func open(_ text: String, in tab: BrowserTab? = nil) {
+        guard let r = AddressInput.resolve(text, engine: searchEngine) else { return }
+        let target = tab ?? selectedTab ?? newTab(url: nil)
+        switch r {
+        case .url(let u):
+            logs.add("―― \(u.absoluteString) を開きます ――", level: .info, category: .nav, tab: target.id)
+            target.load(u, userInitiated: true)
+        case .search(let q, let u):
+            logs.add("―― 「\(q)」を検索します（\(searchEngine.name)）――", level: .info, category: .nav, tab: target.id)
+            target.load(u, userInitiated: true)
         }
     }
 
-    /// LAN の保護のルール（標準の通信のタブ・WebSocket・VNet の手前）を WebKit に入れる
-    private func installLocalNetworkRules() {
+    /// 動いている WebView が多すぎたら、長く見ていないタブ（見ているタブ以外）から WebView を捨てる
+    private func trimLiveWebViews() {
+        let live = tabs.filter { $0.webView != nil && $0.id != selectedID }.sorted { $0.lastSelected < $1.lastSelected }
+        let over = live.count + (selectedTab?.webView != nil ? 1 : 0) - BrowserStore.maxLiveWebViews
+        if over <= 0 { return }
+        for t in live.prefix(over) { t.suspend(reason: "動いている WebView が \(BrowserStore.maxLiveWebViews) 枚を超えた") }
+    }
+
+    private func handleMemoryWarning() {
+        let others = tabs.filter { $0.webView != nil && $0.id != selectedID }
+        logs.add("⚠️ メモリ警告: 見ていないタブ \(others.count) 枚の WebView を捨てます", level: .warning, category: .app)
+        for t in others { t.suspend(reason: "メモリ警告") }
+    }
+
+    /// タブ一覧を開く前に、動いているタブのスナップショットを撮る
+    func openTabOverview() {
+        for t in tabs where t.webView != nil { t.takeSnapshot() }
+        showTabOverview = true
+    }
+
+    // MARK: 保存
+
+    func saveSession() {
+        session.save(SessionData(tabs: tabs.map { $0.saved() }, selected: selectedID))
+    }
+
+    /// アプリが裏に回るとき: すぐ書く
+    func saveSessionNow() {
+        session.saveNow(SessionData(tabs: tabs.map { $0.saved() }, selected: selectedID))
+        hsts.saveNow()
+    }
+
+    private func restoreSession() {
+        guard let s = session.load(), !s.tabs.isEmpty else { return }
+        for st in s.tabs {
+            var mode = st.mode
+            if mode.usesVNet && defaultMode == .native { mode = .native }      // VNet が使えないときは標準の通信で
+            if mode == .vnetDirect && defaultMode == .vnetsLegacy { mode = .vnetsLegacy }
+            let tab = BrowserTab(id: st.id, store: self, mode: mode)
+            tab.restore(from: st)
+            tabs.append(tab)
+            nextTabID = max(nextTabID, st.id + 1)
+        }
+        logs.add("前のタブを \(s.tabs.count) 枚戻しました", level: .info, category: .app)
+        select(tabs.first { $0.id == s.selected } ?? tabs[0])
+    }
+
+    // MARK: ダイアログ（JavaScript の alert・confirm・prompt）
+
+    func presentDialog(_ d: JSDialog) {
+        if dialog == nil { show(d) } else { dialogQueue.append(d) }
+    }
+
+    private func show(_ d: JSDialog) {
+        if case .prompt(let def) = d.kind { dialogInput = def } else { dialogInput = "" }
+        dialog = d
+    }
+
+    /// ダイアログを閉じる（ok: OK を押したか）
+    func answerDialog(ok: Bool) {
+        guard let d = dialog else { return }
+        dialog = nil
+        d.respond(ok, ok ? dialogInput : nil)
+        if !dialogQueue.isEmpty { show(dialogQueue.removeFirst()) }
+    }
+
+    /// そのタブのダイアログを全部取り消す（タブを閉じたとき）
+    func cancelDialogs(for tab: BrowserTab) {
+        let mine = dialogQueue.filter { $0.origin.hasPrefix("#\(tab.id) ") }
+        dialogQueue.removeAll { $0.origin.hasPrefix("#\(tab.id) ") }
+        for d in mine { d.respond(false, nil) }
+        if let d = dialog, d.origin.hasPrefix("#\(tab.id) ") { answerDialog(ok: false) }
+    }
+
+    // MARK: WebKit のルール
+
+    /// LAN の保護のルール（標準の通信のタブ・WebSocket・VNet の手前）
+    private func compileLocalNetworkRules() {
         let lb = logs
         WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "vela-lan-protection", encodedContentRuleList: PageScripts.localNetworkRules) { [weak self] list, error in
-            let model = self
+            let store = self
             if let list {
-                Task { @MainActor in model?.webView.configuration.userContentController.add(list) }
+                Task { @MainActor in store?.addRuleList(list) }
             } else {
                 lb.add("⚠️ LAN の保護のルールを WebKit に入れられません: \(error.map { "\($0)" } ?? "不明")")
             }
         }
     }
 
-    private func startTimers() {
-        logTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
-            let model = self
-            Task { @MainActor in model?.flushLog() }
-        }
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            let model = self
-            Task { @MainActor in model?.refreshStatus() }
+    /// 予備の vnets:// の作りで、ブラウザが自分で外へ読みに行くのを止める（自作の通信だけで読む実験のため）
+    private func compileVNetOnlyRules() {
+        let rules = #"[{"trigger":{"url-filter":"^https?://"},"action":{"type":"block"}}]"#
+        WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "vnet-only", encodedContentRuleList: rules) { [weak self] list, _ in
+            let store = self
+            if let list { Task { @MainActor in store?.addRuleList(list, onlyVNetsLegacy: true) } }
         }
     }
 
-    func addLog(_ s: String) { logs.add(s) }
+    private var vnetsOnlyRuleLists: [WKContentRuleList] = []
 
-    private func flushLog() {
-        if let t = logs.take() { logText = t }
+    private func addRuleList(_ list: WKContentRuleList, onlyVNetsLegacy: Bool = false) {
+        if onlyVNetsLegacy { vnetsOnlyRuleLists.append(list) } else { contentRuleLists.append(list) }
+        for t in tabs { t.addRuleList(list, onlyVNetsLegacy: onlyVNetsLegacy) }
     }
+
+    /// そのタブに入れるルール
+    func ruleLists(for mode: NetMode) -> [WKContentRuleList] {
+        contentRuleLists + (mode == .vnetsLegacy ? vnetsOnlyRuleLists : [])
+    }
+
+    /// VNet のタブの Cookie を WebKit の置き場に入れる（VNetScheme から）
+    func pushCookies(_ changes: [CookieChange]) async {
+        await cookieSync?.apply(changes)
+    }
+
+    func cookiesChangedByPage() {
+        cookieSync?.scheduleRefresh()
+    }
+
+    // MARK: 様子
 
     private func refreshStatus() {
-        guard mode.usesVNet else { status = "通信: \(mode.rawValue)"; return }
-        let name = mode.rawValue
-        machine.stats { [weak self] s in
-            let model = self
-            let ip = s.ready ? "IP \(s.ip)" : "IP をもらっています…"
-            let text = "\(name)・\(ip)・\(s.summary)"
-            Task { @MainActor in model?.status = text }
+        guard defaultMode.usesVNet || tabs.contains(where: { $0.mode.usesVNet }) else {
+            vnetStatus = "VNet: 使っていません（\(takeover.description)）"
+            return
         }
+        machine.stats { [weak self] s in
+            let store = self
+            let text = (s.ready ? "IP \(s.ip)" : "IP をもらっています…") + "・" + s.summary
+            Task { @MainActor in
+                store?.vnetReady = s.ready
+                store?.vnetStatus = text
+            }
+        }
+    }
+
+    private func flushLogIfVisible() {
+        guard showDevPanel, let t = logs.take(lines: 400) else { return }
+        logText = t
+    }
+}
+
+// ======================================================================
+// MARK: - BrowserTab.swift
+// ======================================================================
+
+// MARK: - タブ 1 枚
+//
+// ・WKWebView は必要なときだけ作る（ensureWebView）。見ていない間に捨てられたら（suspend）、スナップショットと
+//   戻る/進むの履歴（interactionState）だけを持っておき、次に見るときに作り直して戻す
+// ・WebView の状態（URL・タイトル・読み込みの進み具合・戻れるか）は KVO で受け取る
+// ・通信の作り（VNet / 標準）は WebView を作るときにしか決められないので、切り替えは作り直しで行う
+// ・捨てるときは、デリゲート・スクリプトの受け口・KVO を外して、読み込み中の要求を止める（循環参照と漏れを防ぐ）
+
+@MainActor
+final class BrowserTab: ObservableObject, Identifiable {
+    enum LifeState: String {
+        case live = "動いている"
+        case suspended = "休止中"
+        case crashed = "落ちた"
+    }
+
+    let id: Int
+    private weak var store: BrowserStore?
+    @Published private(set) var url: URL?
+    @Published private(set) var title = ""
+    @Published private(set) var progress = 0.0
+    @Published private(set) var isLoading = false
+    @Published private(set) var canGoBack = false
+    @Published private(set) var canGoForward = false
+    @Published private(set) var isSecure = false
+    @Published private(set) var mode: NetMode
+    @Published private(set) var state = LifeState.suspended
+    @Published private(set) var snapshot: UIImage?
+    /// このページが使った、VNet を通らない通信（"WebSocket" など）
+    @Published private(set) var nonVNetUsage: Set<String> = []
+    /// 最後に見た時刻（WebView を捨てる順番を決める）
+    var lastSelected = Date()
+
+    private(set) var webView: WKWebView?
+    /// VNet のタブの、要求を引き受ける部品（タブごとに 1 つ。通信の machine は共有）
+    private(set) var scheme: VNetScheme?
+    private var delegate: TabWebDelegate?
+    private var observations: [NSKeyValueObservation] = []
+    private let cookies = CookieBridge()
+    private let actions = PageActionBridge()
+    private var refresh: UIRefreshControl?
+    /// 休止中のときの、戻る/進むの履歴（WKWebView.interactionState）と開く URL
+    private var savedState: Data?
+    private var pendingURL: URL?
+
+    init(id: Int, store: BrowserStore, mode: NetMode) {
+        self.id = id
+        self.store = store
+        self.mode = mode
+    }
+
+    private func log(_ s: String, level: LogLevel = .info, category: LogCategory = .nav) {
+        store?.logs.add(s, level: level, category: category, tab: id)
+    }
+
+    // MARK: WebView を作る・捨てる
+
+    /// 見るときに呼ぶ。WebView が無ければ作って、休止中の履歴を戻す
+    func ensureWebView() {
+        if let wv = webView {
+            // 見ていない間にページのプロセスが落ちていた: 見るときに読み直す
+            if state == .crashed {
+                log("落ちていたページを読み直します")
+                wv.reload()
+                state = .live
+            }
+            return
+        }
+        let wv = makeWebView(configuration: nil, scheme: nil)
+        if let s = savedState {
+            wv.interactionState = s as NSData
+            savedState = nil
+            log("休止中の履歴から戻しました")
+        } else if let u = pendingURL ?? url {
+            pendingURL = nil
+            load(u, userInitiated: true)
+        }
+        state = .live
+    }
+
+    /// ページが開いた新しい窓。WebKit が渡した設定で作る（設定を変えると WebKit が止まるので、そのまま使う）
+    func adopt(configuration: WKWebViewConfiguration, scheme opener: VNetScheme?) -> WKWebView {
+        let wv = makeWebView(configuration: configuration, scheme: opener)
+        state = .live
+        return wv
+    }
+
+    private func makeWebView(configuration given: WKWebViewConfiguration?, scheme opener: VNetScheme?) -> WKWebView {
+        let config: WKWebViewConfiguration
+        if let given {
+            config = given
+            scheme = opener
+        } else {
+            config = makeConfiguration()
+        }
+        let wv = WKWebView(frame: .zero, configuration: config)
+        // User-Agent を iPad の Safari と同じにする。WKWebView の初期値には「Version/… Safari/…」が無く、
+        // アプリの中のブラウザやロボットだと思われて、エラーや「不審なトラフィック」の画面になりやすい
+        wv.customUserAgent = BrowserIdentity.userAgent
+        wv.allowsBackForwardNavigationGestures = true
+        if #available(iOS 16.4, *) { wv.isInspectable = VelaSettings.webInspector }
+        let d = TabWebDelegate(tab: self)
+        wv.navigationDelegate = d
+        wv.uiDelegate = d
+        delegate = d
+        // 引っ張って再読み込み
+        let rc = UIRefreshControl()
+        rc.addAction(UIAction { [weak self, weak rc] _ in
+            self?.webView?.reload()
+            rc?.endRefreshing()
+        }, for: .valueChanged)
+        wv.scrollView.refreshControl = rc
+        refresh = rc
+        observe(wv)
+        webView = wv
+        log("WebView を作りました（\(mode.rawValue)）")
+        return wv
+    }
+
+    /// 通信の作りに合わせた設定（スキームの引き受け・スクリプト・ルール）
+    private func makeConfiguration() -> WKWebViewConfiguration {
+        let config = WKWebViewConfiguration()
+        let content = config.userContentController
+        if mode.usesVNet, let store {
+            let s = VNetScheme()
+            s.machine = store.machine
+            s.hsts = store.hsts
+            let tabID = id
+            let lb = store.logs
+            s.log = { m in lb.add(m, tab: tabID) }
+            s.pushCookies = { [weak store] changes, done in
+                let st = store
+                Task { @MainActor in
+                    await st?.pushCookies(changes)
+                    done()
+                }
+            }
+            scheme = s
+            if mode == .vnetDirect {
+                config.setURLSchemeHandler(s, forURLScheme: "https")
+                config.setURLSchemeHandler(s, forURLScheme: "http")
+            } else {
+                config.setURLSchemeHandler(s, forURLScheme: "vnet")
+                config.setURLSchemeHandler(s, forURLScheme: "vnets")
+                content.addUserScript(WKUserScript(source: PageScripts.rewriteURLs, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+            }
+            // Cookie: ページの JavaScript が変えたら「合図」だけもらって、WebKit の置き場（正本）を読み直す
+            content.addUserScript(WKUserScript(source: PageScripts.watchCookies, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+            cookies.log = { m in lb.add(m, tab: tabID) }
+            cookies.onSignal = { [weak store] in
+                let st = store
+                Task { @MainActor in st?.cookiesChangedByPage() }
+            }
+            content.add(cookies, name: PageScripts.cookieHandlerName)
+        } else {
+            scheme = nil
+        }
+        // LAN の保護: WebSocket は VNet を通らないので、ページの中でも止める
+        if VelaSettings.localNetworkProtection {
+            content.addUserScript(WKUserScript(source: PageScripts.webSocketGuard, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        }
+        // VNet を通らない通信（WebSocket）を使ったら知らせてもらう
+        content.addUserScript(WKUserScript(source: PageScripts.trackNonVNet, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        actions.onAction = { [weak self] body, isMain, origin in
+            let tab = self
+            Task { @MainActor in tab?.handleAction(body, isMainFrame: isMain, origin: origin) }
+        }
+        content.add(actions, name: PageScripts.actionHandlerName)
+        for r in store?.ruleLists(for: mode) ?? [] { content.add(r) }
+        // 動画: 全画面にせずページの中で再生する・自動再生を許す
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+        // iPad の Safari と同じ「デスクトップ用の表示」にする（User-Agent と、ページから見える端末の情報を揃えるため）
+        config.defaultWebpagePreferences.preferredContentMode = .desktop
+        config.preferences.isFraudulentWebsiteWarningEnabled = true
+        return config
+    }
+
+    /// WebKit のルールを後から足す（コンパイルが終わったとき）
+    func addRuleList(_ list: WKContentRuleList, onlyVNetsLegacy: Bool) {
+        if onlyVNetsLegacy && mode != .vnetsLegacy { return }
+        webView?.configuration.userContentController.add(list)
+    }
+
+    private func observe(_ wv: WKWebView) {
+        // KVO の知らせは画面のスレッドで来るが、閉包は MainActor の外なので、Task で戻ってから触る
+        let sync: (WKWebView) -> Void = { [weak self] _ in
+            let tab = self
+            Task { @MainActor in tab?.syncFromWebView() }
+        }
+        observations = [
+            wv.observe(\.url, options: [.new]) { w, _ in sync(w) },
+            wv.observe(\.title, options: [.new]) { w, _ in sync(w) },
+            wv.observe(\.estimatedProgress, options: [.new]) { w, _ in sync(w) },
+            wv.observe(\.isLoading, options: [.new]) { w, _ in sync(w) },
+            wv.observe(\.canGoBack, options: [.new]) { w, _ in sync(w) },
+            wv.observe(\.canGoForward, options: [.new]) { w, _ in sync(w) },
+            wv.observe(\.hasOnlySecureContent, options: [.new]) { w, _ in sync(w) },
+        ]
+    }
+
+    func syncFromWebView() {
+        guard let wv = webView else { return }
+        let real = wv.url.flatMap { VNetURL.toReal($0) } ?? wv.url
+        if real != url, real != nil {
+            url = real
+            nonVNetUsage = []
+        }
+        title = wv.title ?? ""
+        progress = wv.estimatedProgress
+        isLoading = wv.isLoading
+        canGoBack = wv.canGoBack
+        canGoForward = wv.canGoForward
+        isSecure = wv.hasOnlySecureContent && (real?.scheme?.lowercased() == "https")
+    }
+
+    /// WebView を捨てて休止する（スナップショット・履歴・URL は残す）
+    func suspend(reason: String) {
+        guard let wv = webView else { return }
+        if let st = wv.interactionState as? Data { savedState = st } else if let st = wv.interactionState as? NSData { savedState = st as Data }
+        pendingURL = url
+        log("休止します（\(reason)）")
+        tearDownWebView()
+        state = .suspended
+    }
+
+    /// タブを閉じるとき
+    func tearDown() {
+        store?.cancelDialogs(for: self)
+        tearDownWebView()
+    }
+
+    private func tearDownWebView() {
+        guard let wv = webView else { return }
+        observations = []
+        wv.stopLoading()
+        wv.navigationDelegate = nil
+        wv.uiDelegate = nil
+        let content = wv.configuration.userContentController
+        content.removeScriptMessageHandler(forName: PageScripts.cookieHandlerName)
+        content.removeScriptMessageHandler(forName: PageScripts.actionHandlerName)
+        wv.scrollView.refreshControl = nil
+        wv.removeFromSuperview()
+        webView = nil
+        delegate = nil
+        refresh = nil
+        scheme = nil
+        isLoading = false
+        progress = 0
+    }
+
+    func takeSnapshot() {
+        guard let wv = webView, wv.bounds.width > 0 else { return }
+        wv.takeSnapshot(with: nil) { [weak self] image, _ in
+            if let image { self?.snapshot = image }
+        }
+    }
+
+    // MARK: 読み込み
+
+    /// 開く。userInitiated: ユーザーの操作（アドレス欄・ブックマークなど）か（LAN の保護・SameSite の判定に使う）
+    func load(_ u: URL, userInitiated: Bool) {
+        guard let wv = webView else {
+            pendingURL = u
+            url = u
+            savedState = nil
+            return
+        }
+        var target = u
+        if mode == .vnetsLegacy {
+            guard let v = VNetURL.toVNet(u) else { log("vnets:// にできないアドレスです: \(u.absoluteString)", level: .warning); return }
+            target = v
+        }
+        if userInitiated { scheme?.noteUserNavigation(target) }
+        url = u
+        nonVNetUsage = []
+        wv.load(URLRequest(url: target))
+    }
+
+    func goBack() { webView?.goBack() }
+    func goForward() { webView?.goForward() }
+    func reload() { if webView == nil { ensureWebView() } else { webView?.reload() } }
+    func stop() { webView?.stopLoading() }
+
+    /// 戻る/進むの履歴の項目へ
+    func go(to item: WKBackForwardListItem) { webView?.go(to: item) }
+
+    /// 通信の作りを変える（同じ URL で WebView を作り直す）
+    func switchMode(to m: NetMode) {
+        guard m != mode else { return }
+        let u = url
+        log("通信を \(mode.rawValue) → \(m.rawValue) に切り替えます")
+        tearDownWebView()
+        savedState = nil
+        mode = m
+        pendingURL = u
+        ensureWebView()
+        store?.saveSession()
+    }
+
+    // MARK: 保存
+
+    func saved() -> SavedTab {
+        var st = savedState
+        if let wv = webView {
+            if let d = wv.interactionState as? Data { st = d } else if let d = wv.interactionState as? NSData { st = d as Data }
+        }
+        return SavedTab(id: id, url: url?.absoluteString, title: title, mode: mode, state: st)
+    }
+
+    func restore(from s: SavedTab) {
+        url = s.url.flatMap { URL(string: $0) }
+        title = s.title
+        savedState = s.state
+        pendingURL = url
+        state = .suspended
+    }
+
+    // MARK: WebKit からの知らせ（TabWebDelegate から）
+
+    func navigationEvent(_ s: String, level: LogLevel = .info) {
+        log(s, level: level)
+    }
+
+    func didFinish() {
+        syncFromWebView()
+        store?.saveSession()
+    }
+
+    func processTerminated() {
+        log("⚠️ ページのプロセスが落ちました", level: .warning)
+        if store?.selectedTab === self {
+            webView?.reload()
+        } else {
+            state = .crashed
+        }
+    }
+
+    func openInNewTab(_ u: URL, select: Bool) {
+        store?.newTab(url: u, select: select, mode: mode, after: self)
+    }
+
+    func popup(configuration: WKWebViewConfiguration) -> WKWebView? {
+        store?.adoptPopup(configuration: configuration, opener: self)
+    }
+
+    func closeByPage() {
+        log("ページがタブを閉じました（window.close）")
+        store?.close(self)
+    }
+
+    func presentDialog(_ kind: JSDialog.Kind, message: String, frame: WKFrameInfo, respond: @escaping (Bool, String?) -> Void) {
+        let o = frame.securityOrigin
+        let origin = "#\(id) \(o.host.isEmpty ? (url?.host ?? "") : o.host)"
+        store?.presentDialog(JSDialog(kind: kind, message: message, origin: origin, respond: respond))
     }
 
     /// エラーページのボタン・守りのスクリプトからの知らせ
@@ -289,43 +1329,39 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
         switch body["action"] as? String {
         case "allowLocalNetwork":
             // 確認のページ（メインフレーム）からの、合言葉の合っている知らせだけを受け付ける
-            guard isMainFrame, let nonce = body["nonce"] as? String, let u = scheme.consumeConsent(nonce) else {
-                addLog("🛡 LAN の確認: 受け付けない知らせです（\(origin)）")
+            guard isMainFrame, let nonce = body["nonce"] as? String, let u = scheme?.consumeConsent(nonce) else {
+                log("🛡 LAN の確認: 受け付けない知らせです（\(origin)）", category: .security)
                 return
             }
-            addLog("🛡 LAN の確認: ユーザーが許可しました → \(u.absoluteString)")
-            open(u)
+            log("🛡 LAN の確認: ユーザーが許可しました → \(u.absoluteString)", category: .security)
+            load(u, userInitiated: true)
         case "blockedWebSocket":
-            addLog("🛡 LAN の保護: WebSocket を止めました（\(origin) → \(body["url"] as? String ?? "?")）")
+            log("🛡 LAN の保護: WebSocket を止めました（\(origin) → \(body["url"] as? String ?? "?")）", category: .security)
+        case "usedWebSocket":
+            if !nonVNetUsage.contains("WebSocket") {
+                nonVNetUsage.insert("WebSocket")
+                log("このページは WebSocket を使っています（VNet を通りません）", category: .net)
+            }
         default:
             break
         }
     }
+}
 
-    /// ユーザーの操作として開く（LAN の保護・SameSite の判定で「ユーザーの操作」になる）
-    private func open(_ u: URL) {
-        let target: URL
-        switch mode {
-        case .vnetsLegacy: guard let v = VNetURL.toVNet(u) else { addLog("アドレスが正しくありません"); return }; target = v
-        case .vnetDirect, .native: target = u
-        }
-        if mode.usesVNet { scheme.noteUserNavigation(target) }
-        webView.load(URLRequest(url: target))
+// MARK: - WebKit のデリゲート（タブ 1 枚に 1 つ）
+
+@MainActor
+final class TabWebDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
+    weak var tab: BrowserTab?
+
+    init(tab: BrowserTab) {
+        self.tab = tab
+        super.init()
     }
 
-    func go() {
-        var text = address.trimmingCharacters(in: .whitespaces)
-        if !text.contains("://") { text = "https://" + text }
-        guard let u = URL(string: text) else { addLog("アドレスが正しくありません"); return }
-        addLog("―― \(text) を開きます ――")
-        open(u)
-    }
-
-    // MARK: WKNavigationDelegate
-
-    // リンクを押したとき: https:// などのアドレスなら、自作の通信のアドレスに直して開き直す（vnets:// の作りのときだけ）
+    // リンクを押したとき: vnets:// の作りなら、自作の通信のアドレスに直して開き直す
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
-        if mode != .vnetsLegacy { return .allow }
+        guard let tab, tab.mode == .vnetsLegacy else { return .allow }
         if let u = navigationAction.request.url, let s = u.scheme?.lowercased(), s == "http" || s == "https",
            navigationAction.targetFrame?.isMainFrame ?? true, let v = VNetURL.toVNet(u) {
             webView.load(URLRequest(url: v))
@@ -334,16 +1370,214 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
         return .allow
     }
 
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        tab?.navigationEvent("読み込み開始: \(webView.url?.absoluteString ?? "")")
+    }
+
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-        if let u = webView.url, let r = VNetURL.toReal(u) { address = r.absoluteString }
+        tab?.syncFromWebView()
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        pageTitle = webView.title ?? ""
+        tab?.navigationEvent("読み込み完了: \(webView.title ?? "")")
+        tab?.didFinish()
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        tab?.navigationEvent("✕ 読み込みに失敗: \(error.localizedDescription)", level: .error)
+        tab?.syncFromWebView()
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        addLog("✕ 読み込みに失敗: \(error.localizedDescription)")
+        tab?.navigationEvent("✕ 読み込みに失敗: \(error.localizedDescription)", level: .error)
+        tab?.syncFromWebView()
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        tab?.processTerminated()
+    }
+
+    // MARK: WKUIDelegate
+
+    /// target=_blank・window.open: 新しいタブにする
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        tab?.popup(configuration: configuration)
+    }
+
+    func webViewDidClose(_ webView: WKWebView) {
+        tab?.closeByPage()
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async {
+        guard let tab else { return }
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            tab.presentDialog(.alert, message: message, frame: frame) { _, _ in c.resume() }
+        }
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async -> Bool {
+        guard let tab else { return false }
+        return await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
+            tab.presentDialog(.confirm, message: message, frame: frame) { ok, _ in c.resume(returning: ok) }
+        }
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?,
+                 initiatedByFrame frame: WKFrameInfo) async -> String? {
+        guard let tab else { return nil }
+        return await withCheckedContinuation { (c: CheckedContinuation<String?, Never>) in
+            tab.presentDialog(.prompt(defaultText ?? ""), message: prompt, frame: frame) { ok, text in c.resume(returning: ok ? (text ?? "") : nil) }
+        }
+    }
+
+    /// リンクの長押しメニュー: 「新しいタブで開く」などを足す（WebKit の元のメニューも残す）
+    func webView(_ webView: WKWebView, contextMenuConfigurationForElement elementInfo: WKContextMenuElementInfo,
+                 completionHandler: @escaping (UIContextMenuConfiguration?) -> Void) {
+        guard let link = elementInfo.linkURL else { completionHandler(nil); return }
+        let real = VNetURL.toReal(link) ?? link
+        let config = UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] suggested in
+            let open = UIAction(title: "新しいタブで開く", image: UIImage(systemName: "plus.square.on.square")) { _ in
+                let d = self
+                Task { @MainActor in d?.tab?.openInNewTab(real, select: true) }
+            }
+            let back = UIAction(title: "裏のタブで開く", image: UIImage(systemName: "square.on.square")) { _ in
+                let d = self
+                Task { @MainActor in d?.tab?.openInNewTab(real, select: false) }
+            }
+            let copy = UIAction(title: "リンクをコピー", image: UIImage(systemName: "doc.on.doc")) { _ in
+                UIPasteboard.general.url = real
+            }
+            return UIMenu(title: real.absoluteString, children: [open, back, copy] + suggested)
+        }
+        completionHandler(config)
+    }
+}
+
+// ======================================================================
+// MARK: - AddressInput.swift
+// ======================================================================
+
+// MARK: - アドレス欄に入れた文字を、開く URL にする（URL か検索語かを決める）
+//
+// ・「://」がある・about: で始まる → そのまま URL
+// ・空白がある → 検索
+// ・ホスト名らしい（example.com・192.168.0.1・localhost・[::1]・ポートやパス付きも） → URL
+//   LAN のアドレス（数字の LAN・localhost・.local）は http://、それ以外は https://
+// ・それ以外 → 検索
+
+enum SearchEngine: String, CaseIterable, Codable, Sendable {
+    case google, duckDuckGo, bing, yahooJapan
+
+    var name: String {
+        switch self {
+        case .google: return "Google"
+        case .duckDuckGo: return "DuckDuckGo"
+        case .bing: return "Bing"
+        case .yahooJapan: return "Yahoo! JAPAN"
+        }
+    }
+
+    func searchURL(_ query: String) -> URL? {
+        var c: URLComponents
+        switch self {
+        case .google: c = URLComponents(string: "https://www.google.com/search")!; c.queryItems = [URLQueryItem(name: "q", value: query)]
+        case .duckDuckGo: c = URLComponents(string: "https://duckduckgo.com/")!; c.queryItems = [URLQueryItem(name: "q", value: query)]
+        case .bing: c = URLComponents(string: "https://www.bing.com/search")!; c.queryItems = [URLQueryItem(name: "q", value: query)]
+        case .yahooJapan: c = URLComponents(string: "https://search.yahoo.co.jp/search")!; c.queryItems = [URLQueryItem(name: "p", value: query)]
+        }
+        // URLComponents は「+」をそのまま残すので、検索語の「+」を %2B にする（空白と区別するため）
+        c.percentEncodedQuery = c.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
+        return c.url
+    }
+}
+
+enum AddressInput {
+    enum Resolved: Equatable {
+        case url(URL)
+        case search(String, URL)
+    }
+
+    /// 入れた文字を開く URL にする。空なら nil
+    static func resolve(_ raw: String, engine: SearchEngine) -> Resolved? {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty { return nil }
+        let lower = text.lowercased()
+        if lower.hasPrefix("about:") { return URL(string: lower).map { .url($0) } }
+        if text.contains("://"), let u = URL(string: text), u.scheme != nil, u.host != nil || lower.hasPrefix("file:") {
+            return .url(u)
+        }
+        if text.rangeOfCharacter(from: .whitespaces) == nil, let u = hostLikeURL(text) { return .url(u) }
+        return engine.searchURL(text).map { .search(text, $0) }
+    }
+
+    /// ホスト名らしいものなら URL にする
+    static func hostLikeURL(_ text: String) -> URL? {
+        // ホストの部分（最初の / ? # まで）
+        let hostEnd = text.firstIndex(where: { $0 == "/" || $0 == "?" || $0 == "#" }) ?? text.endIndex
+        var hostPort = String(text[..<hostEnd])
+        let rest = String(text[hostEnd...])
+        if hostPort.isEmpty { return nil }
+        var host = hostPort
+        // ポート（[v6]:8080 と host:8080）
+        if hostPort.hasPrefix("[") {
+            guard let close = hostPort.firstIndex(of: "]") else { return nil }
+            host = String(hostPort[hostPort.index(after: hostPort.startIndex)..<close])
+            let after = hostPort[hostPort.index(after: close)...]
+            if !after.isEmpty && !(after.hasPrefix(":") && after.dropFirst().allSatisfy({ $0.isNumber }) && after.count > 1) { return nil }
+            guard IPAddressText.v6(host) != nil else { return nil }
+        } else if let colon = hostPort.lastIndex(of: ":") {
+            let port = hostPort[hostPort.index(after: colon)...]
+            guard !port.isEmpty, port.allSatisfy({ $0.isASCII && $0.isNumber }), let p = Int(port), p > 0, p < 65536 else { return nil }
+            host = String(hostPort[..<colon])
+        }
+        host = host.lowercased()
+        hostPort = hostPort.lowercased()
+        let local: Bool
+        if hostPort.hasPrefix("[") {
+            local = LocalNetworkPolicy.classify(host: host)?.isLocal ?? false
+        } else if IPAddressText.v4(host) != nil {
+            local = LocalNetworkPolicy.classify(host: host)?.isLocal ?? false
+        } else if host == "localhost" || host.hasSuffix(".localhost") || host.hasSuffix(".local") {
+            local = true
+        } else {
+            guard looksLikeDomain(host) else { return nil }
+            local = false
+        }
+        return URL(string: (local ? "http://" : "https://") + hostPort + rest)
+    }
+
+    /// ドメイン名らしいか（点で区切った各部分が英数字とハイフン、最後は英字 2 文字以上か xn--）
+    static func looksLikeDomain(_ h: String) -> Bool {
+        let labels = h.split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.count >= 2 else { return false }
+        for l in labels {
+            guard !l.isEmpty, l.count <= 63, !l.hasPrefix("-"), !l.hasSuffix("-"),
+                  l.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }) else { return false }
+        }
+        let tld = labels.last!
+        return tld.hasPrefix("xn--") || (tld.count >= 2 && tld.allSatisfy { $0.isLetter })
+    }
+
+    /// アドレス欄を触っていないときに見せる短い形（ホスト名。www. は外す）
+    static func shortDisplay(_ url: URL?) -> String {
+        guard let u = url else { return "" }
+        if u.scheme == "about" { return "" }
+        guard var h = u.host, !h.isEmpty else { return u.absoluteString }
+        if h.hasPrefix("www.") { h.removeFirst(4) }
+        return h
+    }
+
+    /// 検索の結果のページなら、その検索語（アドレス欄に戻すため）
+    static func searchTerms(in url: URL?) -> String? {
+        guard let u = url, let c = URLComponents(url: u, resolvingAgainstBaseURL: false), let host = u.host?.lowercased() else { return nil }
+        let key: String
+        if host.hasSuffix("google.com") && u.path == "/search" { key = "q" }
+        else if host == "duckduckgo.com" { key = "q" }
+        else if host.hasSuffix("bing.com") && u.path == "/search" { key = "q" }
+        else if host == "search.yahoo.co.jp" { key = "p" }
+        else { return nil }
+        return c.queryItems?.first(where: { $0.name == key })?.value
     }
 }
 
@@ -451,6 +1685,18 @@ enum VelaSettings {
     /// 開発者向け: 横取りできないとき、標準の通信ではなく予備の vnets:// の作りを使う（安全ではない。CSP などを外すため）
     static var legacyVNetsFallback: Bool {
         get { bool("vnet.legacyVNets", false) } set { d.set(newValue, forKey: "vnet.legacyVNets") }
+    }
+
+    // MARK: 使い勝手
+
+    /// 検索エンジン
+    static var searchEngine: SearchEngine {
+        get { SearchEngine(rawValue: d.string(forKey: "search.engine") ?? "") ?? .google }
+        set { d.set(newValue.rawValue, forKey: "search.engine") }
+    }
+    /// Mac の Safari の Web インスペクタからつなげるようにする（iOS 16.4 から）
+    static var webInspector: Bool {
+        get { bool("dev.webInspector", false) } set { d.set(newValue, forKey: "dev.webInspector") }
     }
 
     // MARK: プライバシー・守り
@@ -1337,6 +2583,25 @@ enum PageScripts {
     })();
     """#
 
+    /// VNet を通らない通信（WebSocket）を使ったら、アプリに 1 回だけ知らせる（アドレス欄の札に出す）
+    static let trackNonVNet = #"""
+    (function () {
+      try {
+        const W = window.WebSocket;
+        const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.velaAction;
+        if (!W || !h) return;
+        let told = false;
+        const Tracked = function WebSocket(url, protocols) {
+          if (!told) { told = true; try { h.postMessage({ action: 'usedWebSocket' }); } catch (e) {} }
+          return protocols === undefined ? new W(url) : new W(url, protocols);
+        };
+        Tracked.prototype = W.prototype;
+        for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) Tracked[k] = W[k];
+        window.WebSocket = Tracked;
+      } catch (e) {}
+    })();
+    """#
+
     /// LAN の保護（標準の通信のタブと WebSocket 用）: WebKit のルールで、LAN でないページから数字の LAN のアドレスなどへの読み込みを止める。
     /// トップのページが LAN のもの（ユーザーがアドレス欄で開いた機器のページなど）なら止めない。
     /// WebKit の正規表現は「|」が使えないので、アドレスの範囲ごとに 1 行にする
@@ -2131,8 +3396,9 @@ final class CookieJar: @unchecked Sendable {
     func receive(_ lines: [String], url: URL, method: String, ctx: RequestContext, now: Date = Date()) -> [CookieChange] {
         var changes: [CookieChange] = []
         let s = settings
-        for line in lines {
-            switch SetCookieParser.parse(line, url: url, now: now) {
+        for (i, line) in lines.enumerated() {
+            // 同じ返事の中の Cookie は、届いた順に作られたことにする（送る順番が毎回変わらないように、1 マイクロ秒ずつずらす）
+            switch SetCookieParser.parse(line, url: url, now: now.addingTimeInterval(Double(i) * 1e-6)) {
             case .rejected(let why):
                 log?("🍪✕ 受け取らない（\(SiteUtil.host(of: url) ?? "")）: \(why)")
             case .cookie(var rec):
@@ -3739,7 +5005,13 @@ final class GuestStack: @unchecked Sendable {
         m.replaceSubrange(28..<34, with: mac)
         m += DHCP.magicCookie
         m += [53, 1, type]
-        if let r = requested { m += [50, 4] + r + [54, 4] + router }
+        if let r = requested {
+            // 配列を + でつなぐと型チェックがとても遅いので、1 つずつ足す
+            m.append(contentsOf: [50, 4] as [UInt8])
+            m.append(contentsOf: r)
+            m.append(contentsOf: [54, 4] as [UInt8])
+            m.append(contentsOf: router)
+        }
         m += [55, 3, 1, 3, 6, 255]                         // ほしいもの: サブネット・ルーター・DNS
         sendUDP(sport: 68, dst: Net.broadcastIP, dport: 67, m, broadcast: true)
         dhcpSentAt = Date()
@@ -5340,7 +6612,8 @@ final class UserNet: @unchecked Sendable {
             if a.pointee.ai_family == AF_INET, let sa = a.pointee.ai_addr {
                 sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
                     let v = sin.pointee.sin_addr.s_addr       // ネットワークの順（ビッグエンディアン）のまま
-                    let b = [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8(v >> 24)]
+                    let b: [UInt8] = [UInt8(truncatingIfNeeded: v), UInt8(truncatingIfNeeded: v >> 8),
+                                      UInt8(truncatingIfNeeded: v >> 16), UInt8(truncatingIfNeeded: v >> 24)]
                     if !out.contains(b) { out.append(b) }
                 }
             }

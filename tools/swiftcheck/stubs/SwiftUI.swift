@@ -255,6 +255,8 @@ public struct Text: View, Equatable {
     public static func + (a: Text, b: Text) -> Text { a }
 }
 
+public enum ContentMode: Hashable { case fit, fill }
+
 public struct Image: View, Equatable {
     public init(systemName: String) {}
     public init(_ name: String) {}
@@ -329,13 +331,20 @@ public struct NavigationStack<Content: View>: View {
     public var body: Never { fatalError() }
 }
 
+public struct ButtonRole: Equatable {
+    public static let destructive = ButtonRole(), cancel = ButtonRole()
+}
+
 public struct Button<Label: View>: View {
     public init(action: @escaping () -> Void, @ViewBuilder label: () -> Label) {}
+    public init(role: ButtonRole?, action: @escaping () -> Void, @ViewBuilder label: () -> Label) {}
     public var body: Never { fatalError() }
 }
 public extension Button where Label == Text {
     init(_ titleKey: LocalizedStringKey, action: @escaping () -> Void) {}
     @_disfavoredOverload init<S: StringProtocol>(_ title: S, action: @escaping () -> Void) {}
+    init(_ titleKey: LocalizedStringKey, role: ButtonRole?, action: @escaping () -> Void) {}
+    @_disfavoredOverload init<S: StringProtocol>(_ title: S, role: ButtonRole?, action: @escaping () -> Void) {}
 }
 
 public struct Toggle<Label: View>: View {
@@ -431,6 +440,7 @@ public extension View {
     func background<V: View>(_ background: V, alignment: Alignment = .center) -> _M { .init() }
     func background<V: View>(alignment: Alignment = .center, @ViewBuilder content: () -> V) -> _M { .init() }
     func opacity(_ opacity: Double) -> _M { .init() }
+    func contentShape<S: Shape>(_ shape: S, eoFill: Bool = false) -> _M { .init() }
     func id<ID: Hashable>(_ id: ID) -> _M { .init() }
     func disabled(_ disabled: Bool) -> _M { .init() }
     func hidden() -> _M { .init() }
@@ -456,6 +466,16 @@ public extension View {
     func environmentObject<T: ObservableObject>(_ object: T) -> _M { .init() }
     func sheet<Content: View>(isPresented: Binding<Bool>, onDismiss: (() -> Void)? = nil, @ViewBuilder content: @escaping () -> Content) -> _M { .init() }
     func alert<A: View>(_ titleKey: LocalizedStringKey, isPresented: Binding<Bool>, @ViewBuilder actions: () -> A) -> _M { .init() }
+    func alert<S: StringProtocol, A: View, M: View>(_ title: S, isPresented: Binding<Bool>, @ViewBuilder actions: () -> A,
+                                                   @ViewBuilder message: () -> M) -> _M { .init() }
+    func fullScreenCover<Content: View>(isPresented: Binding<Bool>, onDismiss: (() -> Void)? = nil, @ViewBuilder content: @escaping () -> Content) -> _M { .init() }
+    func contextMenu<MenuItems: View>(@ViewBuilder menuItems: () -> MenuItems) -> _M { .init() }
+    func keyboardShortcut(_ key: KeyEquivalent, modifiers: EventModifiers = .command) -> _M { .init() }
+    func focused(_ condition: FocusState<Bool>.Binding) -> _M { .init() }
+    func submitLabel(_ submitLabel: SubmitLabel) -> _M { .init() }
+    func modifier<T: ViewModifier>(_ modifier: T) -> ModifiedContent<Self, T> { .init() }
+    func scaleEffect(_ s: CGFloat, anchor: UnitPoint = .center) -> _M { .init() }
+    func aspectRatio(_ aspectRatio: CGFloat? = nil, contentMode: ContentMode) -> _M { .init() }
 }
 
 public enum TextAlignment: Hashable { case leading, center, trailing }
@@ -484,4 +504,96 @@ public extension UIViewRepresentable where Coordinator == Void {
 }
 public extension UIViewRepresentable {
     var body: Never { fatalError() }
+}
+
+// MARK: - 環境・フォーカス・メニュー・格子など（フェーズ C で足したもの）
+
+public enum ScenePhase: Hashable { case background, inactive, active }
+
+public struct DismissAction {
+    @MainActor public func callAsFunction() {}
+}
+
+public struct EnvironmentValues {
+    public var scenePhase: ScenePhase { .active }
+    public var dismiss: DismissAction { DismissAction() }
+}
+
+@propertyWrapper public struct Environment<Value> {
+    public init(_ keyPath: KeyPath<EnvironmentValues, Value>) {}
+    @MainActor public var wrappedValue: Value { fatalError() }
+}
+
+@propertyWrapper public struct FocusState<Value: Hashable> {
+    @propertyWrapper public struct Binding {
+        public init() {}
+        public var wrappedValue: Value { get { fatalError() } nonmutating set {} }
+        public var projectedValue: FocusState<Value>.Binding { self }
+    }
+    // 本物は init() where Value == Bool と init<T>() where Value == T?。スタブでは 1 つにまとめる
+    public init() {}
+    public var wrappedValue: Value { get { fatalError() } nonmutating set {} }
+    public var projectedValue: FocusState<Value>.Binding { fatalError() }
+}
+
+public struct SubmitLabel {
+    public static let done = SubmitLabel(), go = SubmitLabel(), send = SubmitLabel(), join = SubmitLabel(), route = SubmitLabel()
+    public static let search = SubmitLabel(), `return` = SubmitLabel(), next = SubmitLabel(), `continue` = SubmitLabel()
+}
+
+public struct KeyEquivalent: ExpressibleByExtendedGraphemeClusterLiteral {
+    public init(_ character: Character) {}
+    public init(extendedGraphemeClusterLiteral value: Character) {}
+    public static let upArrow = KeyEquivalent("u"), downArrow = KeyEquivalent("d"), leftArrow = KeyEquivalent("l"), rightArrow = KeyEquivalent("r")
+    public static let escape = KeyEquivalent("e"), delete = KeyEquivalent("x"), tab = KeyEquivalent("t"), space = KeyEquivalent(" "), `return` = KeyEquivalent("n")
+}
+
+public struct EventModifiers: OptionSet {
+    public let rawValue: Int
+    public init(rawValue: Int) { self.rawValue = rawValue }
+    public static let capsLock = EventModifiers(rawValue: 1), shift = EventModifiers(rawValue: 2), control = EventModifiers(rawValue: 4)
+    public static let option = EventModifiers(rawValue: 8), command = EventModifiers(rawValue: 16), numericPad = EventModifiers(rawValue: 32)
+    public static let all = EventModifiers(rawValue: 63)
+}
+
+public struct _ViewModifier_Content<Modifier: ViewModifier>: View { public var body: Never { fatalError() } }
+
+public protocol ViewModifier {
+    associatedtype Body: View
+    typealias Content = _ViewModifier_Content<Self>
+    @ViewBuilder @MainActor func body(content: Content) -> Body
+}
+extension ModifiedContent: ViewModifier where Content: ViewModifier, Modifier: ViewModifier {
+    public func body(content: _ViewModifier_Content<Self>) -> Never { fatalError() }
+}
+
+public struct GeometryProxy {
+    public var size: CGSize { .zero }
+}
+
+public struct GeometryReader<Content: View>: View {
+    public init(@ViewBuilder content: @escaping (GeometryProxy) -> Content) {}
+    public var body: Never { fatalError() }
+}
+
+public struct Menu<Label: View, Content: View>: View {
+    public init(@ViewBuilder content: () -> Content, @ViewBuilder label: () -> Label) {}
+    public var body: Never { fatalError() }
+}
+
+public struct GridItem {
+    public enum Size { case fixed(CGFloat), flexible(minimum: CGFloat = 10, maximum: CGFloat = .infinity), adaptive(minimum: CGFloat, maximum: CGFloat = .infinity) }
+    public init(_ size: GridItem.Size = .flexible(), spacing: CGFloat? = nil, alignment: Alignment? = nil) {}
+}
+
+public struct LazyVGrid<Content: View>: View {
+    public init(columns: [GridItem], alignment: HorizontalAlignment = .center, spacing: CGFloat? = nil,
+                pinnedViews: PinnedScrollableViews = .init(), @ViewBuilder content: () -> Content) {}
+    public var body: Never { fatalError() }
+}
+
+public struct PinnedScrollableViews: OptionSet {
+    public let rawValue: UInt32
+    public init(rawValue: UInt32) { self.rawValue = rawValue }
+    public static let sectionHeaders = PinnedScrollableViews(rawValue: 1), sectionFooters = PinnedScrollableViews(rawValue: 2)
 }

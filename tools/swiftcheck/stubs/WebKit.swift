@@ -56,7 +56,39 @@ public extension WKNavigationDelegate {
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {}
 }
 
-@MainActor public protocol WKUIDelegate: NSObjectProtocol {}
+open class WKWindowFeatures: NSObject {}
+
+open class WKContextMenuElementInfo: NSObject {
+    open var linkURL: URL? { nil }
+}
+
+open class WKSnapshotConfiguration: NSObject {
+    open var rect: CGRect = .zero
+    open var afterScreenUpdates = true
+}
+
+@MainActor public protocol WKUIDelegate: NSObjectProtocol {
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction,
+                 windowFeatures: WKWindowFeatures) -> WKWebView?
+    func webViewDidClose(_ webView: WKWebView)
+    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async
+    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async -> Bool
+    func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?,
+                 initiatedByFrame frame: WKFrameInfo) async -> String?
+    func webView(_ webView: WKWebView, contextMenuConfigurationForElement elementInfo: WKContextMenuElementInfo,
+                 completionHandler: @escaping (UIContextMenuConfiguration?) -> Void)
+}
+public extension WKUIDelegate {
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction,
+                 windowFeatures: WKWindowFeatures) -> WKWebView? { nil }
+    func webViewDidClose(_ webView: WKWebView) {}
+    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async {}
+    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async -> Bool { false }
+    func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?,
+                 initiatedByFrame frame: WKFrameInfo) async -> String? { nil }
+    func webView(_ webView: WKWebView, contextMenuConfigurationForElement elementInfo: WKContextMenuElementInfo,
+                 completionHandler: @escaping (UIContextMenuConfiguration?) -> Void) {}
+}
 
 public protocol WKURLSchemeTask: NSObjectProtocol {
     var request: URLRequest { get }
@@ -179,6 +211,8 @@ open class WKBackForwardListItem: NSObject {
 }
 open class WKBackForwardList: NSObject {
     open var currentItem: WKBackForwardListItem? { nil }
+    open var backList: [WKBackForwardListItem] { [] }
+    open var forwardList: [WKBackForwardListItem] { [] }
     open var backItem: WKBackForwardListItem? { nil }
     open var forwardItem: WKBackForwardListItem? { nil }
 }
@@ -194,6 +228,11 @@ open class WKBackForwardList: NSObject {
     @MainActor open var estimatedProgress: Double { 0 }
     @MainActor open var canGoBack: Bool { false }
     @MainActor open var canGoForward: Bool { false }
+    @MainActor open var hasOnlySecureContent: Bool { false }
+    @MainActor open var interactionState: Any?
+    @MainActor open func takeSnapshot(with snapshotConfiguration: WKSnapshotConfiguration?,
+                                      completionHandler: @escaping @MainActor (UIImage?, Error?) -> Void) {}
+    @MainActor @discardableResult open func go(to item: WKBackForwardListItem) -> WKNavigation? { nil }
     @MainActor open var customUserAgent: String?
     @MainActor open var allowsBackForwardNavigationGestures = false
     @MainActor open var isInspectable = false

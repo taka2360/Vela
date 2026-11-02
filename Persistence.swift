@@ -102,6 +102,18 @@ enum VelaSettings {
         get { bool("vnet.legacyVNets", false) } set { d.set(newValue, forKey: "vnet.legacyVNets") }
     }
 
+    // MARK: 使い勝手
+
+    /// 検索エンジン
+    static var searchEngine: SearchEngine {
+        get { SearchEngine(rawValue: d.string(forKey: "search.engine") ?? "") ?? .google }
+        set { d.set(newValue.rawValue, forKey: "search.engine") }
+    }
+    /// Mac の Safari の Web インスペクタからつなげるようにする（iOS 16.4 から）
+    static var webInspector: Bool {
+        get { bool("dev.webInspector", false) } set { d.set(newValue, forKey: "dev.webInspector") }
+    }
+
     // MARK: プライバシー・守り
 
     /// サードパーティ Cookie をブロックする

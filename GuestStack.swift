@@ -142,7 +142,13 @@ final class GuestStack: @unchecked Sendable {
         m.replaceSubrange(28..<34, with: mac)
         m += DHCP.magicCookie
         m += [53, 1, type]
-        if let r = requested { m += [50, 4] + r + [54, 4] + router }
+        if let r = requested {
+            // 配列を + でつなぐと型チェックがとても遅いので、1 つずつ足す
+            m.append(contentsOf: [50, 4] as [UInt8])
+            m.append(contentsOf: r)
+            m.append(contentsOf: [54, 4] as [UInt8])
+            m.append(contentsOf: router)
+        }
         m += [55, 3, 1, 3, 6, 255]                         // ほしいもの: サブネット・ルーター・DNS
         sendUDP(sport: 68, dst: Net.broadcastIP, dport: 67, m, broadcast: true)
         dhcpSentAt = Date()

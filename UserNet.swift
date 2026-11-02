@@ -245,7 +245,8 @@ final class UserNet: @unchecked Sendable {
             if a.pointee.ai_family == AF_INET, let sa = a.pointee.ai_addr {
                 sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
                     let v = sin.pointee.sin_addr.s_addr       // ネットワークの順（ビッグエンディアン）のまま
-                    let b = [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8(v >> 24)]
+                    let b: [UInt8] = [UInt8(truncatingIfNeeded: v), UInt8(truncatingIfNeeded: v >> 8),
+                                      UInt8(truncatingIfNeeded: v >> 16), UInt8(truncatingIfNeeded: v >> 24)]
                     if !out.contains(b) { out.append(b) }
                 }
             }
