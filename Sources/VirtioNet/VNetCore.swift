@@ -103,6 +103,26 @@ enum VirtioMMIO {
 
     /// virtio_net_hdr の大きさ（古い形 = legacy、MRG_RXBUF なし）
     static let netHeaderSize = 10
+
+    /// ページの大きさ・キューの揃え方の既定値（古い形）
+    static let defaultPageSize: UInt32 = 4096
+}
+
+/// 古い形（legacy）のキューの置き場所: 記述子表 (16 × n) → avail (4 + 2n + 2) → used (4 + 8n + 2)。
+/// used は align の倍数（絶対アドレスで）に切り上げる。カードとドライバの両方が使う
+struct VirtioQueueLayout {
+    let desc: UInt64
+    let avail: UInt64
+    let used: UInt64
+    /// used リングの終わり（ここまでが 1 本のキュー）
+    let usedEnd: UInt64
+    init(base: UInt64, num: UInt64, align: UInt64) {
+        desc = base
+        avail = base + 16 * num
+        let availEnd = avail + 4 + 2 * num + 2
+        used = (availEnd + align - 1) / align * align
+        usedEnd = used + 4 + 8 * num + 2
+    }
 }
 
 // MARK: - virtio-mmio のネットワーク（Linux では eth0 になる）
@@ -130,7 +150,7 @@ final class VirtioNet: @unchecked Sendable {
         var avail: UInt64 = 0
         var used: UInt64 = 0
         var lastAvail: UInt16 = 0
-        var align: UInt32 = 4096
+        var align: UInt32 = VirtioMMIO.defaultPageSize
         var pfn: UInt32 = 0
         /// 入れ物の数（ドライバが決めていなければ最大）
         var size: UInt16 { UInt16(num == 0 ? VirtioNet.queueMax : num) }
@@ -142,7 +162,7 @@ final class VirtioNet: @unchecked Sendable {
     private var driverFeatures: UInt64 = 0
     private var queueSel: UInt32 = 0
     private var interruptStatus: UInt32 = 0
-    private var guestPageSize: UInt32 = 4096
+    private var guestPageSize: UInt32 = VirtioMMIO.defaultPageSize
 
     /// まだ OS に渡していない受け取ったフレーム
     private var pending: [[UInt8]] = []
@@ -181,7 +201,7 @@ final class VirtioNet: @unchecked Sendable {
         driverFeatures = 0
         queueSel = 0
         interruptStatus = 0
-        guestPageSize = 4096
+        guestPageSize = VirtioMMIO.defaultPageSize
         queues = [Queue(), Queue()]
     }
 
@@ -228,10 +248,10 @@ final class VirtioNet: @unchecked Sendable {
                 driverFeatures = (driverFeatures & ~(0xFFFF_FFFF << shift)) | (UInt64(v) << shift)
             }
         case R.driverFeaturesSel: driverFeaturesSel = v
-        case R.guestPageSize: if legacy { guestPageSize = v == 0 ? 4096 : v }
+        case R.guestPageSize: if legacy { guestPageSize = v == 0 ? VirtioMMIO.defaultPageSize : v }
         case R.queueSel: queueSel = v
         case R.queueNum: if ok { queues[qs].num = min(v, VirtioNet.queueMax) }
-        case R.queueAlign: if legacy && ok { queues[qs].align = v == 0 ? 4096 : v }
+        case R.queueAlign: if legacy && ok { queues[qs].align = v == 0 ? VirtioMMIO.defaultPageSize : v }
         case R.queuePFN: if legacy && ok { setLegacyQueue(qs, pfn: v) }
         case R.queueReady: if ok { queues[qs].ready = v & 1 }
         case R.queueNotify:
@@ -252,14 +272,11 @@ final class VirtioNet: @unchecked Sendable {
     private func setLegacyQueue(_ i: Int, pfn: UInt32) {
         queues[i].pfn = pfn
         if pfn == 0 { queues[i].ready = 0; queues[i].lastAvail = 0; return }
-        let num = UInt64(queues[i].size)
-        let desc = UInt64(pfn) * UInt64(guestPageSize)
-        let avail = desc + 16 * num
-        let align = UInt64(queues[i].align)
-        let availEnd = avail + 4 + 2 * num + 2
-        queues[i].desc = desc
-        queues[i].avail = avail
-        queues[i].used = (availEnd + align - 1) / align * align
+        let l = VirtioQueueLayout(base: UInt64(pfn) * UInt64(guestPageSize), num: UInt64(queues[i].size),
+                                  align: UInt64(queues[i].align))
+        queues[i].desc = l.desc
+        queues[i].avail = l.avail
+        queues[i].used = l.used
         queues[i].lastAvail = 0
         queues[i].ready = 1
     }

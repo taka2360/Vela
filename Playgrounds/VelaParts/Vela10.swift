@@ -123,6 +123,26 @@ enum VirtioMMIO {
 
     /// virtio_net_hdr の大きさ（古い形 = legacy、MRG_RXBUF なし）
     static let netHeaderSize = 10
+
+    /// ページの大きさ・キューの揃え方の既定値（古い形）
+    static let defaultPageSize: UInt32 = 4096
+}
+
+/// 古い形（legacy）のキューの置き場所: 記述子表 (16 × n) → avail (4 + 2n + 2) → used (4 + 8n + 2)。
+/// used は align の倍数（絶対アドレスで）に切り上げる。カードとドライバの両方が使う
+struct VirtioQueueLayout {
+    let desc: UInt64
+    let avail: UInt64
+    let used: UInt64
+    /// used リングの終わり（ここまでが 1 本のキュー）
+    let usedEnd: UInt64
+    init(base: UInt64, num: UInt64, align: UInt64) {
+        desc = base
+        avail = base + 16 * num
+        let availEnd = avail + 4 + 2 * num + 2
+        used = (availEnd + align - 1) / align * align
+        usedEnd = used + 4 + 8 * num + 2
+    }
 }
 
 // MARK: - virtio-mmio のネットワーク（Linux では eth0 になる）
@@ -150,7 +170,7 @@ final class VirtioNet: @unchecked Sendable {
         var avail: UInt64 = 0
         var used: UInt64 = 0
         var lastAvail: UInt16 = 0
-        var align: UInt32 = 4096
+        var align: UInt32 = VirtioMMIO.defaultPageSize
         var pfn: UInt32 = 0
         /// 入れ物の数（ドライバが決めていなければ最大）
         var size: UInt16 { UInt16(num == 0 ? VirtioNet.queueMax : num) }
@@ -162,7 +182,7 @@ final class VirtioNet: @unchecked Sendable {
     private var driverFeatures: UInt64 = 0
     private var queueSel: UInt32 = 0
     private var interruptStatus: UInt32 = 0
-    private var guestPageSize: UInt32 = 4096
+    private var guestPageSize: UInt32 = VirtioMMIO.defaultPageSize
 
     /// まだ OS に渡していない受け取ったフレーム
     private var pending: [[UInt8]] = []
@@ -201,7 +221,7 @@ final class VirtioNet: @unchecked Sendable {
         driverFeatures = 0
         queueSel = 0
         interruptStatus = 0
-        guestPageSize = 4096
+        guestPageSize = VirtioMMIO.defaultPageSize
         queues = [Queue(), Queue()]
     }
 
@@ -248,10 +268,10 @@ final class VirtioNet: @unchecked Sendable {
                 driverFeatures = (driverFeatures & ~(0xFFFF_FFFF << shift)) | (UInt64(v) << shift)
             }
         case R.driverFeaturesSel: driverFeaturesSel = v
-        case R.guestPageSize: if legacy { guestPageSize = v == 0 ? 4096 : v }
+        case R.guestPageSize: if legacy { guestPageSize = v == 0 ? VirtioMMIO.defaultPageSize : v }
         case R.queueSel: queueSel = v
         case R.queueNum: if ok { queues[qs].num = min(v, VirtioNet.queueMax) }
-        case R.queueAlign: if legacy && ok { queues[qs].align = v == 0 ? 4096 : v }
+        case R.queueAlign: if legacy && ok { queues[qs].align = v == 0 ? VirtioMMIO.defaultPageSize : v }
         case R.queuePFN: if legacy && ok { setLegacyQueue(qs, pfn: v) }
         case R.queueReady: if ok { queues[qs].ready = v & 1 }
         case R.queueNotify:
@@ -272,14 +292,11 @@ final class VirtioNet: @unchecked Sendable {
     private func setLegacyQueue(_ i: Int, pfn: UInt32) {
         queues[i].pfn = pfn
         if pfn == 0 { queues[i].ready = 0; queues[i].lastAvail = 0; return }
-        let num = UInt64(queues[i].size)
-        let desc = UInt64(pfn) * UInt64(guestPageSize)
-        let avail = desc + 16 * num
-        let align = UInt64(queues[i].align)
-        let availEnd = avail + 4 + 2 * num + 2
-        queues[i].desc = desc
-        queues[i].avail = avail
-        queues[i].used = (availEnd + align - 1) / align * align
+        let l = VirtioQueueLayout(base: UInt64(pfn) * UInt64(guestPageSize), num: UInt64(queues[i].size),
+                                  align: UInt64(queues[i].align))
+        queues[i].desc = l.desc
+        queues[i].avail = l.avail
+        queues[i].used = l.used
         queues[i].lastAvail = 0
         queues[i].ready = 1
     }
@@ -464,7 +481,7 @@ final class VirtioNetDriver: @unchecked Sendable {
         let features = r32(R.deviceFeatures)
         w32(R.driverFeaturesSel, 0)
         w32(R.driverFeatures, features & UInt32(VirtioMMIO.featureNetMAC))   // MAC アドレスだけ使う
-        w32(R.guestPageSize, 4096)
+        w32(R.guestPageSize, VirtioMMIO.defaultPageSize)
         mac = (0..<6).map { UInt8(truncatingIfNeeded: dev.read(R.config + UInt64($0), size: 1)) }
         rx = setupQueue(VirtioMMIO.rxQueue)
         tx = setupQueue(VirtioMMIO.txQueue)
@@ -485,19 +502,17 @@ final class VirtioNetDriver: @unchecked Sendable {
         w32(R.queueSel, UInt32(q))
         precondition(Int(r32(R.queueNumMax)) >= qsize)
         w32(R.queueNum, UInt32(qsize))
-        w32(R.queueAlign, 4096)
-        // 記述子表 (16 × n) + avail (4 + 2n + 2)、used は 4096 の倍数から (4 + 8n + 2)
-        let n = UInt64(qsize)
-        let availEnd = 16 * n + 4 + 2 * n + 2
-        let usedOff = (availEnd + 4095) / 4096 * 4096
-        let total = Int(usedOff + 4 + 8 * n + 2)
-        let area = ram.alloc(total, align: 4096)
+        let page = UInt64(VirtioMMIO.defaultPageSize)
+        w32(R.queueAlign, VirtioMMIO.defaultPageSize)
+        // 置き場所はカードと同じ決まりで、0 から数えた位置を出す（area はページの倍数なので、そのまま足せる）
+        let l = VirtioQueueLayout(base: 0, num: UInt64(qsize), align: page)
+        let area = ram.alloc(Int(l.usedEnd), align: page)
         var r = Ring(ram: ram, size: qsize)
-        r.desc = area
-        r.avail = area + 16 * n
-        r.used = area + usedOff
+        r.desc = area + l.desc
+        r.avail = area + l.avail
+        r.used = area + l.used
         r.bufs = (0..<qsize).map { _ in ram.alloc(bufSize, align: 64) }
-        w32(R.queuePFN, UInt32(area / 4096))
+        w32(R.queuePFN, UInt32(area / page))
         return r
     }
 

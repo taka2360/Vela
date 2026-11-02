@@ -82,7 +82,7 @@ final class VirtioNetDriver: @unchecked Sendable {
         let features = r32(R.deviceFeatures)
         w32(R.driverFeaturesSel, 0)
         w32(R.driverFeatures, features & UInt32(VirtioMMIO.featureNetMAC))   // MAC アドレスだけ使う
-        w32(R.guestPageSize, 4096)
+        w32(R.guestPageSize, VirtioMMIO.defaultPageSize)
         mac = (0..<6).map { UInt8(truncatingIfNeeded: dev.read(R.config + UInt64($0), size: 1)) }
         rx = setupQueue(VirtioMMIO.rxQueue)
         tx = setupQueue(VirtioMMIO.txQueue)
@@ -103,19 +103,17 @@ final class VirtioNetDriver: @unchecked Sendable {
         w32(R.queueSel, UInt32(q))
         precondition(Int(r32(R.queueNumMax)) >= qsize)
         w32(R.queueNum, UInt32(qsize))
-        w32(R.queueAlign, 4096)
-        // 記述子表 (16 × n) + avail (4 + 2n + 2)、used は 4096 の倍数から (4 + 8n + 2)
-        let n = UInt64(qsize)
-        let availEnd = 16 * n + 4 + 2 * n + 2
-        let usedOff = (availEnd + 4095) / 4096 * 4096
-        let total = Int(usedOff + 4 + 8 * n + 2)
-        let area = ram.alloc(total, align: 4096)
+        let page = UInt64(VirtioMMIO.defaultPageSize)
+        w32(R.queueAlign, VirtioMMIO.defaultPageSize)
+        // 置き場所はカードと同じ決まりで、0 から数えた位置を出す（area はページの倍数なので、そのまま足せる）
+        let l = VirtioQueueLayout(base: 0, num: UInt64(qsize), align: page)
+        let area = ram.alloc(Int(l.usedEnd), align: page)
         var r = Ring(ram: ram, size: qsize)
-        r.desc = area
-        r.avail = area + 16 * n
-        r.used = area + usedOff
+        r.desc = area + l.desc
+        r.avail = area + l.avail
+        r.used = area + l.used
         r.bufs = (0..<qsize).map { _ in ram.alloc(bufSize, align: 64) }
-        w32(R.queuePFN, UInt32(area / 4096))
+        w32(R.queuePFN, UInt32(area / page))
         return r
     }
 

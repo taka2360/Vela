@@ -63,6 +63,21 @@ func virtioTests() {
         check(num: 0, align: 8192, page: 4096, pfnOffset: 1)
     }
 
+    test("VirtioQueueLayout（今の式と同じ値）") {
+        for (base, n, align) in [(UInt64(0), UInt64(256), UInt64(4096)), (0x4000_3000, 8, 8192), (0x4000_1000, 256, 64), (0, 1, 1)] {
+            let l = VirtioQueueLayout(base: base, num: n, align: align)
+            expectEqual(l.desc, base)
+            expectEqual(l.avail, base + 16 * n)
+            expectEqual(l.used, (base + 16 * n + 4 + 2 * n + 2 + align - 1) / align * align)
+            expectEqual(l.usedEnd, l.used + 4 + 8 * n + 2)
+        }
+        // ドライバの前の式（0 から数えた位置を 4096 で切り上げ）と同じ
+        let n: UInt64 = 256
+        let old = (16 * n + 4 + 2 * n + 2 + 4095) / 4096 * 4096
+        expectEqual(VirtioQueueLayout(base: 0, num: n, align: 4096).used, old)
+        expectEqual(VirtioQueueLayout(base: 0, num: n, align: 4096).usedEnd, old + 4 + 8 * n + 2)
+    }
+
     test("ドライバ: カードを準備して、送ったフレームが出てくる") {
         let ram = GuestRAM(megabytes: 4)
         let card = VirtioNet(memory: ram)
