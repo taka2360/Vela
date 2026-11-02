@@ -33,6 +33,15 @@ func helperTests() {
         expectEqual(SiteUtil.stripWWW("www.www.a"), "www.a")
         expectEqual(SiteUtil.stripWWW("www"), "www")
     }
+    test("保存先のフォルダ（AppPaths）") {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let old = base.appendingPathComponent("Vela", isDirectory: true)
+        expectEqual(AppPaths.support, old)
+        expectEqual(JSONFile<Int>.defaultDirectory(), old)
+        expectEqual(CrashLog.folder, old)
+        expectEqual(CrashLog.currentURL, old.appendingPathComponent("crash-current.txt"))
+    }
     test("MIME の種類（DownloadFiles）") {
         expectEqual(DownloadFiles.mimeEssence(" Text/HTML ; charset=utf-8"), "text/html")
         expectEqual(DownloadFiles.mimeEssence(";a"), "a")

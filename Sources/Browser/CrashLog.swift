@@ -61,8 +61,7 @@ enum CrashLog {
     static let signalMark = "【シグナル】"
 
     static var folder: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? FileManager.default.temporaryDirectory
-        let dir = base.appendingPathComponent("Vela", isDirectory: true)
+        let dir = AppPaths.support
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }

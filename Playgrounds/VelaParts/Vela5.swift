@@ -719,6 +719,15 @@ enum ContentBlockerCompiler {
 // タブ・ブックマーク・履歴などを Codable の JSON で置く。書き込みはまとめて（delay 秒後に 1 回）、裏のキューで、
 // いったん別の名前に書いてから置き換える（.atomic。書いている途中で落ちても前のものが残る）
 
+enum AppPaths {
+    /// Application Support/Vela（取れなければ一時フォルダの Vela）。フォルダは作らない（作るのは使う側）
+    static var support: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("Vela", isDirectory: true)
+    }
+}
+
 final class JSONFile<Value: Codable>: @unchecked Sendable {
     let url: URL
     private let lock = NSLock()
@@ -738,11 +747,7 @@ final class JSONFile<Value: Codable>: @unchecked Sendable {
         queue = DispatchQueue(label: "vela-json-\(name)")
     }
 
-    static func defaultDirectory() -> URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        return base.appendingPathComponent("Vela", isDirectory: true)
-    }
+    static func defaultDirectory() -> URL { AppPaths.support }
 
     /// 読む（無い・壊れているなら nil。壊れていたファイルは .broken に名前を変えて残す）
     func load() -> Value? {
@@ -1072,8 +1077,7 @@ enum CrashLog {
     static let signalMark = "【シグナル】"
 
     static var folder: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? FileManager.default.temporaryDirectory
-        let dir = base.appendingPathComponent("Vela", isDirectory: true)
+        let dir = AppPaths.support
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
