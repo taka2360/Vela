@@ -27,6 +27,18 @@ func foundationTests() {
         expect(after.first!.id < after.last!.id, "古い順")
         expect(log.export(minLevel: .error).isEmpty, "error はもう押し出された")
     }
+    test("消すと、重さごとの数も 0 に戻る") {
+        let log = DevLog()
+        log.add("w", level: .warning, category: .app)
+        log.add("e", level: .error, category: .app)
+        expectEqual(log.count(.warning), 1)
+        log.clear()
+        expectEqual(log.all().count, 0)
+        expectEqual(log.count(.warning), 0)
+        expectEqual(log.count(.error), 0)
+        log.add("e2", level: .error, category: .app)
+        expectEqual(log.count(.error), 1)
+    }
     test("どのスレッドから書いても壊れない") {
         let log = DevLog()
         DispatchQueue.concurrentPerform(iterations: 8) { t in for i in 0..<500 { log.add("t\(t)-\(i)") } }

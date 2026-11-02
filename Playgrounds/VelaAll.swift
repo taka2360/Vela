@@ -5646,7 +5646,7 @@ final class DevLog: @unchecked Sendable {
     private var start = 0           // ring の中で一番古いものの位置（いっぱいになってから使う）
     private var nextID = 1
     private var dirty = false
-    /// ログを書いた回数（重さごと。開発者パネル用）
+    /// ログを書いた回数（重さごと。開発者パネル用。clear で 0 に戻す）
     private var counts: [LogLevel: Int] = [:]
 
     init() {}
@@ -5702,7 +5702,7 @@ final class DevLog: @unchecked Sendable {
     }
 
     func clear() {
-        lock.lock(); ring = []; start = 0; dirty = true; lock.unlock()
+        lock.lock(); ring = []; start = 0; counts = [:]; dirty = true; lock.unlock()
     }
 
     /// 文字列から種類と重さを決める（今までのログの書き方に合わせる）
