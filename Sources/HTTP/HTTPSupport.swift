@@ -8,7 +8,7 @@ import Compression
 
 // MARK: - http の小さな道具（ヘッダ・gzip・ブラウザらしさ）
 //
-// Cookie は CookieJar.swift（WebKit の置き場の写し）と NetPolicy.swift の CookiePolicy に移した
+// Cookie は CookieJar.swift（WebKit の置き場の写し）と Cookies.swift の CookiePolicy に移した
 
 /// ヘッダ（名前, 値）の並び。名前の大文字小文字は区別しない
 extension Array where Element == (String, String) {

@@ -1,5 +1,5 @@
 // このファイルは merge_swift.py で自動生成したものです（直接編集しないでください）
-// 元ファイル: MyApp.swift, BrowserView.swift, BrowserControls.swift, TabViews.swift, LibraryView.swift, DevPanel.swift, DevPanelPages.swift, SettingsView.swift, AdBlockView.swift, Downloads.swift, DownloadFiles.swift, BrowserStore.swift, BrowserTab.swift, Library.swift, LibraryModel.swift, AddressInput.swift, ErrorPages.swift, NetLog.swift, FilterLists.swift, ABPFilter.swift, BlockEngine.swift, ContentBlocker.swift, Persistence.swift, DevLog.swift, CrashLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
+// 元ファイル: MyApp.swift, BrowserView.swift, BrowserControls.swift, TabViews.swift, LibraryView.swift, DevPanel.swift, DevPanelPages.swift, SettingsView.swift, AdBlockView.swift, Downloads.swift, DownloadFiles.swift, BrowserStore.swift, BrowserTab.swift, Library.swift, LibraryModel.swift, AddressInput.swift, ErrorPages.swift, NetLog.swift, FilterLists.swift, ABPFilter.swift, BlockEngine.swift, ContentBlocker.swift, Persistence.swift, DevLog.swift, CrashLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, SiteUtil.swift, Cookies.swift, RedirectPolicy.swift, LocalNetworkPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
 
 import SwiftUI
 import WebKit
@@ -5853,7 +5853,7 @@ enum CrashLog {
 // https:// と http://（予備の作りでは vnets:// と vnet://）の読み込みが全部ここに来る。
 // WebKit は画面のスレッドから呼ぶ。こちらも pending は画面のスレッドの上でだけ触る
 //
-// 守っていること（NetPolicy.swift の決まりを使う）:
+// 守っていること（Sources/Policy/ の決まりを使う）:
 // ・CORS はサーバーの答えをそのまま渡す（OPTIONS もサーバーに送る）。Vela が許可を作ることはしない
 // ・CSP・X-Frame-Options などの守りのヘッダは消さない（予備の vnets:// の作りだけは、書き換えと合わないので外す）
 // ・リダイレクトの次の要求は RedirectPolicy だけで作る（Authorization を別のオリジンへ持ち越さない・POST を二重に送らない）
@@ -6984,6 +6984,71 @@ final class WebCookieSync: NSObject, WKHTTPCookieStoreObserver {
 //  RedirectPolicy     … 3xx から次の要求を作る（ここ以外では作らない）
 //  CORSPassthrough    … サーバーの CORS ヘッダをそのまま通す（Vela が許可を作らない）
 //  LocalNetworkPolicy … Vela 独自のローカルネットワーク（LAN）への接続の制御（Chrome の PNA / LNA とは別物）
+//
+// ファイル: SiteUtil.swift（SiteUtil・IPAddressText）、Cookies.swift（CookieRecord・SetCookieParser・HTTPDate・CookiePolicy）、
+//           RedirectPolicy.swift、LocalNetworkPolicy.swift（IPClass・LocalNetworkPolicy）。このファイルは RequestContext と CORSPassthrough
+
+// MARK: - 要求の文脈
+
+/// 要求がどんな場面で出たか。Cookie・リダイレクト・LAN の判定に使う
+struct RequestContext: Sendable {
+    /// トップのページの URL（WebKit の mainDocumentURL）
+    var topURL: URL?
+    /// トップレベルの移動（ページそのものを開く要求）か
+    var isTopLevel = false
+    /// 要求を出したページ（Referer）。トップレベルの移動で、どこから来たかを見るのに使う
+    var initiator: URL?
+    /// リダイレクトの経路で、一度でもクロスサイトになったか（なったら、そのあとはずっとクロスサイト扱い）
+    var crossSiteChain = false
+    /// Cookie を送受信してよいか（URLRequest.httpShouldHandleCookies。Fetch の credentials: omit と同じものではない）
+    var cookiesAllowed = true
+    /// ユーザーがアドレス欄・ブックマークなどから開いた移動か（ページのリンクや JavaScript ではない）
+    var userInitiated = false
+    /// リダイレクトのとき、1 つ前の URL
+    var previousURL: URL?
+    /// どのタブの要求か（ログ用）
+    var tabID = 0
+
+    init(topURL: URL? = nil, isTopLevel: Bool = false, initiator: URL? = nil) {
+        self.topURL = topURL
+        self.isTopLevel = isTopLevel
+        self.initiator = initiator
+    }
+
+    /// リダイレクトで次の URL に進んだときの文脈
+    func redirected(from: URL, to next: URL) -> RequestContext {
+        var c = self
+        if !SiteUtil.isSameSite(from, next) { c.crossSiteChain = true }
+        c.previousURL = from
+        // トップレベルの移動なら、トップのページは移動先になる
+        if isTopLevel { c.topURL = next }
+        return c
+    }
+}
+
+// MARK: - CORS
+
+/// サーバーの Access-Control-* をそのまま通す。Vela が自分で許可を作ることはしない
+enum CORSPassthrough {
+    /// vnetsMode: 予備の vnets:// 方式（開発者向け）。そのときだけ、許可されたオリジンの https:// を vnets:// に読み替える
+    static func headers(_ server: [(String, String)], vnetsMode: Bool) -> [(String, String)] {
+        server.compactMap { k, v in
+            let lk = k.lowercased()
+            guard lk.hasPrefix("access-control-") else { return nil }
+            if vnetsMode && lk == "access-control-allow-origin" {
+                if v.lowercased().hasPrefix("https://") { return (k, "vnets://" + v.dropFirst(8)) }
+                if v.lowercased().hasPrefix("http://") { return (k, "vnet://" + v.dropFirst(7)) }
+            }
+            return (k, v)
+        }
+    }
+}
+
+// ======================================================================
+// MARK: - SiteUtil.swift
+// ======================================================================
+
+// 通信の決まりの部品（NetPolicy.swift の続き）。ホスト名の正規化・サイト・オリジン・IP アドレスの文字の読み取り
 
 // MARK: - サイト・オリジン
 
@@ -7150,43 +7215,11 @@ enum IPAddressText {
     }
 }
 
-// MARK: - 要求の文脈
+// ======================================================================
+// MARK: - Cookies.swift
+// ======================================================================
 
-/// 要求がどんな場面で出たか。Cookie・リダイレクト・LAN の判定に使う
-struct RequestContext: Sendable {
-    /// トップのページの URL（WebKit の mainDocumentURL）
-    var topURL: URL?
-    /// トップレベルの移動（ページそのものを開く要求）か
-    var isTopLevel = false
-    /// 要求を出したページ（Referer）。トップレベルの移動で、どこから来たかを見るのに使う
-    var initiator: URL?
-    /// リダイレクトの経路で、一度でもクロスサイトになったか（なったら、そのあとはずっとクロスサイト扱い）
-    var crossSiteChain = false
-    /// Cookie を送受信してよいか（URLRequest.httpShouldHandleCookies。Fetch の credentials: omit と同じものではない）
-    var cookiesAllowed = true
-    /// ユーザーがアドレス欄・ブックマークなどから開いた移動か（ページのリンクや JavaScript ではない）
-    var userInitiated = false
-    /// リダイレクトのとき、1 つ前の URL
-    var previousURL: URL?
-    /// どのタブの要求か（ログ用）
-    var tabID = 0
-
-    init(topURL: URL? = nil, isTopLevel: Bool = false, initiator: URL? = nil) {
-        self.topURL = topURL
-        self.isTopLevel = isTopLevel
-        self.initiator = initiator
-    }
-
-    /// リダイレクトで次の URL に進んだときの文脈
-    func redirected(from: URL, to next: URL) -> RequestContext {
-        var c = self
-        if !SiteUtil.isSameSite(from, next) { c.crossSiteChain = true }
-        c.previousURL = from
-        // トップレベルの移動なら、トップのページは移動先になる
-        if isTopLevel { c.topURL = next }
-        return c
-    }
-}
+// 通信の決まりの部品（NetPolicy.swift の続き）。Cookie 1 つの形・Set-Cookie の読み取り・送るかどうかの判定
 
 // MARK: - Cookie
 
@@ -7444,6 +7477,12 @@ enum CookiePolicy {
     }
 }
 
+// ======================================================================
+// MARK: - RedirectPolicy.swift
+// ======================================================================
+
+// 通信の決まりの部品（NetPolicy.swift の続き）。3xx から次の要求を作る
+
 // MARK: - リダイレクト
 
 enum RedirectPolicy {
@@ -7521,23 +7560,11 @@ enum RedirectPolicy {
     }
 }
 
-// MARK: - CORS
+// ======================================================================
+// MARK: - LocalNetworkPolicy.swift
+// ======================================================================
 
-/// サーバーの Access-Control-* をそのまま通す。Vela が自分で許可を作ることはしない
-enum CORSPassthrough {
-    /// vnetsMode: 予備の vnets:// 方式（開発者向け）。そのときだけ、許可されたオリジンの https:// を vnets:// に読み替える
-    static func headers(_ server: [(String, String)], vnetsMode: Bool) -> [(String, String)] {
-        server.compactMap { k, v in
-            let lk = k.lowercased()
-            guard lk.hasPrefix("access-control-") else { return nil }
-            if vnetsMode && lk == "access-control-allow-origin" {
-                if v.lowercased().hasPrefix("https://") { return (k, "vnets://" + v.dropFirst(8)) }
-                if v.lowercased().hasPrefix("http://") { return (k, "vnet://" + v.dropFirst(7)) }
-            }
-            return (k, v)
-        }
-    }
-}
+// 通信の決まりの部品（NetPolicy.swift の続き）。ローカルネットワーク（LAN）への接続の制御
 
 // MARK: - ローカルネットワーク（LAN）
 
@@ -8911,7 +8938,7 @@ final class ResponseParser {
 
 // MARK: - http の小さな道具（ヘッダ・gzip・ブラウザらしさ）
 //
-// Cookie は CookieJar.swift（WebKit の置き場の写し）と NetPolicy.swift の CookiePolicy に移した
+// Cookie は CookieJar.swift（WebKit の置き場の写し）と Cookies.swift の CookiePolicy に移した
 
 /// ヘッダ（名前, 値）の並び。名前の大文字小文字は区別しない
 extension Array where Element == (String, String) {

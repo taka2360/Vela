@@ -22,7 +22,7 @@ from pathlib import Path
 # つなげる順（ここに無いファイルは警告を出して、最後に名前順で足す）
 ORDER = [
     "MyApp", "BrowserView", "BrowserControls", "TabViews", "LibraryView", "DevPanel", "DevPanelPages", "SettingsView", "AdBlockView", "Downloads", "DownloadFiles", "BrowserStore", "BrowserTab", "Library", "LibraryModel", "AddressInput", "ErrorPages", "NetLog", "FilterLists", "ABPFilter", "BlockEngine", "ContentBlocker", "Persistence", "DevLog", "CrashLog", "VNetScheme", "HTTPSTakeover", "PageScripts",
-    "NetPolicy", "CookieJar", "HSTSStore",
+    "NetPolicy", "SiteUtil", "Cookies", "RedirectPolicy", "LocalNetworkPolicy", "CookieJar", "HSTSStore",
     "HTTPClient", "HTTPResponseParser", "HTTPSupport", "TLSClient",
     "GuestStack", "GuestTCP", "DNSMessage", "Packet",
     "VNetMachine", "VNetCore", "VNetDriver",

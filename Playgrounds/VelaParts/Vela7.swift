@@ -30,6 +30,71 @@ import Security
 //  RedirectPolicy     … 3xx から次の要求を作る（ここ以外では作らない）
 //  CORSPassthrough    … サーバーの CORS ヘッダをそのまま通す（Vela が許可を作らない）
 //  LocalNetworkPolicy … Vela 独自のローカルネットワーク（LAN）への接続の制御（Chrome の PNA / LNA とは別物）
+//
+// ファイル: SiteUtil.swift（SiteUtil・IPAddressText）、Cookies.swift（CookieRecord・SetCookieParser・HTTPDate・CookiePolicy）、
+//           RedirectPolicy.swift、LocalNetworkPolicy.swift（IPClass・LocalNetworkPolicy）。このファイルは RequestContext と CORSPassthrough
+
+// MARK: - 要求の文脈
+
+/// 要求がどんな場面で出たか。Cookie・リダイレクト・LAN の判定に使う
+struct RequestContext: Sendable {
+    /// トップのページの URL（WebKit の mainDocumentURL）
+    var topURL: URL?
+    /// トップレベルの移動（ページそのものを開く要求）か
+    var isTopLevel = false
+    /// 要求を出したページ（Referer）。トップレベルの移動で、どこから来たかを見るのに使う
+    var initiator: URL?
+    /// リダイレクトの経路で、一度でもクロスサイトになったか（なったら、そのあとはずっとクロスサイト扱い）
+    var crossSiteChain = false
+    /// Cookie を送受信してよいか（URLRequest.httpShouldHandleCookies。Fetch の credentials: omit と同じものではない）
+    var cookiesAllowed = true
+    /// ユーザーがアドレス欄・ブックマークなどから開いた移動か（ページのリンクや JavaScript ではない）
+    var userInitiated = false
+    /// リダイレクトのとき、1 つ前の URL
+    var previousURL: URL?
+    /// どのタブの要求か（ログ用）
+    var tabID = 0
+
+    init(topURL: URL? = nil, isTopLevel: Bool = false, initiator: URL? = nil) {
+        self.topURL = topURL
+        self.isTopLevel = isTopLevel
+        self.initiator = initiator
+    }
+
+    /// リダイレクトで次の URL に進んだときの文脈
+    func redirected(from: URL, to next: URL) -> RequestContext {
+        var c = self
+        if !SiteUtil.isSameSite(from, next) { c.crossSiteChain = true }
+        c.previousURL = from
+        // トップレベルの移動なら、トップのページは移動先になる
+        if isTopLevel { c.topURL = next }
+        return c
+    }
+}
+
+// MARK: - CORS
+
+/// サーバーの Access-Control-* をそのまま通す。Vela が自分で許可を作ることはしない
+enum CORSPassthrough {
+    /// vnetsMode: 予備の vnets:// 方式（開発者向け）。そのときだけ、許可されたオリジンの https:// を vnets:// に読み替える
+    static func headers(_ server: [(String, String)], vnetsMode: Bool) -> [(String, String)] {
+        server.compactMap { k, v in
+            let lk = k.lowercased()
+            guard lk.hasPrefix("access-control-") else { return nil }
+            if vnetsMode && lk == "access-control-allow-origin" {
+                if v.lowercased().hasPrefix("https://") { return (k, "vnets://" + v.dropFirst(8)) }
+                if v.lowercased().hasPrefix("http://") { return (k, "vnet://" + v.dropFirst(7)) }
+            }
+            return (k, v)
+        }
+    }
+}
+
+// ======================================================================
+// MARK: - SiteUtil.swift
+// ======================================================================
+
+// 通信の決まりの部品（NetPolicy.swift の続き）。ホスト名の正規化・サイト・オリジン・IP アドレスの文字の読み取り
 
 // MARK: - サイト・オリジン
 
@@ -196,43 +261,11 @@ enum IPAddressText {
     }
 }
 
-// MARK: - 要求の文脈
+// ======================================================================
+// MARK: - Cookies.swift
+// ======================================================================
 
-/// 要求がどんな場面で出たか。Cookie・リダイレクト・LAN の判定に使う
-struct RequestContext: Sendable {
-    /// トップのページの URL（WebKit の mainDocumentURL）
-    var topURL: URL?
-    /// トップレベルの移動（ページそのものを開く要求）か
-    var isTopLevel = false
-    /// 要求を出したページ（Referer）。トップレベルの移動で、どこから来たかを見るのに使う
-    var initiator: URL?
-    /// リダイレクトの経路で、一度でもクロスサイトになったか（なったら、そのあとはずっとクロスサイト扱い）
-    var crossSiteChain = false
-    /// Cookie を送受信してよいか（URLRequest.httpShouldHandleCookies。Fetch の credentials: omit と同じものではない）
-    var cookiesAllowed = true
-    /// ユーザーがアドレス欄・ブックマークなどから開いた移動か（ページのリンクや JavaScript ではない）
-    var userInitiated = false
-    /// リダイレクトのとき、1 つ前の URL
-    var previousURL: URL?
-    /// どのタブの要求か（ログ用）
-    var tabID = 0
-
-    init(topURL: URL? = nil, isTopLevel: Bool = false, initiator: URL? = nil) {
-        self.topURL = topURL
-        self.isTopLevel = isTopLevel
-        self.initiator = initiator
-    }
-
-    /// リダイレクトで次の URL に進んだときの文脈
-    func redirected(from: URL, to next: URL) -> RequestContext {
-        var c = self
-        if !SiteUtil.isSameSite(from, next) { c.crossSiteChain = true }
-        c.previousURL = from
-        // トップレベルの移動なら、トップのページは移動先になる
-        if isTopLevel { c.topURL = next }
-        return c
-    }
-}
+// 通信の決まりの部品（NetPolicy.swift の続き）。Cookie 1 つの形・Set-Cookie の読み取り・送るかどうかの判定
 
 // MARK: - Cookie
 
@@ -490,6 +523,12 @@ enum CookiePolicy {
     }
 }
 
+// ======================================================================
+// MARK: - RedirectPolicy.swift
+// ======================================================================
+
+// 通信の決まりの部品（NetPolicy.swift の続き）。3xx から次の要求を作る
+
 // MARK: - リダイレクト
 
 enum RedirectPolicy {
@@ -567,23 +606,11 @@ enum RedirectPolicy {
     }
 }
 
-// MARK: - CORS
+// ======================================================================
+// MARK: - LocalNetworkPolicy.swift
+// ======================================================================
 
-/// サーバーの Access-Control-* をそのまま通す。Vela が自分で許可を作ることはしない
-enum CORSPassthrough {
-    /// vnetsMode: 予備の vnets:// 方式（開発者向け）。そのときだけ、許可されたオリジンの https:// を vnets:// に読み替える
-    static func headers(_ server: [(String, String)], vnetsMode: Bool) -> [(String, String)] {
-        server.compactMap { k, v in
-            let lk = k.lowercased()
-            guard lk.hasPrefix("access-control-") else { return nil }
-            if vnetsMode && lk == "access-control-allow-origin" {
-                if v.lowercased().hasPrefix("https://") { return (k, "vnets://" + v.dropFirst(8)) }
-                if v.lowercased().hasPrefix("http://") { return (k, "vnet://" + v.dropFirst(7)) }
-            }
-            return (k, v)
-        }
-    }
-}
+// 通信の決まりの部品（NetPolicy.swift の続き）。ローカルネットワーク（LAN）への接続の制御
 
 // MARK: - ローカルネットワーク（LAN）
 

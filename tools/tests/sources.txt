@@ -1,5 +1,9 @@
 # テストに入れるアプリ側の .swift（UI・WebKit に頼らないものだけ。プロジェクトのフォルダからの相対パス）
 Sources/Policy/NetPolicy.swift
+Sources/Policy/SiteUtil.swift
+Sources/Policy/Cookies.swift
+Sources/Policy/RedirectPolicy.swift
+Sources/Policy/LocalNetworkPolicy.swift
 Sources/Policy/HSTSStore.swift
 Sources/Policy/CookieJar.swift
 Sources/HTTP/HTTPSupport.swift

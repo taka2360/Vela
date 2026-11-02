@@ -25,7 +25,7 @@ import Security
 // https:// と http://（予備の作りでは vnets:// と vnet://）の読み込みが全部ここに来る。
 // WebKit は画面のスレッドから呼ぶ。こちらも pending は画面のスレッドの上でだけ触る
 //
-// 守っていること（NetPolicy.swift の決まりを使う）:
+// 守っていること（Sources/Policy/ の決まりを使う）:
 // ・CORS はサーバーの答えをそのまま渡す（OPTIONS もサーバーに送る）。Vela が許可を作ることはしない
 // ・CSP・X-Frame-Options などの守りのヘッダは消さない（予備の vnets:// の作りだけは、書き換えと合わないので外す）
 // ・リダイレクトの次の要求は RedirectPolicy だけで作る（Authorization を別のオリジンへ持ち越さない・POST を二重に送らない）

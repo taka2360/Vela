@@ -44,7 +44,7 @@ UserNet（小さなルーター）→ Network.framework → インターネッ�
 > [!NOTE]
 > 1 つにまとめた `Playgrounds/VelaAll.swift` もありますが、大きすぎて Playgrounds が
 > 「Timed out waiting for a thunk to build after 30.0 seconds」で止まることがあります。ふつうは `VelaParts` の 10 個を使ってください。
-> `VelaAll.swift` と `VelaParts` を一緒に入れてはいけません。`Sources/` の 44 ファイルをそのまま入れても動きます。
+> `VelaAll.swift` と `VelaParts` を一緒に入れてはいけません。`Sources/` の 48 ファイルをそのまま入れても動きます。
 
 ## フォルダの構成
 
@@ -55,7 +55,8 @@ Sources/              アプリのソース（ここを直す）
   Browser/            ブラウザの中身: BrowserStore / BrowserTab / Library / LibraryModel / AddressInput /
                             ErrorPages / DownloadFiles / NetLog / Persistence / DevLog / CrashLog
   WebKitBridge/       VNet と WebKit: VNetScheme / HTTPSTakeover / PageScripts
-  Policy/             守り: NetPolicy / CookieJar / HSTSStore
+  Policy/             守り: NetPolicy / SiteUtil / Cookies / RedirectPolicy / LocalNetworkPolicy /
+                            CookieJar / HSTSStore
   AdBlock/            広告ブロック: FilterLists / ABPFilter / BlockEngine / ContentBlocker
   HTTP/               http: HTTPClient / HTTPResponseParser / HTTPSupport / TLSClient
   TCPIP/              TCP/IP: GuestStack / GuestTCP / DNSMessage / Packet
@@ -142,7 +143,7 @@ Vela 独自の守り（Cookie の判定・LAN の保護）は、VNet を通る�
 WebSocket と標準の通信には、WebKit のルールとページのスクリプトで、できる所まで LAN の保護をかけています
 （ホスト名で LAN に解決されるものは防げません。スクリプトの守りは回避される可能性があります）。
 
-## 守り（[`Sources/Policy/NetPolicy.swift`](Sources/Policy/NetPolicy.swift)）
+## 守り（[`Sources/Policy/`](Sources/Policy/)）
 
 - **CORS**: サーバーの `Access-Control-*` をそのまま渡します（Vela が許可を足すことはしません。OPTIONS もサーバーに送ります）
 - **CSP・X-Frame-Options** はそのまま渡します（予備の `vnets://` の作りだけは外します。この作りは開発者向けの実験で、安全ではありません）
