@@ -69,7 +69,7 @@ struct BookmarksPage: View {
     }
 
     private var renameShown: Binding<Bool> {
-        Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })
+        Binding.present({ renaming }, clear: { renaming = nil })
     }
 }
 

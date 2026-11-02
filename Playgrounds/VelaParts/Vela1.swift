@@ -76,7 +76,7 @@ struct BrowserView: View {
     }
 
     private var shareShown: Binding<Bool> {
-        Binding(get: { store.shareURL != nil }, set: { if !$0 { store.shareURL = nil } })
+        Binding.present({ store.shareURL }, clear: { store.shareURL = nil })
     }
 }
 
@@ -734,7 +734,7 @@ struct BookmarksPage: View {
     }
 
     private var renameShown: Binding<Bool> {
-        Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })
+        Binding.present({ renaming }, clear: { renaming = nil })
     }
 }
 

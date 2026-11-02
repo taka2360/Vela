@@ -44,7 +44,7 @@ struct BrowserView: View {
     }
 
     private var shareShown: Binding<Bool> {
-        Binding(get: { store.shareURL != nil }, set: { if !$0 { store.shareURL = nil } })
+        Binding.present({ store.shareURL }, clear: { store.shareURL = nil })
     }
 }
 

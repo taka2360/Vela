@@ -77,7 +77,7 @@ struct SettingsView: View {
     }
 
     private var confirmShown: Binding<Bool> {
-        Binding(get: { confirm != nil }, set: { if !$0 { confirm = nil } })
+        Binding.present({ confirm }, clear: { confirm = nil })
     }
 
     private func toggle(_ title: String, get: @escaping () -> Bool, set: @escaping (Bool) -> Void) -> some View {

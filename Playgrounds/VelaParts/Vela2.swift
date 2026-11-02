@@ -377,7 +377,7 @@ struct SettingsView: View {
     }
 
     private var confirmShown: Binding<Bool> {
-        Binding(get: { confirm != nil }, set: { if !$0 { confirm = nil } })
+        Binding.present({ confirm }, clear: { confirm = nil })
     }
 
     private func toggle(_ title: String, get: @escaping () -> Bool, set: @escaping (Bool) -> Void) -> some View {
@@ -792,7 +792,7 @@ struct DownloadsView: View {
                 .padding(.horizontal)
             }
         }
-        .sheet(isPresented: Binding(get: { sharing != nil }, set: { if !$0 { sharing = nil } })) {
+        .sheet(isPresented: Binding.present({ sharing }, clear: { sharing = nil })) {
             if let u = sharing { ShareSheet(items: [u]) }
         }
     }
@@ -857,6 +857,14 @@ struct ShareSheet: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+
+extension Binding where Value == Bool {
+    /// 「値があるあいだ出す」シート・アラート用（閉じられたら clear を呼ぶ）。
+    /// Binding(get: { x != nil }, set: { if !$0 { x = nil } }) と同じ
+    static func present<T>(_ value: @escaping () -> T?, clear: @escaping () -> Void) -> Binding<Bool> {
+        Binding(get: { value() != nil }, set: { if !$0 { clear() } })
+    }
 }
 
 // ======================================================================
