@@ -1399,7 +1399,7 @@ struct DevCookiePage: View {
         if c.secure { flags.append("Secure") }
         if c.httpOnly { flags.append("HttpOnly") }
         flags.append("SameSite=\(c.sameSite.rawValue)")
-        let exp = c.expires.map { "期限 \(DevTime.format($0)) \(Calendar.current.dateComponents([.day], from: Date(), to: $0).day ?? 0)日後" } ?? "セッション"
+        let exp = c.expires.map { "期限 \(DevDate.dateTime($0)) \(Calendar.current.dateComponents([.day], from: Date(), to: $0).day ?? 0)日後" } ?? "セッション"
         let v = c.value.count > 16 ? String(c.value.prefix(16)) + "…" : c.value
         return "\(c.domain)\(c.path)  \(c.name)=\(v)  [\(flags.joined(separator: " "))・\(exp)]"
     }
@@ -5636,6 +5636,23 @@ struct LogEntry: Sendable, Identifiable {
 
     var line: String {
         "\(LogEntry.timeFormat.string(from: time)) \(level.mark) [\(category.rawValue)\(tab.map { "#\($0)" } ?? "")] \(message)"
+    }
+}
+
+/// 開発者パネルの日時（端末の時刻で「2026-11-03 14:05」）。Cookie や HSTS の期限など、日付も要るもの用
+enum DevDate {
+    private static let lock = NSLock()
+    private static let formatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f
+    }()
+
+    static func dateTime(_ d: Date, timeZone: TimeZone = .current) -> String {
+        lock.lock(); defer { lock.unlock() }
+        formatter.timeZone = timeZone
+        return formatter.string(from: d)
     }
 }
 

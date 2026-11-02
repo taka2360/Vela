@@ -27,6 +27,13 @@ func foundationTests() {
         expect(after.first!.id < after.last!.id, "古い順")
         expect(log.export(minLevel: .error).isEmpty, "error はもう押し出された")
     }
+    test("開発者パネルの日時（DevDate）") {
+        let d = Date(timeIntervalSince1970: 1_793_700_000)   // 2026-11-03 10:00:00 UTC
+        expectEqual(DevDate.dateTime(d, timeZone: TimeZone(identifier: "UTC")!), "2026-11-03 10:00")
+        expectEqual(DevDate.dateTime(d, timeZone: TimeZone(identifier: "Asia/Tokyo")!), "2026-11-03 19:00")
+        expectEqual(DevDate.dateTime(d, timeZone: TimeZone(identifier: "America/Los_Angeles")!), "2026-11-03 02:00")
+        expectEqual(DevDate.dateTime(d, timeZone: TimeZone(identifier: "UTC")!), "2026-11-03 10:00")   // 前の時間帯が残らない
+    }
     test("消すと、重さごとの数も 0 に戻る") {
         let log = DevLog()
         log.add("w", level: .warning, category: .app)

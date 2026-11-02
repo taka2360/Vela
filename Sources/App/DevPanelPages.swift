@@ -116,7 +116,7 @@ struct DevCookiePage: View {
         if c.secure { flags.append("Secure") }
         if c.httpOnly { flags.append("HttpOnly") }
         flags.append("SameSite=\(c.sameSite.rawValue)")
-        let exp = c.expires.map { "期限 \(DevTime.format($0)) \(Calendar.current.dateComponents([.day], from: Date(), to: $0).day ?? 0)日後" } ?? "セッション"
+        let exp = c.expires.map { "期限 \(DevDate.dateTime($0)) \(Calendar.current.dateComponents([.day], from: Date(), to: $0).day ?? 0)日後" } ?? "セッション"
         let v = c.value.count > 16 ? String(c.value.prefix(16)) + "…" : c.value
         return "\(c.domain)\(c.path)  \(c.name)=\(v)  [\(flags.joined(separator: " "))・\(exp)]"
     }

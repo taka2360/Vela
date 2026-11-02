@@ -917,6 +917,23 @@ struct LogEntry: Sendable, Identifiable {
     }
 }
 
+/// 開発者パネルの日時（端末の時刻で「2026-11-03 14:05」）。Cookie や HSTS の期限など、日付も要るもの用
+enum DevDate {
+    private static let lock = NSLock()
+    private static let formatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f
+    }()
+
+    static func dateTime(_ d: Date, timeZone: TimeZone = .current) -> String {
+        lock.lock(); defer { lock.unlock() }
+        formatter.timeZone = timeZone
+        return formatter.string(from: d)
+    }
+}
+
 final class DevLog: @unchecked Sendable {
     static let maxEntries = 5000
     private let lock = NSLock()
