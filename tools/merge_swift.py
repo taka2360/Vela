@@ -19,7 +19,7 @@ import re
 import sys
 from pathlib import Path
 
-# README の順（ここに無いファイルは最後に名前順で足す）
+# つなげる順（ここに無いファイルは警告を出して、最後に名前順で足す）
 ORDER = [
     "MyApp", "BrowserView", "BrowserControls", "TabViews", "LibraryView", "DevPanel", "DevPanelPages", "SettingsView", "AdBlockView", "Downloads", "DownloadFiles", "BrowserStore", "BrowserTab", "Library", "LibraryModel", "AddressInput", "ErrorPages", "NetLog", "FilterLists", "ABPFilter", "BlockEngine", "ContentBlocker", "Persistence", "DevLog", "CrashLog", "VNetScheme", "HTTPSTakeover", "PageScripts",
     "NetPolicy", "CookieJar", "HSTSStore",
@@ -113,6 +113,12 @@ def main():
     if not files:
         sys.exit(f"{src_dir} に .swift ファイルがありません")
     names = [n for n in ORDER if n in files] + sorted(n for n in files if n not in ORDER)
+    for n in sorted(n for n in files if n not in ORDER):
+        print(f"  警告: {n}.swift が ORDER にありません（最後に足します）。tools/merge_swift.py の ORDER に足してください",
+              file=sys.stderr)
+    for n in ORDER:
+        if n not in files:
+            print(f"  警告: ORDER の {n}.swift が Sources にありません", file=sys.stderr)
 
     headers = []          # 順序を保って重複を除く
     bodies = []
