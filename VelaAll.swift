@@ -1,5 +1,5 @@
 // このファイルは merge_swift.py で自動生成したものです（直接編集しないでください）
-// 元ファイル: MyApp.swift, BrowserView.swift, BrowserControls.swift, TabViews.swift, LibraryView.swift, DevPanel.swift, AdBlockView.swift, Downloads.swift, DownloadFiles.swift, BrowserStore.swift, BrowserTab.swift, Library.swift, LibraryModel.swift, AddressInput.swift, ErrorPages.swift, FilterLists.swift, ABPFilter.swift, BlockEngine.swift, ContentBlocker.swift, Persistence.swift, DevLog.swift, CrashLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
+// 元ファイル: MyApp.swift, BrowserView.swift, BrowserControls.swift, TabViews.swift, LibraryView.swift, DevPanel.swift, DevPanelPages.swift, SettingsView.swift, AdBlockView.swift, Downloads.swift, DownloadFiles.swift, BrowserStore.swift, BrowserTab.swift, Library.swift, LibraryModel.swift, AddressInput.swift, ErrorPages.swift, NetLog.swift, FilterLists.swift, ABPFilter.swift, BlockEngine.swift, ContentBlocker.swift, Persistence.swift, DevLog.swift, CrashLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
 
 import SwiftUI
 import WebKit
@@ -65,6 +65,7 @@ struct BrowserView: View {
         .background(ShortcutKeys(store: store))
         .sheet(isPresented: $store.showDevPanel) { DevPanel(store: store) }
         .sheet(isPresented: $store.showAdBlock) { AdBlockView(adblock: store.adblock) }
+        .sheet(isPresented: $store.showSettings) { SettingsView(store: store) }
         .sheet(isPresented: $store.showLibrary) { LibraryView(store: store, library: store.library) }
         .sheet(isPresented: shareShown) { if let u = store.shareURL { ShareSheet(items: [u]) } }
         .fullScreenCover(isPresented: $store.showTabOverview) { TabOverview(store: store) }
@@ -314,6 +315,7 @@ struct MoreMenu: View {
             Button { store.close(tab) } label: { Label("このタブを閉じる", systemImage: "xmark.square") }
             Divider()
             Button { store.showAdBlock = true } label: { Label("広告ブロック", systemImage: "shield.lefthalf.filled") }
+            Button { store.showSettings = true } label: { Label("設定", systemImage: "gearshape") }
             Button { store.showDevPanel = true } label: { Label("開発者パネル", systemImage: "wrench.and.screwdriver") }
         } label: {
             Image(systemName: "ellipsis.circle")
@@ -1036,74 +1038,175 @@ struct SiteTile: View {
 // MARK: - DevPanel.swift
 // ======================================================================
 
-// MARK: - 開発者パネル（簡易版。完成版はフェーズ G）
+// MARK: - 開発者パネル（「…」メニュー・⌘⌥I から。普段の画面とは分ける）
 //
-// 通信の様子・タブごとの状態・ログ。普段の画面とは分けて、「…」メニューから開く
+// ページ: 概要・ログ・通信・タブ・Cookie・HSTS・広告ブロック・VNet・システム・範囲とリスク
+// 開いている間だけ、BrowserStore.devTick（0.5 秒ごと）で描き直す。どのページも、数が多いものは新しい方から数百件だけ出す
 
+enum DevPage: String, CaseIterable, Hashable {
+    case overview = "概要", log = "ログ", network = "通信", tabs = "タブ", cookies = "Cookie", hsts = "HSTS"
+    case adblock = "広告ブロック", vnet = "VNet", system = "システム", scope = "範囲とリスク"
+}
+
+@MainActor
 struct DevPanel: View {
     @ObservedObject var store: BrowserStore
     @Environment(\.dismiss) private var dismiss
+    @State private var page = DevPage.overview
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("開発者パネル").font(.headline)
                 Spacer()
-                Button("ログをコピー") { UIPasteboard.general.string = store.logs.export() }
-                Button(store.hadCrash ? "前回の記録をコピー（落ちた）" : "前回の記録をコピー") {
-                    UIPasteboard.general.string = CrashLog.previous() ?? "（前回の記録はありません）"
+                Menu {
+                    Button("ログをコピー") { UIPasteboard.general.string = store.logs.export() }
+                    Button("通信の記録をコピー") { UIPasteboard.general.string = store.netLog.export() }
+                    Button(store.hadCrash ? "前回の記録をコピー（落ちた）" : "前回の記録をコピー") {
+                        UIPasteboard.general.string = CrashLog.previous() ?? "（前回の記録はありません）"
+                    }
+                } label: {
+                    Label(store.hadCrash ? "コピー（前回は落ちた）" : "コピー", systemImage: "doc.on.doc")
                 }
-                .padding(.leading, 12)
                 Button("閉じる") { dismiss() }.padding(.leading, 12)
             }
-            DevStatus(store: store)
-            DevTabList(store: store)
-            DevLogView(text: store.logText)
+            DevPageBar(page: $page)
+            DevPageContent(store: store, page: page, tick: store.devTick)
         }
         .padding()
     }
 }
 
-struct DevStatus: View {
-    @ObservedObject var store: BrowserStore
+@MainActor
+struct DevPageBar: View {
+    @Binding var page: DevPage
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(store.takeover.description)
-            Text("新しいタブの通信: \(store.defaultMode.rawValue)")
-            Text("VNet: \(store.vnetStatus)")
-            Text("タブ \(store.tabs.count) 枚・動いている WebView \(store.liveWebViewCount) / \(BrowserStore.maxLiveWebViews)")
-            Text("Cookie（写し）\(store.cookieJar.count) 個・HSTS \(store.hsts.all().count) 件")
-            Text("広告ブロック: \(store.adblock.enabled ? "使う" : "止めている")・VNet 用のルール \(store.adblock.ruleCount) 個・止めた数 \(store.adblock.totalBlocked)")
-            Text("ネットワーク: \(store.isOnline ? "つながっている" : "つながっていない")・ダウンロード中 \(store.downloads.runningCount) 件")
-        }
-        .font(.system(size: 12, design: .monospaced))
-    }
-}
-
-struct DevTabList: View {
-    @ObservedObject var store: BrowserStore
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            ForEach(store.tabs) { tab in
-                DevTabRow(tab: tab, selected: tab.id == store.selectedID)
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(DevPage.allCases, id: \.self) { p in
+                    Button { page = p } label: {
+                        Text(p.rawValue)
+                            .font(.system(size: 13, weight: page == p ? .semibold : .regular))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(RoundedRectangle(cornerRadius: 7).fill(page == p ? Color.accentColor.opacity(0.2) : Color(UIColor.tertiarySystemFill)))
+                    }
+                    .buttonStyle(.plain)
+                }
             }
         }
-        .font(.system(size: 11, design: .monospaced))
     }
 }
 
-struct DevTabRow: View {
-    @ObservedObject var tab: BrowserTab
-    let selected: Bool
+@MainActor
+struct DevPageContent: View {
+    @ObservedObject var store: BrowserStore
+    let page: DevPage
+    /// 変わると描き直す（中身は使わない）
+    let tick: Int
 
     var body: some View {
-        Text("\(selected ? "▶" : " ") #\(tab.id) [\(tab.mode.short)・\(tab.state.rawValue)\(tab.isLoading ? "・読み込み中 \(Int(tab.progress * 100))%" : "")] \(tab.url?.absoluteString ?? "（空）")")
-            .lineLimit(1)
+        switch page {
+        case .overview: DevOverview(store: store)
+        case .log: DevLogPage(store: store)
+        case .network: DevNetworkPage(store: store)
+        case .tabs: DevTabsPage(store: store)
+        case .cookies: DevCookiePage(store: store)
+        case .hsts: DevHSTSPage(store: store)
+        case .adblock: DevAdBlockPage(store: store, adblock: store.adblock)
+        case .vnet: DevVNetPage(store: store)
+        case .system: DevSystemPage(store: store)
+        case .scope: DevScopePage()
+        }
     }
 }
 
+/// 等幅の小さな文字の行
+@MainActor
+struct DevLine: View {
+    let text: String
+    init(_ text: String) { self.text = text }
+    var body: some View {
+        Text(text).font(.system(size: 12, design: .monospaced)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
+    }
+}
+
+// MARK: 概要
+
+@MainActor
+struct DevOverview: View {
+    @ObservedObject var store: BrowserStore
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 4) {
+                Group {
+                DevLine(store.takeover.description)
+                DevLine("新しいタブの通信: \(store.defaultMode.rawValue)")
+                DevLine("VNet: \(store.vnetStatus)")
+                DevLine("タブ \(store.tabs.count) 枚・動いている WebView \(store.liveWebViewCount) / \(BrowserStore.maxLiveWebViews)")
+                DevLine("Cookie（写し）\(store.cookieJar.count) 個・HSTS \(store.hsts.all().count) 件")
+                DevLine("広告ブロック: \(store.adblock.enabled ? "使う" : "止めている")・VNet 用のルール \(store.adblock.ruleCount) 個・止めた数 \(store.adblock.totalBlocked)")
+                DevLine("ネットワーク: \(store.isOnline ? "つながっている" : "つながっていない")・ダウンロード中 \(store.downloads.runningCount) 件")
+                DevLine("ログ: 警告 \(store.logs.count(.warning))・エラー \(store.logs.count(.error))・通信の記録 \(store.netLog.count) 件")
+                if store.hadCrash { DevLine("⚠️ 前回は落ちて終わりました（右上の「コピー」→ 前回の記録）") }
+                }
+                Divider().padding(.vertical, 6)
+                Text("最近の警告・エラー").font(.subheadline)
+                ForEach(store.logs.all().filter { $0.level >= .warning }.suffix(30).reversed()) { e in
+                    DevLine(e.line).foregroundColor(e.level == .error ? .red : .orange)
+                }
+            }
+        }
+    }
+}
+
+// MARK: ログ
+
+@MainActor
+struct DevLogPage: View {
+    @ObservedObject var store: BrowserStore
+    @State private var minLevel = LogLevel.info
+    @State private var category: LogCategory?
+    @State private var onlyThisTab = false
+    @State private var query = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                Menu("重さ: \(levelName(minLevel)) 以上") {
+                    ForEach(LogLevel.allCases, id: \.self) { l in Button(levelName(l)) { minLevel = l } }
+                }
+                Menu("種類: \(category?.rawValue ?? "全部")") {
+                    Button("全部") { category = nil }
+                    ForEach(LogCategory.allCases, id: \.self) { c in Button(c.rawValue) { category = c } }
+                }
+                Toggle("このタブだけ", isOn: $onlyThisTab).fixedSize()
+                TextField("探す", text: $query).textFieldStyle(.roundedBorder).autocorrectionDisabled().textInputAutocapitalization(.never)
+                Button("コピー") { UIPasteboard.general.string = filtered.map { $0.line }.joined(separator: "\n") }
+                Button("消す") { store.logs.clear() }
+            }
+            .font(.system(size: 13))
+            DevLogView(text: filtered.suffix(400).map { $0.line }.joined(separator: "\n"))
+        }
+    }
+
+    private var filtered: [LogEntry] {
+        let tab = onlyThisTab ? store.selectedID : nil
+        let q = query.lowercased()
+        return store.logs.all().filter { e in
+            e.level >= minLevel && (category == nil || e.category == category) && (tab == nil || e.tab == tab)
+                && (q.isEmpty || e.message.lowercased().contains(q))
+        }
+    }
+
+    private func levelName(_ l: LogLevel) -> String {
+        switch l { case .debug: return "細かい"; case .info: return "普通"; case .warning: return "警告"; case .error: return "エラー" }
+    }
+}
+
+@MainActor
 struct DevLogView: View {
     let text: String
 
@@ -1121,6 +1224,435 @@ struct DevLogView: View {
             .clipShape(RoundedRectangle(cornerRadius: 6))
             .onChange(of: text) { _ in proxy.scrollTo("end", anchor: .bottom) }
         }
+    }
+}
+
+// MARK: タブ
+
+@MainActor
+struct DevTabsPage: View {
+    @ObservedObject var store: BrowserStore
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(store.tabs) { tab in
+                    DevTabBlock(tab: tab, selected: tab.id == store.selectedID)
+                }
+            }
+        }
+    }
+}
+
+@MainActor
+struct DevTabBlock: View {
+    @ObservedObject var tab: BrowserTab
+    let selected: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            DevLine("\(selected ? "▶" : " ") #\(tab.id) [\(tab.mode.short)・\(tab.state.rawValue)\(tab.isLoading ? "・読み込み中 \(Int(tab.progress * 100))%" : "")]"
+                    + "・WebView \(tab.webView == nil ? "なし" : "あり")・文字 \(PageZoom.percent(tab.zoom))・ブロック \(tab.blockedCount)")
+            DevLine("   \(tab.url?.absoluteString ?? "（空）")")
+            if !tab.nonVNetUsage.isEmpty { DevLine("   VNet を通らない通信: \(tab.nonVNetUsage.sorted().joined(separator: "・"))") }
+            ForEach(Array(tab.navEvents.suffix(8).enumerated()), id: \.offset) { _, ev in
+                DevLine("   \(DevTime.format(ev.0)) \(ev.1)").foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+enum DevTime {
+    static let formatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+    static func format(_ d: Date) -> String { formatter.string(from: d) }
+}
+
+// ======================================================================
+// MARK: - DevPanelPages.swift
+// ======================================================================
+
+// MARK: - 開発者パネルのページ（通信・Cookie・HSTS・広告ブロック・VNet・システム・範囲とリスク）
+
+// MARK: 通信
+
+@MainActor
+struct DevNetworkPage: View {
+    @ObservedObject var store: BrowserStore
+    @State private var onlyProblems = false
+    @State private var onlyThisTab = false
+    @State private var query = ""
+    @State private var opened: Int?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                Toggle("失敗・ブロックだけ", isOn: $onlyProblems).fixedSize()
+                Toggle("このタブだけ", isOn: $onlyThisTab).fixedSize()
+                TextField("URL を探す", text: $query).textFieldStyle(.roundedBorder).autocorrectionDisabled().textInputAutocapitalization(.never)
+                Button("消す") { store.netLog.clear() }
+            }
+            .font(.system(size: 13))
+            Text("VNet が引き受けた要求だけを記録します（標準の通信のタブ・WebSocket は入りません）。行を押すと、途中で決めたことが出ます")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 3) {
+                    ForEach(records) { r in
+                        DevNetRow(record: r, opened: opened == r.id) { opened = opened == r.id ? nil : r.id }
+                    }
+                }
+            }
+        }
+    }
+
+    private var records: [NetRecord] {
+        let tab = onlyThisTab ? store.selectedID : nil
+        let q = query.lowercased()
+        return store.netLog.recent(limit: 300) { r in
+            (!onlyProblems || r.isProblem) && (tab == nil || r.tab == tab) && (q.isEmpty || r.url.lowercased().contains(q))
+        }
+    }
+}
+
+@MainActor
+struct DevNetRow: View {
+    let record: NetRecord
+    let opened: Bool
+    let toggle: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text("\(DevTime.format(record.started)) \(record.tab.map { "#\($0) " } ?? "")\(record.line)")
+                .font(.system(size: 11, design: .monospaced))
+                .lineLimit(opened ? nil : 1)
+                .foregroundColor(color)
+            if opened {
+                ForEach(Array(record.notes.enumerated()), id: \.offset) { _, n in
+                    Text("    " + n).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                }
+                if record.notes.isEmpty {
+                    Text("    （メモなし）").font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: toggle)
+    }
+
+    private var color: Color {
+        switch record.outcome {
+        case .blocked: return .purple
+        case .failed: return .red
+        case .pending: return .secondary
+        default: return (record.status ?? 0) >= 400 ? .orange : .primary
+        }
+    }
+}
+
+// MARK: Cookie
+
+@MainActor
+struct DevCookiePage: View {
+    @ObservedObject var store: BrowserStore
+    @State private var query = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                TextField("ドメイン・名前で探す", text: $query).textFieldStyle(.roundedBorder).autocorrectionDisabled().textInputAutocapitalization(.never)
+                Text("\(cookies.count) / \(store.cookieJar.count) 個").font(.system(size: 13))
+            }
+            Text("VNet が使う Cookie の写し（正本は WebKit の置き場）。値は先頭だけ出します。消すのは 設定 → データ からできます")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 3) {
+                    ForEach(Array(cookies.prefix(500).enumerated()), id: \.offset) { _, c in
+                        DevLine(describe(c))
+                    }
+                }
+            }
+        }
+    }
+
+    private var cookies: [CookieRecord] {
+        let q = query.lowercased()
+        return store.cookieJar.snapshot()
+            .filter { q.isEmpty || $0.domain.contains(q) || $0.name.lowercased().contains(q) }
+            .sorted { ($0.domain, $0.name) < ($1.domain, $1.name) }
+    }
+
+    private func describe(_ c: CookieRecord) -> String {
+        var flags: [String] = []
+        if c.hostOnly { flags.append("host-only") }
+        if c.secure { flags.append("Secure") }
+        if c.httpOnly { flags.append("HttpOnly") }
+        flags.append("SameSite=\(c.sameSite.rawValue)")
+        let exp = c.expires.map { "期限 \(DevTime.format($0)) \(Calendar.current.dateComponents([.day], from: Date(), to: $0).day ?? 0)日後" } ?? "セッション"
+        let v = c.value.count > 16 ? String(c.value.prefix(16)) + "…" : c.value
+        return "\(c.domain)\(c.path)  \(c.name)=\(v)  [\(flags.joined(separator: " "))・\(exp)]"
+    }
+}
+
+// MARK: HSTS
+
+@MainActor
+struct DevHSTSPage: View {
+    @ObservedObject var store: BrowserStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("HSTS の記録 \(store.hsts.all().count) 件（このホストは http でも https で開く）").font(.system(size: 13))
+                Spacer()
+                Button("全部消す") { store.clearHSTS() }
+            }
+            List {
+                ForEach(store.hsts.all().sorted { $0.host < $1.host }, id: \.host) { e in
+                    DevLine("\(e.host)\(e.includeSubDomains ? "（サブドメインも）" : "")  期限 \(e.expires)")
+                }
+                .onDelete { idx in
+                    let hosts = store.hsts.all().sorted { $0.host < $1.host }.map { $0.host }
+                    for i in idx { store.hsts.remove(hosts[i]) }
+                }
+            }
+            .listStyle(.plain)
+        }
+    }
+}
+
+// MARK: 広告ブロック
+
+@MainActor
+struct DevAdBlockPage: View {
+    @ObservedObject var store: BrowserStore
+    @ObservedObject var adblock: AdBlocker
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 4) {
+                DevLine("状態: \(adblock.enabled ? "使う" : "止めている")・\(adblock.status)")
+                DevLine("VNet 用のルール \(adblock.ruleCount) 個・起動してから止めた数 \(adblock.totalBlocked)")
+                DevLine("止めているサイト: \(adblock.disabledSites.isEmpty ? "なし" : adblock.disabledSites.sorted().joined(separator: ", "))")
+                ForEach(adblock.lists) { l in
+                    DevLine("\(l.enabled ? "●" : "○") \(l.name): 通信 \(l.networkRules)・隠す \(l.cosmeticRules)・対応外 \(l.unsupported)"
+                            + "・WebKit \(l.netID == nil ? "なし" : "通信あり")/\(l.cosID == nil ? "なし" : "隠すあり")\(l.lastError.map { "・⚠️ \($0)" } ?? "")")
+                }
+                Divider().padding(.vertical, 6)
+                Text("最近止めたもの").font(.subheadline)
+                ForEach(store.netLog.recent(limit: 100) { if case .blocked = $0.outcome { return true } else { return false } }) { r in
+                    DevLine("\(DevTime.format(r.started)) \(r.tab.map { "#\($0) " } ?? "")\(r.url)")
+                    if case .blocked(let rule) = r.outcome { DevLine("    \(rule)").foregroundStyle(.secondary) }
+                }
+            }
+        }
+    }
+}
+
+// MARK: VNet
+
+@MainActor
+struct DevVNetPage: View {
+    @ObservedObject var store: BrowserStore
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 4) {
+                DevLine(store.takeover.description)
+                DevLine("新しいタブの通信: \(store.defaultMode.rawValue)")
+                if let s = store.vnetStats {
+                    DevLine("IP: \(s.ready ? s.ip : "（まだ）")")
+                    DevLine("フレーム: 送 \(s.framesOut)（\(s.bytesOut / 1024)KB）・受 \(s.framesIn)（\(s.bytesIn / 1024)KB）・捨てた \(s.droppedRx)")
+                    DevLine("TCP: 送り直し \(s.tcpRetransmits)・順番を直した \(s.tcpReordered)")
+                    DevLine("接続: 新しく \(s.pool.opened)・使い回し \(s.pool.reused)・使用中 \(s.pool.busy)・空き \(s.pool.idle)・待ち \(s.pool.waiting)")
+                    DevLine("読み途中の中身: \(s.pool.bufferedBytes / 1024)KB・DNS の覚え \(s.pool.dnsCached) 件")
+                } else {
+                    DevLine("（数字を集めています…）")
+                }
+                let limits = PoolLimits()
+                DevLine("上限: 1 要求 \(limits.maxBodyPerRequest >> 20)MB・全体の読み途中 \(limits.maxBufferedTotal >> 20)MB・接続 ホストごと \(limits.maxPerHost)・全体 \(limits.maxTotalConnections)・待ち \(limits.maxWaiting)")
+                Divider().padding(.vertical, 6)
+                Text("最近の VNet・通信のログ").font(.subheadline)
+                ForEach(store.logs.all().filter { $0.category == .vnet || $0.category == .net }.suffix(60).reversed()) { e in
+                    DevLine(e.line)
+                }
+            }
+        }
+    }
+}
+
+// MARK: システム
+
+@MainActor
+struct DevSystemPage: View {
+    @ObservedObject var store: BrowserStore
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 4) {
+                let p = ProcessInfo.processInfo
+                DevLine("OS: \(p.operatingSystemVersionString)")
+                DevLine("メモリ（端末）: \(p.physicalMemory >> 20)MB・CPU \(p.activeProcessorCount) 個")
+                DevLine("起動してから: \(Int(Date().timeIntervalSince(store.launchedAt)) / 60) 分")
+                DevLine("動いている WebView: \(store.liveWebViewCount) 枚（上限 \(BrowserStore.maxLiveWebViews)）")
+                DevLine("ブックマーク \(store.library.bookmarks.items.count) 件・履歴 \(store.library.history.entries.count) 件")
+                Divider().padding(.vertical, 6)
+                Text("データのファイル（Application Support/Vela）").font(.subheadline)
+                ForEach(DevFiles.list(), id: \.0) { f in DevLine("\(f.0)  \(f.1 / 1024)KB") }
+            }
+        }
+    }
+}
+
+enum DevFiles {
+    /// Vela のデータのフォルダの中身（名前, 大きさ）。filters の中も数える
+    static func list() -> [(String, Int)] {
+        let fm = FileManager.default
+        let dir = JSONFile<SessionData>.defaultDirectory()
+        guard let e = fm.enumerator(at: dir, includingPropertiesForKeys: [.fileSizeKey]) else { return [] }
+        var out: [(String, Int)] = []
+        for case let u as URL in e {
+            let size = (try? u.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            if size > 0 { out.append((u.path.replacingOccurrences(of: dir.path + "/", with: ""), size)) }
+        }
+        return out.sorted { $0.0 < $1.0 }
+    }
+}
+
+// MARK: 範囲とリスク
+
+@MainActor
+struct DevScopePage: View {
+    var body: some View {
+        ScrollView {
+            Text(DevScopePage.text).font(.system(size: 13)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
+        }
+    }
+
+    static let text = """
+    【VNet が処理するもの】
+    ・ページ本体とサブリソースの http / https（HTTP/1.1）、fetch・XHR、リダイレクト
+    ・Vela 独自の守り（Cookie の判定・LAN の保護・HSTS・広告ブロックの判定と数）は、VNet を通る通信にだけ効く
+
+    【VNet が処理しないもの・未対応】
+    ・WebSocket（ws / wss）は VNet を通らない（WebKit が直接つなぐ）。LAN の保護は WebKit のルールとスクリプトで補うが、名前で LAN に向くものは防げない
+    ・HTTP/2・HTTP/3・TLS 1.3・IPv6 は未対応（TLS 1.3 だけのサーバーは「標準の通信で開く」）
+    ・標準の通信のタブは、全部 WebKit が処理する（通信の記録・広告ブロックの数は出ない）
+
+    【受け入れたリスク】
+    ・https の横取りに非公開の API を使う（WKWebView.handlesURLScheme の差し替え、_willPerformRedirection）。iOS が変わると動かなくなることがある。確かめていない iOS の版では使わず、失敗したら元に戻して標準の通信にする。設定の「VNet を使わない」で止められる
+    ・TLS は SecureTransport（2019 年から非推奨・TLS 1.2 まで）を使っている
+    ・サードパーティ Cookie は既定でブロックする。Safari の ITP や Storage Access API の例外は再現していない
+    ・広告ブロックは、スクリプトを使う書き方・正規表現・$redirect などに対応しない
+    ・Cookie の正本は WebKit の置き場。VNet は写しを使うので、ページの JavaScript が変えた直後は少し遅れることがある
+    """
+}
+
+// ======================================================================
+// MARK: - SettingsView.swift
+// ======================================================================
+
+// MARK: - 設定（「…」メニューから）
+//
+// 値は VelaSettings（UserDefaults）。すぐ効くもの（検索エンジン・Cookie の決まり・HTTPS-First など）は BrowserStore.applySettings で入れ直す。
+// 通信の作りを決めるもの（VNet を使わない など）は、アプリを起動し直したときに効く
+
+@MainActor
+struct SettingsView: View {
+    @ObservedObject var store: BrowserStore
+    @Environment(\.dismiss) private var dismiss
+    /// 変えたら描き直す（VelaSettings は @Published ではないので）
+    @State private var tick = 0
+    @State private var confirm: DataAction?
+
+    enum DataAction: String, Identifiable {
+        case history = "履歴を全部消す"
+        case websiteData = "Cookie とサイトのデータを全部消す"
+        case hsts = "HSTS の記録を消す"
+        var id: String { rawValue }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("設定").font(.headline)
+                Spacer()
+                Button("完了") { dismiss() }
+            }
+            .padding()
+            List {
+                Section {
+                    Picker("検索エンジン", selection: engine) {
+                        ForEach(SearchEngine.allCases, id: \.self) { e in Text(e.name).tag(e) }
+                    }
+                    toggle("HTTPS-First（http のページはまず https で開く）", get: { VelaSettings.httpsFirst }, set: { VelaSettings.httpsFirst = $0 })
+                } header: { Text("ブラウズ") }
+
+                Section {
+                    toggle("サードパーティ Cookie をブロック", get: { VelaSettings.blockThirdPartyCookies }, set: { VelaSettings.blockThirdPartyCookies = $0 })
+                    toggle("SameSite の無い Cookie を Lax として扱う", get: { VelaSettings.cookiesLaxByDefault }, set: { VelaSettings.cookiesLaxByDefault = $0 })
+                    toggle("LAN の保護（公開のサイトから LAN の機器に届かせない）※起動し直すと効く", get: { VelaSettings.localNetworkProtection },
+                           set: { VelaSettings.localNetworkProtection = $0 })
+                } header: { Text("プライバシーと守り") } footer: { Text("Cookie の決まりは VNet のタブに効きます") }
+
+                Section {
+                    toggle("VNet でページを読めなかったら、標準の通信に自動で切り替える", get: { VelaSettings.autoFallbackToNative }, set: { VelaSettings.autoFallbackToNative = $0 })
+                    toggle("VNet を使わない（標準の通信だけ）※起動し直すと効く", get: { VelaSettings.vnetDisabled }, set: { VelaSettings.vnetDisabled = $0 })
+                } header: { Text("通信") } footer: { Text("いまの状態: \(store.takeover.description)") }
+
+                Section {
+                    toggle("Web インスペクタ（Mac の Safari からつなぐ）", get: { VelaSettings.webInspector }, set: { VelaSettings.webInspector = $0 })
+                    toggle("確かめていない iOS の版でも https の横取りを試す ※起動し直すと効く", get: { VelaSettings.allowUntestedOS }, set: { VelaSettings.allowUntestedOS = $0 })
+                    toggle("横取りできないとき vnets:// の作りを使う（安全ではない）※起動し直すと効く", get: { VelaSettings.legacyVNetsFallback },
+                           set: { VelaSettings.legacyVNetsFallback = $0 })
+                } header: { Text("開発者向け") }
+
+                Section {
+                    ForEach([DataAction.history, .websiteData, .hsts]) { a in
+                        Button(role: .destructive) { confirm = a } label: { Text(a.rawValue) }
+                    }
+                } header: { Text("データ") } footer: { Text("ブックマークとダウンロードしたファイルは消えません") }
+            }
+            .listStyle(.insetGrouped)
+            .id(tick)
+        }
+        .alert(confirm?.rawValue ?? "", isPresented: confirmShown) {
+            Button("キャンセル", role: .cancel) { confirm = nil }
+            Button("消す", role: .destructive) { run(confirm) }
+        } message: {
+            Text("元に戻せません")
+        }
+    }
+
+    private var engine: Binding<SearchEngine> {
+        Binding(get: { VelaSettings.searchEngine }, set: { VelaSettings.searchEngine = $0; changed() })
+    }
+
+    private var confirmShown: Binding<Bool> {
+        Binding(get: { confirm != nil }, set: { if !$0 { confirm = nil } })
+    }
+
+    private func toggle(_ title: String, get: @escaping () -> Bool, set: @escaping (Bool) -> Void) -> some View {
+        Toggle(title, isOn: Binding(get: get, set: { v in set(v); changed() }))
+    }
+
+    private func changed() {
+        tick += 1
+        store.applySettings()
+    }
+
+    private func run(_ a: DataAction?) {
+        switch a {
+        case .history?: store.library.clearHistory(since: nil)
+        case .websiteData?: store.clearWebsiteData()
+        case .hsts?: store.clearHSTS()
+        case nil: break
+        }
+        confirm = nil
     }
 }
 
@@ -1880,8 +2412,15 @@ final class BrowserStore: ObservableObject {
     /// VNet の様子（ツールバー・開発者パネル用）
     @Published private(set) var vnetReady = false
     @Published private(set) var vnetStatus = "準備中…"
-    /// 開発者パネルのログ（パネルを開いている間だけ更新する）
-    @Published private(set) var logText = ""
+    /// 開発者パネルを描き直す合図（パネルを開いている間だけ、0.5 秒ごとに増える）
+    @Published private(set) var devTick = 0
+    /// VNet の数字（開発者パネル用）
+    @Published private(set) var vnetStats: VNetMachine.Stats?
+    @Published var showSettings = false
+    /// 起動した時刻
+    let launchedAt = Date()
+    /// 通信の記録（VNet が引き受けた要求 1 つずつ）
+    let netLog = NetLog()
     @Published var showDownloads = false
     /// 前回は落ちて終わった（開発者パネルで前回の記録を見られる）
     @Published private(set) var hadCrash = false
@@ -2265,14 +2804,43 @@ final class BrowserStore: ObservableObject {
             Task { @MainActor in
                 store?.vnetReady = s.ready
                 store?.vnetStatus = text
+                if store?.showDevPanel == true { store?.vnetStats = s }
             }
         }
     }
 
     private func flushLogIfVisible() {
-        guard showDevPanel, let t = logs.take(lines: 400) else { return }
-        logText = t
+        guard showDevPanel else { return }
+        devTick += 1
     }
+
+    // MARK: 設定・データ
+
+    /// Cookie の決まりなど、すぐ効かせられる設定を入れ直す
+    func applySettings() {
+        cookieJar.settings = VelaSettings.cookiePolicy
+        for t in tabs { t.applySettings() }
+        logs.add("設定を変えました", level: .info, category: .app)
+    }
+
+    /// Cookie・キャッシュ・サイトのデータを消す
+    func clearWebsiteData() {
+        let types = WKWebsiteDataStore.allWebsiteDataTypes()
+        WKWebsiteDataStore.default().removeData(ofTypes: types, modifiedSince: Date.distantPast) { [weak self] in
+            let store = self
+            Task { @MainActor in
+                store?.cookieJar.removeAll()
+                store?.logs.add("Cookie とサイトのデータを消しました", level: .info, category: .cookie)
+            }
+        }
+    }
+
+    func clearHSTS() {
+        hsts.removeAll()
+        logs.add("HSTS の記録を消しました", level: .info, category: .security)
+    }
+
+    func clearClosedTabs() { closedTabs = [] }
 }
 
 // ======================================================================
@@ -2333,6 +2901,8 @@ final class BrowserTab: ObservableObject, Identifiable {
     private var httpsFirstFrom: URL?
     /// HTTPS-First で「http のまま開く」を選んだホスト
     private var httpAllowedHosts = Set<String>()
+    /// 移動の出来事（開発者パネル。最新 200 件）
+    private(set) var navEvents: [(Date, String)] = []
     /// いま入れている広告ブロックの WebKit のルール
     private var adRuleLists: [WKContentRuleList] = []
     /// エラーページを出した URL（履歴に入れない）
@@ -2433,6 +3003,8 @@ final class BrowserTab: ObservableObject, Identifiable {
                 Task { @MainActor in tab?.vnetFailed(u, e) }
             }
             s.blocker = store.adblock.box
+            s.netLog = store.netLog
+            s.tabID = id
             s.onBlocked = { [weak self] _, _ in
                 let tab = self
                 Task { @MainActor in tab?.noteBlocked() }
@@ -2789,6 +3361,14 @@ final class BrowserTab: ObservableObject, Identifiable {
 
     func navigationEvent(_ s: String, level: LogLevel = .info) {
         log(s, level: level)
+        navEvents.append((Date(), s))
+        if navEvents.count > 200 { navEvents.removeFirst(navEvents.count - 200) }
+    }
+
+    /// 設定を変えたとき（すぐ効かせられるものだけ）
+    func applySettings() {
+        scheme?.httpsFirst = VelaSettings.httpsFirst
+        if #available(iOS 16.4, *) { webView?.isInspectable = VelaSettings.webInspector }
     }
 
     func didFinish() {
@@ -3627,6 +4207,148 @@ enum ErrorPage {
             }
         }
         return o
+    }
+}
+
+// ======================================================================
+// MARK: - NetLog.swift
+// ======================================================================
+
+// MARK: - 通信の記録（開発者パネルの「通信」。VNet が引き受けた要求 1 つずつ）
+//
+// 要求ごとに、メソッド・URL・種類・結果（返事の番号・大きさ・かかった時間）と、途中で決めたこと
+// （HSTS で https に上げた・リダイレクト・Cookie を保存した・広告ブロックで止めた など）をメモとして持つ。
+// 最新 maxRecords 件まで。どのスレッドから書いてもよい
+
+struct NetRecord: Identifiable, Sendable, Equatable {
+    enum Outcome: Sendable, Equatable {
+        case pending
+        case ok
+        case failed(String)
+        case blocked(String)
+        case cancelled
+        case download
+
+        var label: String {
+            switch self {
+            case .pending: return "…"
+            case .ok: return "完了"
+            case .failed: return "失敗"
+            case .blocked: return "ブロック"
+            case .cancelled: return "取り消し"
+            case .download: return "ダウンロード"
+            }
+        }
+    }
+
+    let id: Int
+    let tab: Int?
+    let started: Date
+    var method: String
+    var url: String
+    /// 種類（ページ・画像・スクリプト など。当て推量）
+    var kind: String
+    var topLevel: Bool
+    var status: Int?
+    var bytes = 0
+    var finished: Date?
+    var outcome = Outcome.pending
+    var notes: [String] = []
+
+    var durationMs: Int? { finished.map { Int($0.timeIntervalSince(started) * 1000) } }
+    var isProblem: Bool {
+        switch outcome {
+        case .failed, .blocked: return true
+        default: return (status ?? 0) >= 400
+        }
+    }
+
+    /// 1 行の説明
+    var line: String {
+        let st = status.map(String.init) ?? outcome.label
+        let ms = durationMs.map { "\($0)ms" } ?? "…"
+        let kb = bytes > 0 ? "・\(bytes / 1024)KB" : ""
+        var s = "\(st) \(method) \(kind)\(topLevel ? "（ページ）" : "") \(ms)\(kb) \(url)"
+        switch outcome {
+        case .failed(let m): s += "  ✕ \(m)"
+        case .blocked(let r): s += "  🚫 \(r)"
+        default: break
+        }
+        return s
+    }
+}
+
+final class NetLog: @unchecked Sendable {
+    static let maxRecords = 1000
+    private let lock = NSLock()
+    private var records: [NetRecord] = []
+    private var positions: [Int: Int] = [:]     // id → records の中の位置
+    private var nextID = 1
+    /// 変わるたびに増える（画面が描き直すかを決める）
+    private(set) var version = 0
+
+    init() {}
+
+    /// 始まった要求を記録して、番号を返す
+    func begin(tab: Int?, method: String, url: String, kind: String, topLevel: Bool, now: Date = Date()) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let id = nextID
+        nextID += 1
+        records.append(NetRecord(id: id, tab: tab, started: now, method: method, url: url, kind: kind, topLevel: topLevel))
+        positions[id] = records.count - 1
+        if records.count > NetLog.maxRecords + 100 {
+            // まとめて古いものを捨てる（1 件ずつだと位置の付け直しが重い）
+            records.removeFirst(records.count - NetLog.maxRecords)
+            positions = [:]
+            for (i, r) in records.enumerated() { positions[r.id] = i }
+        }
+        version += 1
+        return id
+    }
+
+    func update(_ id: Int, _ change: (inout NetRecord) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        guard id > 0, let i = positions[id], i < records.count, records[i].id == id else { return }
+        change(&records[i])
+        version += 1
+    }
+
+    func note(_ id: Int, _ s: String) {
+        update(id) { $0.notes.append(s) }
+    }
+
+    /// 終わった（status が分かっていれば入れる）
+    func finish(_ id: Int, outcome: NetRecord.Outcome, status: Int? = nil, bytes: Int? = nil, now: Date = Date()) {
+        update(id) { r in
+            if r.finished != nil && r.outcome != .pending { return }      // 先に終わっていたら変えない
+            r.outcome = outcome
+            if let status { r.status = status }
+            if let bytes { r.bytes = bytes }
+            r.finished = now
+        }
+    }
+
+    /// 新しい順
+    func recent(limit: Int = 300, filter: (NetRecord) -> Bool = { _ in true }) -> [NetRecord] {
+        lock.lock(); defer { lock.unlock() }
+        var out: [NetRecord] = []
+        for r in records.reversed() where filter(r) {
+            out.append(r)
+            if out.count >= limit { break }
+        }
+        return out
+    }
+
+    var count: Int { lock.lock(); defer { lock.unlock() }; return records.count }
+
+    func clear() {
+        lock.lock(); records = []; positions = [:]; version += 1; lock.unlock()
+    }
+
+    func export() -> String {
+        recent(limit: NetLog.maxRecords).reversed().map { r in
+            ([r.line] + r.notes.map { "    " + $0 }).joined(separator: "\n")
+        }.joined(separator: "\n")
     }
 }
 
@@ -5154,6 +5876,9 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     /// VNet が自分でファイルに書くダウンロードを始めたとき（画面のスレッドで呼ぶ）。
     /// WebKit の WKDownload は使わない（VNetScheme が引き受けた読み込みを WebKit がダウンロードに変えると、アプリが落ちたため）
     var onDownloadStarted: ((VNetDownload) -> Void)?
+    /// 通信の記録（開発者パネル）と、このタブの番号
+    var netLog: NetLog?
+    var tabID: Int?
     /// 広告ブロックの判定（nil なら調べない）。ページ本体は止めず、サブリソースだけを調べる
     var blocker: BlockEngineBox?
     /// 広告ブロックで止めたとき（画面のスレッドで呼ぶ）
@@ -5192,6 +5917,8 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         var httpsFirstFrom: URL?
         /// 自分で作った移動（HSTS・HTTPS-First）を WebKit に伝えている途中
         var syntheticRedirect = false
+        /// 通信の記録の番号（0 なら記録していない）
+        var logID = 0
     }
     private enum StreamPhase { case none, pushing, sending }
     /// 読み込み中の要求（番号 → 要求）。番号は要求ごとに 1 つずつ増やす（使い回さない）。
@@ -5221,6 +5948,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         taskIDs[key] = nil
         pending[id] = nil
         p.token.cancel()
+        netLog?.finish(p.logID, outcome: .cancelled)
     }
 
     /// 読み込み中の要求の数（開発者向け）
@@ -5232,11 +5960,14 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         }
         let body = VNetScheme.body(of: task.request)
         let ctx = context(for: task.request, real: real)
+        let types = BlockEngine.guessTypes(url: real, accept: task.request.value(forHTTPHeaderField: "Accept"), isTopLevel: ctx.isTopLevel)
+        let logID = netLog?.begin(tab: tabID, method: task.request.httpMethod ?? "GET", url: real.absoluteString,
+                                  kind: VNetScheme.kindLabel(types), topLevel: ctx.isTopLevel) ?? 0
         // 広告ブロック（サブリソースだけ）。止めたものは通信しない
         if !ctx.isTopLevel, let blocker {
-            let types = BlockEngine.guessTypes(url: real, accept: task.request.value(forHTTPHeaderField: "Accept"), isTopLevel: false)
             if let d = blocker.match(url: real, types: types, sourceHost: ctx.initiator?.host ?? ctx.topURL?.host, topHost: ctx.topURL?.host) {
                 log?("🚫 広告ブロック: \(real.absoluteString)（\(d.rule)）")
+                netLog?.finish(logID, outcome: .blocked(d.rule))
                 onBlocked?(real, d.rule)
                 task.didFailWithError(NSError(domain: "VelaAdBlock", code: 1, userInfo: [NSLocalizedDescriptionKey: "広告ブロックで止めました"]))
                 return
@@ -5250,10 +5981,17 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         let webKitRedirects = SchemeTaskRedirect.isAvailable(task)
         var p = Pending(task: task, shownURL: shown, realURL: real, started: Date(), request: task.request, body: body,
                         webKitRedirects: webKitRedirects, context: ctx)
+        p.logID = logID
+        if ctx.userInitiated { netLog?.note(logID, "ユーザーの操作で開いた") }
+        if let i = ctx.initiator, !ctx.isTopLevel, let top = ctx.topURL,
+           SiteUtil.registrableDomain(i.host ?? "") != SiteUtil.registrableDomain(top.host ?? "") {
+            netLog?.note(logID, "読み込んだのは別のサイト: \(i.host ?? "")")
+        }
         pending[id] = p
         // HSTS・HTTPS-First: http を https に上げてから読む（WebKit にも移動として伝える）
         if let (up, reason) = upgradeTarget(real, ctx: ctx) {
             log?("🔒 \(reason): \(real.absoluteString) → https")
+            netLog?.note(logID, "🔒 \(reason): https に上げた")
             if reason == "HTTPS-First" { p.httpsFirstFrom = real }
             if webKitRedirects {
                 p.syntheticRedirect = true
@@ -5343,6 +6081,10 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         guard let p = pending[id] else { return }
         if case .success(let r) = result, let sts = r.header("Strict-Transport-Security") {
             hsts?.record(header: sts, url: r.url, ctx: p.context)
+            netLog?.note(p.logID, "HSTS の指定: \(sts)")
+        }
+        if case .success(let r) = result, !r.cookieChanges.isEmpty {
+            netLog?.note(p.logID, "🍪 Cookie を \(r.cookieChanges.count) 個保存・変更")
         }
         // 移動（3xx）: WebKit に「移動した」と伝える（アドレス・相対リンク・オリジン・クッキーが移動先のものになる）
         if case .success(let r) = result, p.webKitRedirects, RedirectPolicy.statuses.contains(r.status) {
@@ -5370,6 +6112,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         case .success(let r):
             let range = r.header("Content-Range").map { "・\($0)" } ?? ""
             log?("✓ \(r.status) \(r.url.absoluteString)（\(r.body.count / 1024)KB・\(ms)ms\(range)）")
+            netLog?.finish(p.logID, outcome: .ok, status: r.status, bytes: r.body.count)
             var type = VNetScheme.contentType(r, real: real)
             var body = r.body
             // vnets:// の作りのときだけ: HTML と CSS の中の https:// を vnets:// に書き換える（部品も自作の通信で読むため）
@@ -5406,12 +6149,18 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
                 p.task.didFinish()
             }
             log?("⬇︎ ダウンロードにします: \(h.url.absoluteString) → \(dl.fileURL.lastPathComponent)")
+            netLog?.finish(p.logID, outcome: .download, status: h.status)
             onDownloadStarted?(dl)
             return
         }
         p.streamPhase = .pushing
         pending[id] = p
-        if let sts = h.header("Strict-Transport-Security") { hsts?.record(header: sts, url: h.url, ctx: p.context) }
+        netLog?.update(p.logID) { $0.status = h.status }
+        if !h.cookieChanges.isEmpty { netLog?.note(p.logID, "🍪 Cookie を \(h.cookieChanges.count) 個保存・変更") }
+        if let sts = h.header("Strict-Transport-Security") {
+            hsts?.record(header: sts, url: h.url, ctx: p.context)
+            netLog?.note(p.logID, "HSTS の指定: \(sts)")
+        }
         if !h.cookieChanges.isEmpty, let pushCookies {
             pushCookies(h.cookieChanges) { [weak self] in
                 let me = self
@@ -5527,11 +6276,13 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         switch result {
         case .success(let r):
             log?("✓ \(r.status) \(r.url.absoluteString)（\(p.streamBytes / 1024)KB・\(ms)ms・流す形）")
+            netLog?.finish(p.logID, outcome: .ok, status: r.status, bytes: p.streamBytes)
             // リダイレクトの途中で届いた Cookie もあれば、WebKit の置き場に入れておく（同じものを入れ直しても害は無い）
             if !r.cookieChanges.isEmpty { pushCookies?(r.cookieChanges) {} }
             p.task.didFinish()
         case .failure(let e):
             log?("✕ \(p.realURL.absoluteString)：途中で失敗（\(p.streamBytes / 1024)KB まで）：\(e.description)")
+            netLog?.finish(p.logID, outcome: .failed("途中で失敗: \(e.description)"), bytes: p.streamBytes)
             p.task.didFailWithError(URLError(e.kind == .timeout ? .timedOut : .networkConnectionLost))
         }
     }
@@ -5540,6 +6291,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     private func fail(_ p: Pending, _ e: FetchError) {
         let real = p.realURL
         log?("✕ \(real.absoluteString)：\(e.description)")
+        netLog?.finish(p.logID, outcome: e.kind == .cancelled ? .cancelled : .failed("\(e.kind.rawValue): \(e.description)"))
         let html: String
         if e.kind == .localNetworkConsent && p.context.isTopLevel {
             html = ErrorPage.html(title: "LAN の機器を開きますか？", lines: [
@@ -5578,6 +6330,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         let nextShown = p.vnetsMode ? (VNetURL.toVNet(next.url) ?? next.url) : next.url
         let dropped = next.dropped.isEmpty ? "" : "（外したヘッダ: \(next.dropped.joined(separator: ", "))）"
         log?("↪ \(status) \(p.realURL.absoluteString) → \(next.url.absoluteString)\(dropped)")
+        netLog?.note(p.logID, "↪ \(status) → \(next.url.absoluteString)\(dropped)")
         var h = VNetScheme.responseHeaders(type: type, length: 0, vnetsMode: p.vnetsMode, extra: serverHeaders)
         h["Location"] = nextShown.absoluteString
         let nr = NSMutableURLRequest(url: nextShown)
@@ -5751,6 +6504,22 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
                                                "ts": "video/mp2t"]
 
     /// Content-Type。種類が書いていない動画・音声は、拡張子から決める（でないと再生できない）
+    /// 記録に出す種類の名前
+    static func kindLabel(_ t: Set<ResourceType>) -> String {
+        if t.count > 1 { return "その他" }
+        switch t.first {
+        case .document?: return "ページ"
+        case .subdocument?: return "フレーム"
+        case .script?: return "スクリプト"
+        case .image?: return "画像"
+        case .stylesheet?: return "CSS"
+        case .font?: return "フォント"
+        case .media?: return "動画・音声"
+        case .xhr?: return "XHR"
+        default: return "その他"
+        }
+    }
+
     static func contentType(_ r: HTTPResult, real: URL) -> String {
         contentType(headers: r.headers, real: real)
     }

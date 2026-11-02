@@ -35,6 +35,9 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     /// VNet が自分でファイルに書くダウンロードを始めたとき（画面のスレッドで呼ぶ）。
     /// WebKit の WKDownload は使わない（VNetScheme が引き受けた読み込みを WebKit がダウンロードに変えると、アプリが落ちたため）
     var onDownloadStarted: ((VNetDownload) -> Void)?
+    /// 通信の記録（開発者パネル）と、このタブの番号
+    var netLog: NetLog?
+    var tabID: Int?
     /// 広告ブロックの判定（nil なら調べない）。ページ本体は止めず、サブリソースだけを調べる
     var blocker: BlockEngineBox?
     /// 広告ブロックで止めたとき（画面のスレッドで呼ぶ）
@@ -73,6 +76,8 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         var httpsFirstFrom: URL?
         /// 自分で作った移動（HSTS・HTTPS-First）を WebKit に伝えている途中
         var syntheticRedirect = false
+        /// 通信の記録の番号（0 なら記録していない）
+        var logID = 0
     }
     private enum StreamPhase { case none, pushing, sending }
     /// 読み込み中の要求（番号 → 要求）。番号は要求ごとに 1 つずつ増やす（使い回さない）。
@@ -102,6 +107,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         taskIDs[key] = nil
         pending[id] = nil
         p.token.cancel()
+        netLog?.finish(p.logID, outcome: .cancelled)
     }
 
     /// 読み込み中の要求の数（開発者向け）
@@ -113,11 +119,14 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         }
         let body = VNetScheme.body(of: task.request)
         let ctx = context(for: task.request, real: real)
+        let types = BlockEngine.guessTypes(url: real, accept: task.request.value(forHTTPHeaderField: "Accept"), isTopLevel: ctx.isTopLevel)
+        let logID = netLog?.begin(tab: tabID, method: task.request.httpMethod ?? "GET", url: real.absoluteString,
+                                  kind: VNetScheme.kindLabel(types), topLevel: ctx.isTopLevel) ?? 0
         // 広告ブロック（サブリソースだけ）。止めたものは通信しない
         if !ctx.isTopLevel, let blocker {
-            let types = BlockEngine.guessTypes(url: real, accept: task.request.value(forHTTPHeaderField: "Accept"), isTopLevel: false)
             if let d = blocker.match(url: real, types: types, sourceHost: ctx.initiator?.host ?? ctx.topURL?.host, topHost: ctx.topURL?.host) {
                 log?("🚫 広告ブロック: \(real.absoluteString)（\(d.rule)）")
+                netLog?.finish(logID, outcome: .blocked(d.rule))
                 onBlocked?(real, d.rule)
                 task.didFailWithError(NSError(domain: "VelaAdBlock", code: 1, userInfo: [NSLocalizedDescriptionKey: "広告ブロックで止めました"]))
                 return
@@ -131,10 +140,17 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         let webKitRedirects = SchemeTaskRedirect.isAvailable(task)
         var p = Pending(task: task, shownURL: shown, realURL: real, started: Date(), request: task.request, body: body,
                         webKitRedirects: webKitRedirects, context: ctx)
+        p.logID = logID
+        if ctx.userInitiated { netLog?.note(logID, "ユーザーの操作で開いた") }
+        if let i = ctx.initiator, !ctx.isTopLevel, let top = ctx.topURL,
+           SiteUtil.registrableDomain(i.host ?? "") != SiteUtil.registrableDomain(top.host ?? "") {
+            netLog?.note(logID, "読み込んだのは別のサイト: \(i.host ?? "")")
+        }
         pending[id] = p
         // HSTS・HTTPS-First: http を https に上げてから読む（WebKit にも移動として伝える）
         if let (up, reason) = upgradeTarget(real, ctx: ctx) {
             log?("🔒 \(reason): \(real.absoluteString) → https")
+            netLog?.note(logID, "🔒 \(reason): https に上げた")
             if reason == "HTTPS-First" { p.httpsFirstFrom = real }
             if webKitRedirects {
                 p.syntheticRedirect = true
@@ -224,6 +240,10 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         guard let p = pending[id] else { return }
         if case .success(let r) = result, let sts = r.header("Strict-Transport-Security") {
             hsts?.record(header: sts, url: r.url, ctx: p.context)
+            netLog?.note(p.logID, "HSTS の指定: \(sts)")
+        }
+        if case .success(let r) = result, !r.cookieChanges.isEmpty {
+            netLog?.note(p.logID, "🍪 Cookie を \(r.cookieChanges.count) 個保存・変更")
         }
         // 移動（3xx）: WebKit に「移動した」と伝える（アドレス・相対リンク・オリジン・クッキーが移動先のものになる）
         if case .success(let r) = result, p.webKitRedirects, RedirectPolicy.statuses.contains(r.status) {
@@ -251,6 +271,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         case .success(let r):
             let range = r.header("Content-Range").map { "・\($0)" } ?? ""
             log?("✓ \(r.status) \(r.url.absoluteString)（\(r.body.count / 1024)KB・\(ms)ms\(range)）")
+            netLog?.finish(p.logID, outcome: .ok, status: r.status, bytes: r.body.count)
             var type = VNetScheme.contentType(r, real: real)
             var body = r.body
             // vnets:// の作りのときだけ: HTML と CSS の中の https:// を vnets:// に書き換える（部品も自作の通信で読むため）
@@ -287,12 +308,18 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
                 p.task.didFinish()
             }
             log?("⬇︎ ダウンロードにします: \(h.url.absoluteString) → \(dl.fileURL.lastPathComponent)")
+            netLog?.finish(p.logID, outcome: .download, status: h.status)
             onDownloadStarted?(dl)
             return
         }
         p.streamPhase = .pushing
         pending[id] = p
-        if let sts = h.header("Strict-Transport-Security") { hsts?.record(header: sts, url: h.url, ctx: p.context) }
+        netLog?.update(p.logID) { $0.status = h.status }
+        if !h.cookieChanges.isEmpty { netLog?.note(p.logID, "🍪 Cookie を \(h.cookieChanges.count) 個保存・変更") }
+        if let sts = h.header("Strict-Transport-Security") {
+            hsts?.record(header: sts, url: h.url, ctx: p.context)
+            netLog?.note(p.logID, "HSTS の指定: \(sts)")
+        }
         if !h.cookieChanges.isEmpty, let pushCookies {
             pushCookies(h.cookieChanges) { [weak self] in
                 let me = self
@@ -408,11 +435,13 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         switch result {
         case .success(let r):
             log?("✓ \(r.status) \(r.url.absoluteString)（\(p.streamBytes / 1024)KB・\(ms)ms・流す形）")
+            netLog?.finish(p.logID, outcome: .ok, status: r.status, bytes: p.streamBytes)
             // リダイレクトの途中で届いた Cookie もあれば、WebKit の置き場に入れておく（同じものを入れ直しても害は無い）
             if !r.cookieChanges.isEmpty { pushCookies?(r.cookieChanges) {} }
             p.task.didFinish()
         case .failure(let e):
             log?("✕ \(p.realURL.absoluteString)：途中で失敗（\(p.streamBytes / 1024)KB まで）：\(e.description)")
+            netLog?.finish(p.logID, outcome: .failed("途中で失敗: \(e.description)"), bytes: p.streamBytes)
             p.task.didFailWithError(URLError(e.kind == .timeout ? .timedOut : .networkConnectionLost))
         }
     }
@@ -421,6 +450,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     private func fail(_ p: Pending, _ e: FetchError) {
         let real = p.realURL
         log?("✕ \(real.absoluteString)：\(e.description)")
+        netLog?.finish(p.logID, outcome: e.kind == .cancelled ? .cancelled : .failed("\(e.kind.rawValue): \(e.description)"))
         let html: String
         if e.kind == .localNetworkConsent && p.context.isTopLevel {
             html = ErrorPage.html(title: "LAN の機器を開きますか？", lines: [
@@ -459,6 +489,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         let nextShown = p.vnetsMode ? (VNetURL.toVNet(next.url) ?? next.url) : next.url
         let dropped = next.dropped.isEmpty ? "" : "（外したヘッダ: \(next.dropped.joined(separator: ", "))）"
         log?("↪ \(status) \(p.realURL.absoluteString) → \(next.url.absoluteString)\(dropped)")
+        netLog?.note(p.logID, "↪ \(status) → \(next.url.absoluteString)\(dropped)")
         var h = VNetScheme.responseHeaders(type: type, length: 0, vnetsMode: p.vnetsMode, extra: serverHeaders)
         h["Location"] = nextShown.absoluteString
         let nr = NSMutableURLRequest(url: nextShown)
@@ -632,6 +663,22 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
                                                "ts": "video/mp2t"]
 
     /// Content-Type。種類が書いていない動画・音声は、拡張子から決める（でないと再生できない）
+    /// 記録に出す種類の名前
+    static func kindLabel(_ t: Set<ResourceType>) -> String {
+        if t.count > 1 { return "その他" }
+        switch t.first {
+        case .document?: return "ページ"
+        case .subdocument?: return "フレーム"
+        case .script?: return "スクリプト"
+        case .image?: return "画像"
+        case .stylesheet?: return "CSS"
+        case .font?: return "フォント"
+        case .media?: return "動画・音声"
+        case .xhr?: return "XHR"
+        default: return "その他"
+        }
+    }
+
     static func contentType(_ r: HTTPResult, real: URL) -> String {
         contentType(headers: r.headers, real: real)
     }

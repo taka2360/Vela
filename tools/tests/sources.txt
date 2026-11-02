@@ -24,3 +24,4 @@ LibraryModel.swift
 ABPFilter.swift
 BlockEngine.swift
 ContentBlocker.swift
+NetLog.swift

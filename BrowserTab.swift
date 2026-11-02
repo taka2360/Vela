@@ -55,6 +55,8 @@ final class BrowserTab: ObservableObject, Identifiable {
     private var httpsFirstFrom: URL?
     /// HTTPS-First で「http のまま開く」を選んだホスト
     private var httpAllowedHosts = Set<String>()
+    /// 移動の出来事（開発者パネル。最新 200 件）
+    private(set) var navEvents: [(Date, String)] = []
     /// いま入れている広告ブロックの WebKit のルール
     private var adRuleLists: [WKContentRuleList] = []
     /// エラーページを出した URL（履歴に入れない）
@@ -155,6 +157,8 @@ final class BrowserTab: ObservableObject, Identifiable {
                 Task { @MainActor in tab?.vnetFailed(u, e) }
             }
             s.blocker = store.adblock.box
+            s.netLog = store.netLog
+            s.tabID = id
             s.onBlocked = { [weak self] _, _ in
                 let tab = self
                 Task { @MainActor in tab?.noteBlocked() }
@@ -511,6 +515,14 @@ final class BrowserTab: ObservableObject, Identifiable {
 
     func navigationEvent(_ s: String, level: LogLevel = .info) {
         log(s, level: level)
+        navEvents.append((Date(), s))
+        if navEvents.count > 200 { navEvents.removeFirst(navEvents.count - 200) }
+    }
+
+    /// 設定を変えたとき（すぐ効かせられるものだけ）
+    func applySettings() {
+        scheme?.httpsFirst = VelaSettings.httpsFirst
+        if #available(iOS 16.4, *) { webView?.isInspectable = VelaSettings.webInspector }
     }
 
     func didFinish() {

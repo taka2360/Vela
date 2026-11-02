@@ -328,6 +328,9 @@ public extension Section where Parent: View, Content: View, Footer == EmptyView 
     init(@ViewBuilder content: () -> Content, @ViewBuilder header: () -> Parent) {}
     init(header: Parent, @ViewBuilder content: () -> Content) {}
 }
+public extension Section where Parent: View, Content: View, Footer: View {
+    init(@ViewBuilder content: () -> Content, @ViewBuilder header: () -> Parent, @ViewBuilder footer: () -> Footer) {}
+}
 public extension Section where Parent == EmptyView, Content: View, Footer == EmptyView {
     init(@ViewBuilder content: () -> Content) {}
 }
@@ -608,6 +611,14 @@ public struct GeometryReader<Content: View>: View {
 public struct Menu<Label: View, Content: View>: View {
     public init(@ViewBuilder content: () -> Content, @ViewBuilder label: () -> Label) {}
     public var body: Never { fatalError() }
+}
+
+public extension Menu where Label == Text {
+    @_disfavoredOverload init<S: StringProtocol>(_ title: S, @ViewBuilder content: () -> Content) {}
+}
+public extension View {
+    func fixedSize() -> ModifiedContent<Self, _Mod> { .init() }
+    func fixedSize(horizontal: Bool, vertical: Bool) -> ModifiedContent<Self, _Mod> { .init() }
 }
 
 public struct GridItem {

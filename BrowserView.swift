@@ -33,6 +33,7 @@ struct BrowserView: View {
         .background(ShortcutKeys(store: store))
         .sheet(isPresented: $store.showDevPanel) { DevPanel(store: store) }
         .sheet(isPresented: $store.showAdBlock) { AdBlockView(adblock: store.adblock) }
+        .sheet(isPresented: $store.showSettings) { SettingsView(store: store) }
         .sheet(isPresented: $store.showLibrary) { LibraryView(store: store, library: store.library) }
         .sheet(isPresented: shareShown) { if let u = store.shareURL { ShareSheet(items: [u]) } }
         .fullScreenCover(isPresented: $store.showTabOverview) { TabOverview(store: store) }
@@ -282,6 +283,7 @@ struct MoreMenu: View {
             Button { store.close(tab) } label: { Label("このタブを閉じる", systemImage: "xmark.square") }
             Divider()
             Button { store.showAdBlock = true } label: { Label("広告ブロック", systemImage: "shield.lefthalf.filled") }
+            Button { store.showSettings = true } label: { Label("設定", systemImage: "gearshape") }
             Button { store.showDevPanel = true } label: { Label("開発者パネル", systemImage: "wrench.and.screwdriver") }
         } label: {
             Image(systemName: "ellipsis.circle")

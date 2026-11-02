@@ -17,6 +17,454 @@ import Security
 #endif
 
 // ======================================================================
+// MARK: - TLSClient.swift
+// ======================================================================
+
+// MARK: - https の暗号（TLS）を、自作の TCP の上で動かす
+//
+// iPad の普通の通信の部品（Network.framework）は、自分で作った TCP の上では TLS を使えない。
+// そこで、古いけれど今も使える Apple の「SecureTransport」（SSLCreateContext など）を使う。
+// これは「読む・書く」を自分で用意できるので、GuestTCP の上で TLS 1.2 を話せる。
+// 証明書は iPad と同じ仕組みで確かめる（相手の名前も確かめる）。
+// ブラウザらしく見えるよう: ALPN（http/1.1）を名乗る・前の暗号の約束を使い回す（セッション再開。握手が速くなる）
+//
+// 注意（技術的負債）: SecureTransport は 2019 年から非推奨で、TLS 1.3 には対応しない（Apple TN3151）。
+// なので VNet の TLS は 1.2 まで。TLS 1.3 だけのサーバーは版が合わずに失敗する（versionMismatch）。そのときは標準の通信で開く。
+// 自作の TCP の上では Network.framework の TLS を使えないので、TLS エンジンの移行は別の課題にしている
+//
+// 使い方: TLSStream(host:) を作る → TCP がつながったら attach → onReady で write → onData で中身が届く → onClosed
+// SecureTransport が無い環境では TLSStream(host:) が nil を返す（https は使えない）
+
+#if canImport(Security) && os(iOS)
+final class TLSStream: @unchecked Sendable {
+    static let isSupported = true
+    let host: String
+    private let ctx: SSLContext
+    private var tcp: GuestTCP?
+    /// TCP から届いて、まだ TLS に渡していないもの（inbox[inboxPos...]）。先頭を消すと遅いので、位置で覚える
+    private var inbox = [UInt8]()
+    private var inboxPos = 0
+    private var tcpEnded = false
+    private var handshaking = true
+    private var pendingWrite = Data()
+    private var done = false
+    /// 握手に失敗したときの番号（0 なら握手の失敗ではない）
+    private(set) var handshakeError: OSStatus = 0
+    /// 決まった版（"TLS 1.2" など）
+    private(set) var version = ""
+    var onReady: (() -> Void)?
+    var onData: ((Data) -> Void)?
+    var onClosed: ((String?) -> Void)?
+
+    init?(host: String, port: UInt16 = 443) {
+        self.host = host
+        guard let c = SSLCreateContext(nil, .clientSide, .streamType) else { return nil }
+        ctx = c
+        SSLSetIOFuncs(ctx, tlsRead, tlsWrite)
+        SSLSetProtocolVersionMin(ctx, .tlsProtocol12)
+        SSLSetProtocolVersionMax(ctx, .tlsProtocol12)      // SecureTransport は 1.3 を話せない
+        _ = host.withCString { SSLSetPeerDomainName(ctx, $0, strlen($0)) }
+        SSLSetALPNProtocols(ctx, ["http/1.1"] as CFArray)
+        let peer = Array("\(host):\(port)".utf8)
+        _ = peer.withUnsafeBytes { SSLSetPeerID(ctx, $0.baseAddress, $0.count) }
+    }
+
+    /// 証明書の問題での失敗か
+    var failedOnCertificate: Bool { handshakeError <= -9807 && handshakeError >= -9815 }
+
+    /// 版や暗号の組み合わせが合わずに失敗したか（相手が TLS 1.3 だけなど）
+    /// -9836: errSSLPeerProtocolVersion（相手が版を断った）、-9831: errSSLPeerHandshakeFail、-9801: errSSLNegotiation、-9830: errSSLIllegalParam
+    var versionMismatch: Bool { [-9836, -9831, -9801].contains(handshakeError) }
+
+    /// TCP がつながったら呼ぶ
+    func attach(_ t: GuestTCP) {
+        tcp = t
+        SSLSetConnection(ctx, Unmanaged.passUnretained(self).toOpaque())
+        drive()
+    }
+
+    /// TCP から届いたもの
+    func tcpData(_ d: Data) {
+        if inboxPos > 65536 && inboxPos * 2 > inbox.count { inbox.removeFirst(inboxPos); inboxPos = 0 }
+        inbox.append(contentsOf: d)
+        drive()
+    }
+
+    func tcpClosed(_ error: String?) {
+        tcpEnded = true
+        // まだ attach していない（TCP がつながる前に閉じた・取り消した）: SecureTransport には触らない。
+        // SSLSetConnection の前に SSLHandshake を呼ぶと、tlsWrite に null が来て落ちた（実機の記録: TLSStream.writeFrom で 0x28）
+        if tcp != nil { drive() }
+        if !done { finish(error ?? (handshaking ? "TLS の途中で切れました" : nil)) }
+    }
+
+    /// 暗号にして送る（つながる前なら、つながってから送る）
+    func write(_ d: Data) {
+        if done { return }
+        if handshaking { pendingWrite.append(d); return }
+        // 書き込みの関数（tlsWrite）は全部を TCP に渡すので、普通は 1 回で全部書ける。
+        // それでも、書けた分を確かめて残りを書く。エラーなら閉じる（黙って捨てない）
+        var offset = 0
+        while offset < d.count {
+            var processed = 0
+            let st = d.withUnsafeBytes { buf -> OSStatus in
+                SSLWrite(ctx, buf.baseAddress! + offset, d.count - offset, &processed)
+            }
+            offset += processed
+            if st == errSSLWouldBlock && processed > 0 { continue }
+            if st != errSecSuccess {
+                finish("TLS の書き込みに失敗（\(st)）")
+                return
+            }
+            if processed == 0 { finish("TLS の書き込みが進みません"); return }
+        }
+    }
+
+    private func finish(_ error: String?) {
+        if done { return }
+        done = true
+        tcp?.abort()
+        onClosed?(error)
+    }
+
+    /// 進められるところまで進める（握手 → 読む）
+    private func drive() {
+        if done || tcp == nil { return }
+        if handshaking {
+            let st = SSLHandshake(ctx)
+            if st == errSSLWouldBlock { return }
+            if st != errSecSuccess {
+                handshakeError = st
+                finish("TLS の握手に失敗（\(st)）" + (failedOnCertificate ? "：証明書を確かめられません"
+                                                   : versionMismatch ? "：TLS の版が合いません（VNet は TLS 1.2 まで）" : ""))
+                return
+            }
+            handshaking = false
+            var p = SSLProtocol.sslProtocolUnknown
+            SSLGetNegotiatedProtocolVersion(ctx, &p)
+            version = p == .tlsProtocol13 ? "TLS 1.3" : p == .tlsProtocol12 ? "TLS 1.2" : "TLS（\(p.rawValue)）"
+            onReady?()
+            if !pendingWrite.isEmpty { let w = pendingWrite; pendingWrite = Data(); write(w) }
+        }
+        var buf = [UInt8](repeating: 0, count: 65536)
+        while true {
+            var n = 0
+            let st = buf.withUnsafeMutableBytes { SSLRead(ctx, $0.baseAddress!, $0.count, &n) }
+            if n > 0 { onData?(Data(buf[0..<n])) }
+            if st == errSSLWouldBlock { if tcpEnded && inboxPos >= inbox.count { finish(nil) }; return }
+            if st == errSSLClosedGraceful || st == errSSLClosedNoNotify || st == errSSLClosedAbort { finish(nil); return }
+            if st != errSecSuccess { finish("TLS の読み込みに失敗（\(st)）"); return }
+        }
+    }
+
+    // SecureTransport から呼ばれる「読む・書く」
+    fileprivate func readInto(_ p: UnsafeMutableRawPointer, _ want: Int) -> (Int, OSStatus) {
+        let avail = inbox.count - inboxPos
+        if avail <= 0 { return (0, tcpEnded ? errSSLClosedNoNotify : errSSLWouldBlock) }
+        let n = min(want, avail)
+        inbox.withUnsafeBytes { p.copyMemory(from: $0.baseAddress! + inboxPos, byteCount: n) }
+        inboxPos += n
+        return (n, n < want ? errSSLWouldBlock : errSecSuccess)
+    }
+
+    fileprivate func writeFrom(_ p: UnsafeRawPointer, _ n: Int) -> OSStatus {
+        guard let t = tcp else { return errSSLClosedAbort }
+        t.write(Data(bytes: p, count: n))
+        return errSecSuccess
+    }
+}
+
+private func tlsRead(_ conn: SSLConnectionRef, _ data: UnsafeMutableRawPointer, _ length: UnsafeMutablePointer<Int>) -> OSStatus {
+    // 念のため: 接続の印が無ければ（SSLSetConnection の前）何も読まない
+    if Int(bitPattern: conn) == 0 { length.pointee = 0; return errSSLClosedAbort }
+    let s = Unmanaged<TLSStream>.fromOpaque(conn).takeUnretainedValue()
+    let (n, st) = s.readInto(data, length.pointee)
+    length.pointee = n
+    return st
+}
+
+private func tlsWrite(_ conn: SSLConnectionRef, _ data: UnsafeRawPointer, _ length: UnsafeMutablePointer<Int>) -> OSStatus {
+    if Int(bitPattern: conn) == 0 { length.pointee = 0; return errSSLClosedAbort }
+    let s = Unmanaged<TLSStream>.fromOpaque(conn).takeUnretainedValue()
+    return s.writeFrom(data, length.pointee)
+}
+#else
+/// SecureTransport が無い環境用の代わり（作れない）
+final class TLSStream: @unchecked Sendable {
+    static let isSupported = false
+    let handshakeError: Int32 = 0
+    let version = ""
+    var failedOnCertificate: Bool { false }
+    var versionMismatch: Bool { false }
+    var onReady: (() -> Void)?
+    var onData: ((Data) -> Void)?
+    var onClosed: ((String?) -> Void)?
+    init?(host: String, port: UInt16 = 443) { return nil }
+    func attach(_ t: GuestTCP) {}
+    func tcpData(_ d: Data) {}
+    func tcpClosed(_ error: String?) {}
+    func write(_ d: Data) {}
+}
+#endif
+
+// ======================================================================
+// MARK: - GuestStack.swift
+// ======================================================================
+
+// MARK: - ゲスト側の小さな TCP/IP（Linux の代わり）
+//
+// ・DHCP で IP アドレスをもらう（ルーター UserNet が 10.0.2.15 をくれる）
+// ・ARP でルーター（10.0.2.2）の MAC アドレスを調べる
+// ・DNS（10.0.2.3）で名前を IP アドレスにする
+// ・TCP でつなぐ（GuestTCP。送り直し・順番の確認など最低限）
+// すべて queue（VNetMachine.queue）の上で動く
+
+final class GuestStack: @unchecked Sendable {
+    let queue: DispatchQueue
+    /// フレームを送る（ドライバへ）
+    var output: (([UInt8]) -> Void)?
+    /// 何が起きたかを知らせる（画面のログ用）
+    var trace: ((String) -> Void)?
+    /// TCP の送り直しの回数（開発者向け。queue の上で数える）
+    var retransmits = 0
+    /// 順番を飛ばして届き、取っておいた TCP のセグメントの数（開発者向け）
+    var reordered = 0
+
+    var mac = Net.guestMAC
+    private(set) var ip = Net.zeroIP
+    private(set) var router = Net.gateway
+    private(set) var dns = Net.dns
+    private(set) var ready = false
+    private var routerMAC: [UInt8]?
+    /// ルーターの MAC が分かるまで待たせる IP パケット
+    private var waitingForARP: [[UInt8]] = []
+    private var ipID: UInt16 = 1
+    private var nextPort: UInt16 = 40000
+    private var timer: DispatchSourceTimer?
+
+    init(queue: DispatchQueue) {
+        self.queue = queue
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250))
+        t.setEventHandler { [weak self] in self?.tick() }
+        t.resume()
+        timer = t
+    }
+
+    deinit { timer?.cancel() }
+
+    // MARK: 受け取り
+
+    func input(_ f: [UInt8]) {
+        guard f.count >= Ethernet.headerSize else { return }
+        let body = Array(f[Ethernet.headerSize...])
+        switch f.be16(at: 12) {
+        case EtherType.arp: handleARP(body)
+        case EtherType.ipv4: handleIPv4(body)
+        default: break
+        }
+    }
+
+    // MARK: イーサネット・ARP
+
+    private func sendEthernet(_ type: UInt16, to dst: [UInt8], _ payload: [UInt8]) {
+        output?(Ethernet.frame(dst: dst, src: mac, type: type, payload))
+    }
+
+    private func askRouterMAC() {
+        let a = ARP.packet(op: ARP.request, senderMAC: mac, senderIP: ip, targetMAC: Net.zeroMAC, targetIP: router)
+        sendEthernet(EtherType.arp, to: Net.broadcastMAC, a)
+        trace?("→ ARP \(router.ipString) はどこ？")
+    }
+
+    private func handleARP(_ p: [UInt8]) {
+        guard p.count >= 28 else { return }
+        let op = p.be16(at: 6)
+        let senderMAC = Array(p[8..<14]), senderIP = Array(p[14..<18]), target = Array(p[24..<28])
+        if op == ARP.reply && senderIP == router {
+            if routerMAC == nil { trace?("← ARP \(router.ipString) は \(senderMAC.macString)") }
+            routerMAC = senderMAC
+            let w = waitingForARP
+            waitingForARP = []
+            for pkt in w { sendEthernet(EtherType.ipv4, to: senderMAC, pkt) }
+        } else if op == ARP.request && target == ip && ip != Net.zeroIP {
+            let r = ARP.packet(op: ARP.reply, senderMAC: mac, senderIP: ip, targetMAC: senderMAC, targetIP: senderIP)
+            sendEthernet(EtherType.arp, to: senderMAC, r)
+        }
+    }
+
+    // MARK: IPv4
+
+    private func sendIPv4(proto: UInt8, dst: [UInt8], _ body: [UInt8], broadcast: Bool = false) {
+        let pkt = IPv4Packet.build(proto: proto, id: ipID, src: ip, dst: dst, body)
+        ipID &+= 1
+        if broadcast { sendEthernet(EtherType.ipv4, to: Net.broadcastMAC, pkt); return }
+        // 外へは全部ルーター経由（10.0.2.x もルーターが答える）
+        if let m = routerMAC { sendEthernet(EtherType.ipv4, to: m, pkt) } else {
+            waitingForARP.append(pkt)
+            askRouterMAC()
+        }
+    }
+
+    private func handleIPv4(_ p: [UInt8]) {
+        guard let pkt = IPv4Packet(p) else { return }
+        switch pkt.proto {
+        case IPProto.tcp: handleTCP(src: pkt.src, pkt.body)
+        case IPProto.udp: handleUDP(pkt.body)
+        default: break
+        }
+    }
+
+    // MARK: UDP（DHCP と DNS）
+
+    private func sendUDP(sport: UInt16, dst: [UInt8], dport: UInt16, _ payload: [UInt8], broadcast: Bool = false) {
+        let u = UDPDatagram.build(src: ip, dst: dst, sport: sport, dport: dport, payload)
+        sendIPv4(proto: IPProto.udp, dst: dst, u, broadcast: broadcast)
+    }
+
+    private func handleUDP(_ b: [UInt8]) {
+        guard let u = UDPDatagram(b) else { return }
+        if u.sport == 67 && u.dport == 68 { handleDHCP(u.payload) }
+        else if u.sport == 53, let q = dnsQueries.removeValue(forKey: u.dport) { q.finish(u.payload) }
+    }
+
+    private func allocPort() -> UInt16 {
+        nextPort = nextPort >= 60000 ? 40000 : nextPort + 1
+        return nextPort
+    }
+
+    // MARK: DHCP
+
+    private let dhcpXID = UInt32.random(in: 1...UInt32.max)
+    private var dhcpSentAt = Date.distantPast
+    private var onReady: [() -> Void] = []
+
+    /// IP アドレスをもらう（もらえたら done が呼ばれる）
+    func start(_ done: @escaping () -> Void) {
+        onReady.append(done)
+        sendDHCP(type: DHCP.discover, requested: nil)
+    }
+
+    private func sendDHCP(type: UInt8, requested: [UInt8]?) {
+        var m = [UInt8](repeating: 0, count: 236)
+        m[0] = 1; m[1] = 1; m[2] = 6                       // 問い合わせ・イーサネット・MAC は 6 バイト
+        m.setBE32(dhcpXID, at: 4)
+        m[10] = 0x80                                       // ブロードキャストで返してほしい
+        m.replaceSubrange(28..<34, with: mac)
+        m += DHCP.magicCookie
+        m += [53, 1, type]
+        if let r = requested {
+            // 配列を + でつなぐと型チェックがとても遅いので、1 つずつ足す
+            m.append(contentsOf: [50, 4] as [UInt8])
+            m.append(contentsOf: r)
+            m.append(contentsOf: [54, 4] as [UInt8])
+            m.append(contentsOf: router)
+        }
+        m += [55, 3, 1, 3, 6, 255]                         // ほしいもの: サブネット・ルーター・DNS
+        sendUDP(sport: 68, dst: Net.broadcastIP, dport: 67, m, broadcast: true)
+        dhcpSentAt = Date()
+        trace?(type == DHCP.discover ? "→ DHCP DISCOVER（IP アドレスをください）" : "→ DHCP REQUEST")
+    }
+
+    private func handleDHCP(_ p: [UInt8]) {
+        guard p.count >= 240, p[0] == 2, p.be32(at: 4) == dhcpXID else { return }
+        let yiaddr = Array(p[16..<20])
+        let opts = DHCP.options(p)
+        if let r = opts[3], r.count >= 4 { router = Array(r[0..<4]) }
+        if let d = opts[6], d.count >= 4 { dns = Array(d[0..<4]) }
+        let type = opts[53]?.first ?? 0
+        if type == DHCP.offer {
+            trace?("← DHCP OFFER \(yiaddr.ipString)")
+            sendDHCP(type: DHCP.request, requested: yiaddr)
+        } else if type == DHCP.ack && !ready {
+            ip = yiaddr
+            ready = true
+            trace?("← DHCP ACK: IP \(ip.ipString)・ルーター \(router.ipString)・DNS \(dns.ipString)")
+            let w = onReady
+            onReady = []
+            for f in w { f() }
+        }
+    }
+
+    // MARK: DNS
+
+    private final class DNSQuery {
+        let packet: [UInt8]
+        let done: ([UInt8]?) -> Void
+        var sentAt = Date()
+        var tries = 0
+        private var finished = false
+        init(packet: [UInt8], done: @escaping ([UInt8]?) -> Void) { self.packet = packet; self.done = done }
+        func finish(_ reply: [UInt8]?) {
+            if finished { return }
+            finished = true
+            done(reply.flatMap(DNSMessage.firstA))
+        }
+    }
+    private var dnsQueries: [UInt16: DNSQuery] = [:]
+
+    /// 名前を IPv4 アドレスにする（IP アドレスの形ならそのまま）
+    func resolve(_ name: String, _ done: @escaping ([UInt8]?) -> Void) {
+        let labels = name.split(separator: ".")
+        let octets = labels.compactMap { UInt8($0) }
+        if labels.count == 4 && octets.count == 4 { done(octets); return }
+        let packet = DNSMessage.query(name: name, id: .random(in: 0...UInt16.max))
+        let port = allocPort()
+        dnsQueries[port] = DNSQuery(packet: packet) { [weak self] ip in
+            self?.trace?("← DNS \(name) = " + (ip?.ipString ?? "見つからない"))
+            done(ip)
+        }
+        trace?("→ DNS \(name) は？")
+        sendUDP(sport: port, dst: dns, dport: 53, packet)
+    }
+
+    // MARK: TCP
+
+    private struct TCPKey: Hashable { let lport: UInt16; let rip: [UInt8]; let rport: UInt16 }
+    private var tcps: [TCPKey: GuestTCP] = [:]
+
+    private static func key(_ c: GuestTCP) -> TCPKey { TCPKey(lport: c.lport, rip: c.rip, rport: c.rport) }
+
+    /// TCP でつなぐ
+    func connect(_ rip: [UInt8], _ rport: UInt16, handler: GuestTCP.Handler) -> GuestTCP {
+        let c = GuestTCP(stack: self, lport: allocPort(), rip: rip, rport: rport, handler: handler)
+        tcps[GuestStack.key(c)] = c
+        c.sendSYN()
+        trace?("→ TCP SYN \(rip.ipString):\(rport)")
+        return c
+    }
+
+    /// 終わった接続を忘れる（GuestTCP から呼ぶ）
+    func forget(_ c: GuestTCP) {
+        tcps[GuestStack.key(c)] = nil
+    }
+
+    /// 組み立てた TCP セグメントを送る（GuestTCP から呼ぶ）
+    func sendTCP(to dst: [UInt8], _ segment: [UInt8]) {
+        sendIPv4(proto: IPProto.tcp, dst: dst, segment)
+    }
+
+    private func handleTCP(src: [UInt8], _ b: [UInt8]) {
+        guard let h = TCPHeader(b), let c = tcps[TCPKey(lport: h.dport, rip: src, rport: h.sport)] else { return }
+        c.input(h, payload: b[h.headerLength...])
+    }
+
+    // MARK: 時間で見るもの（DHCP・DNS・TCP の送り直し）
+
+    private func tick() {
+        let now = Date()
+        if !ready && now.timeIntervalSince(dhcpSentAt) > 2 && !onReady.isEmpty { sendDHCP(type: DHCP.discover, requested: nil) }
+        for (port, q) in dnsQueries where now.timeIntervalSince(q.sentAt) > 2 {
+            q.tries += 1
+            if q.tries > 3 { dnsQueries[port] = nil; q.finish(nil); continue }
+            q.sentAt = now
+            sendUDP(sport: port, dst: dns, dport: 53, q.packet)
+        }
+        for c in Array(tcps.values) { c.tick(now) }
+    }
+}
+
+// ======================================================================
 // MARK: - GuestTCP.swift
 // ======================================================================
 
@@ -718,367 +1166,5 @@ final class VNetMachine: @unchecked Sendable {
                           ready: self.stack.ready, ip: self.stack.ready ? self.stack.ip.ipString : "")
             done(s)
         }
-    }
-}
-
-// ======================================================================
-// MARK: - VNetCore.swift
-// ======================================================================
-
-// MARK: - 実験用の「機械」の部品
-//
-// Android エミュレータと同じ virtio-net（仮想 LAN カード）を使う。
-// 本物のエミュレータでは Linux（ゲスト）がこのカードを動かすが、この実験アプリでは
-// ゲストの代わりに、Swift で書いた小さな「ドライバ」と「TCP/IP」（GuestStack）が動かす。
-//
-//   ブラウザ（WKWebView）→ HTTPPool → GuestStack（TCP/IP）→ VirtioNetDriver
-//     → VirtioNet（仮想 LAN カード）→ UserNet（小さなルーター）→ iPad の通信
-
-/// ゲストの RAM（virtio のキューと、フレームの入れ物を置く）。アドレスは 0x4000_0000 から
-final class GuestRAM: @unchecked Sendable {
-    let base: UInt64 = 0x4000_0000
-    let size: UInt64
-    private let words: UnsafeMutablePointer<UInt64>
-    private var next: UInt64 = 0
-
-    init(megabytes: Int) {
-        size = UInt64(megabytes) << 20
-        words = .allocate(capacity: Int(size / 8))
-        words.initialize(repeating: 0, count: Int(size / 8))
-    }
-    deinit { words.deallocate() }
-
-    /// 置き場所をもらう（align の倍数に揃える）。戻り値はゲストの物理アドレス
-    func alloc(_ count: Int, align: UInt64 = 16) -> UInt64 {
-        next = (next + align - 1) / align * align
-        let a = base + next
-        next += UInt64(count)
-        precondition(next <= size, "GuestRAM が足りません")
-        return a
-    }
-
-    /// ドライバ用（自分で置いた場所なので確かめない）
-    func pointer(_ pa: UInt64) -> UnsafeMutableRawPointer { UnsafeMutableRawPointer(words) + Int(pa - base) }
-    /// カード用（ゲストが書いたアドレスなので、RAM の中に収まるか確かめる）
-    func pointer(_ pa: UInt64, count: Int) -> UnsafeMutableRawPointer? {
-        let off = pa &- base
-        guard pa >= base, off <= size, UInt64(count) <= size - off else { return nil }
-        return UnsafeMutableRawPointer(words) + Int(off)
-    }
-
-    func load16(_ pa: UInt64) -> UInt16 { pointer(pa).loadUnaligned(as: UInt16.self) }
-    func load32(_ pa: UInt64) -> UInt32 { pointer(pa).loadUnaligned(as: UInt32.self) }
-    func store16(_ pa: UInt64, _ v: UInt16) { pointer(pa).storeBytes(of: v, as: UInt16.self) }
-    func store32(_ pa: UInt64, _ v: UInt32) { pointer(pa).storeBytes(of: v, as: UInt32.self) }
-    func store64(_ pa: UInt64, _ v: UInt64) { pointer(pa).storeBytes(of: v, as: UInt64.self) }
-}
-
-// MARK: - virtio-mmio の決まり（カードとドライバの両方が使う）
-
-enum VirtioMMIO {
-    /// レジスタの位置
-    enum Reg {
-        static let magic: UInt64 = 0x000
-        static let version: UInt64 = 0x004
-        static let deviceID: UInt64 = 0x008
-        static let vendorID: UInt64 = 0x00C
-        static let deviceFeatures: UInt64 = 0x010
-        static let deviceFeaturesSel: UInt64 = 0x014
-        static let driverFeatures: UInt64 = 0x020
-        static let driverFeaturesSel: UInt64 = 0x024
-        static let guestPageSize: UInt64 = 0x028          // legacy
-        static let queueSel: UInt64 = 0x030
-        static let queueNumMax: UInt64 = 0x034
-        static let queueNum: UInt64 = 0x038
-        static let queueAlign: UInt64 = 0x03C             // legacy
-        static let queuePFN: UInt64 = 0x040               // legacy
-        static let queueReady: UInt64 = 0x044
-        static let queueNotify: UInt64 = 0x050
-        static let interruptStatus: UInt64 = 0x060
-        static let interruptACK: UInt64 = 0x064
-        static let status: UInt64 = 0x070
-        static let queueDescLow: UInt64 = 0x080
-        static let queueDescHigh: UInt64 = 0x084
-        static let queueAvailLow: UInt64 = 0x090
-        static let queueAvailHigh: UInt64 = 0x094
-        static let queueUsedLow: UInt64 = 0x0A0
-        static let queueUsedHigh: UInt64 = 0x0A4
-        static let config: UInt64 = 0x100                 // ここから先がカードごとの設定（ネットワークなら MAC アドレス）
-    }
-    static let magicValue: UInt32 = 0x7472_6976           // "virt"
-    static let vendorQEMU: UInt32 = 0x554D_4551           // "QEMU"
-    static let deviceNet: UInt32 = 1
-
-    /// 状態（status）のビット
-    static let statusAcknowledge: UInt32 = 1
-    static let statusDriver: UInt32 = 2
-    static let statusDriverOK: UInt32 = 4
-
-    /// 機能のビット
-    static let featureNetMAC: UInt64 = 1 << 5
-    static let featureVersion1: UInt64 = 1 << 32
-
-    /// 記述子の flags
-    static let descNext: UInt16 = 1
-    static let descWrite: UInt16 = 2
-
-    /// キューの番号（ネットワーク）
-    static let rxQueue = 0
-    static let txQueue = 1
-
-    /// virtio_net_hdr の大きさ（古い形 = legacy、MRG_RXBUF なし）
-    static let netHeaderSize = 10
-}
-
-// MARK: - virtio-mmio のネットワーク（Linux では eth0 になる）
-//
-// キューは 2 つ: 0 = 受け取り用（OS が空の入れ物を並べておく）、1 = 送り出し用。
-// 1 つの入れ物 = [virtio_net_hdr 10 バイト] [イーサネットのフレーム]
-// 送り出されたフレームは onTransmit に渡す。外から届いたフレームは receive(_:) で受け取り、
-// OS が並べた入れ物に書き込む（入れ物が無ければ、来るまで取っておく）。
-// receive はほかのスレッドから呼んでもよい（鍵で守る）。入れ物に書くのは CPU の側（interruptLine を見るとき）
-final class VirtioNet: @unchecked Sendable {
-    let legacy: Bool
-    let mac = Net.guestMAC
-    /// OS が送り出したフレーム（ヘッダを除いたイーサネットのフレーム）
-    var onTransmit: (([UInt8]) -> Void)?
-
-    static let queueMax: UInt32 = 256
-    static let maxPending = 512
-
-    private let ram: GuestRAM
-
-    private struct Queue {
-        var num: UInt32 = 0
-        var ready: UInt32 = 0
-        var desc: UInt64 = 0
-        var avail: UInt64 = 0
-        var used: UInt64 = 0
-        var lastAvail: UInt16 = 0
-        var align: UInt32 = 4096
-        var pfn: UInt32 = 0
-        /// 入れ物の数（ドライバが決めていなければ最大）
-        var size: UInt16 { UInt16(num == 0 ? VirtioNet.queueMax : num) }
-    }
-    private var queues = [Queue(), Queue()]
-    private var status: UInt32 = 0
-    private var deviceFeaturesSel: UInt32 = 0
-    private var driverFeaturesSel: UInt32 = 0
-    private var driverFeatures: UInt64 = 0
-    private var queueSel: UInt32 = 0
-    private var interruptStatus: UInt32 = 0
-    private var guestPageSize: UInt32 = 4096
-
-    /// まだ OS に渡していない受け取ったフレーム
-    private var pending: [[UInt8]] = []
-    /// RX キューがいっぱいで捨てたフレームの数（lock で守る）
-    private var dropped = 0
-    var droppedRx: Int { lock.lock(); defer { lock.unlock() }; return dropped }
-    private let lock = NSLock()
-    private var hasPending = false
-
-    init(memory: GuestRAM, legacy: Bool = true) {
-        ram = memory
-        self.legacy = legacy
-    }
-
-    var interruptLine: Bool {
-        if hasPending { deliverPending() }
-        return interruptStatus != 0
-    }
-
-    /// 外から届いたフレームを受け取る（どのスレッドからでもよい）
-    func receive(_ frame: [UInt8]) {
-        lock.lock()
-        if pending.count >= VirtioNet.maxPending { pending.removeFirst(); dropped += 1 }
-        pending.append(frame)
-        hasPending = true
-        lock.unlock()
-    }
-
-    /// 持っている機能: MAC。バージョン 2 なら VERSION_1 も
-    private var deviceFeatures: UInt64 { (legacy ? 0 : VirtioMMIO.featureVersion1) | VirtioMMIO.featureNetMAC }
-
-    private func reset() {
-        status = 0
-        deviceFeaturesSel = 0
-        driverFeaturesSel = 0
-        driverFeatures = 0
-        queueSel = 0
-        interruptStatus = 0
-        guestPageSize = 4096
-        queues = [Queue(), Queue()]
-    }
-
-    // MARK: レジスタ
-
-    func read(_ offset: UInt64, size width: Int) -> UInt64 {
-        typealias R = VirtioMMIO.Reg
-        if offset >= R.config {
-            // 設定領域: 先頭 6 バイトが MAC アドレス
-            var r: UInt64 = 0
-            for k in 0..<width {
-                let i = Int(offset - R.config) + k
-                if i < mac.count { r |= UInt64(mac[i]) << UInt64(8 * k) }
-            }
-            return r
-        }
-        let qs = Int(queueSel)
-        let ok = qs < queues.count
-        switch offset {
-        case R.magic: return UInt64(VirtioMMIO.magicValue)
-        case R.version: return legacy ? 1 : 2
-        case R.deviceID: return UInt64(VirtioMMIO.deviceNet)
-        case R.vendorID: return UInt64(VirtioMMIO.vendorQEMU)
-        case R.deviceFeatures: return deviceFeaturesSel < 2 ? (deviceFeatures >> UInt64(32 * deviceFeaturesSel)) & 0xFFFF_FFFF : 0
-        case R.queueNumMax: return ok ? UInt64(VirtioNet.queueMax) : 0
-        case R.queuePFN: return legacy && ok ? UInt64(queues[qs].pfn) : 0
-        case R.queueReady: return ok ? UInt64(queues[qs].ready) : 0
-        case R.interruptStatus: return UInt64(interruptStatus)
-        case R.status: return UInt64(status)
-        default: return 0
-        }
-    }
-
-    func write(_ offset: UInt64, size width: Int, value: UInt64) {
-        typealias R = VirtioMMIO.Reg
-        let v = UInt32(truncatingIfNeeded: value)
-        let qs = Int(queueSel)
-        let ok = qs < queues.count
-        switch offset {
-        case R.deviceFeaturesSel: deviceFeaturesSel = v
-        case R.driverFeatures:
-            if driverFeaturesSel < 2 {
-                let shift = UInt64(32 * driverFeaturesSel)
-                driverFeatures = (driverFeatures & ~(0xFFFF_FFFF << shift)) | (UInt64(v) << shift)
-            }
-        case R.driverFeaturesSel: driverFeaturesSel = v
-        case R.guestPageSize: if legacy { guestPageSize = v == 0 ? 4096 : v }
-        case R.queueSel: queueSel = v
-        case R.queueNum: if ok { queues[qs].num = min(v, VirtioNet.queueMax) }
-        case R.queueAlign: if legacy && ok { queues[qs].align = v == 0 ? 4096 : v }
-        case R.queuePFN: if legacy && ok { setLegacyQueue(qs, pfn: v) }
-        case R.queueReady: if ok { queues[qs].ready = v & 1 }
-        case R.queueNotify:
-            if v == UInt32(VirtioMMIO.txQueue) { transmit() } else if v == UInt32(VirtioMMIO.rxQueue) { deliverPending() }
-        case R.interruptACK: interruptStatus &= ~v
-        case R.status: if v == 0 { reset() } else { status = v }
-        case R.queueDescLow: if ok { queues[qs].desc = setLow(queues[qs].desc, v) }
-        case R.queueDescHigh: if ok { queues[qs].desc = setHigh(queues[qs].desc, v) }
-        case R.queueAvailLow: if ok { queues[qs].avail = setLow(queues[qs].avail, v) }
-        case R.queueAvailHigh: if ok { queues[qs].avail = setHigh(queues[qs].avail, v) }
-        case R.queueUsedLow: if ok { queues[qs].used = setLow(queues[qs].used, v) }
-        case R.queueUsedHigh: if ok { queues[qs].used = setHigh(queues[qs].used, v) }
-        default: break
-        }
-    }
-
-    /// 古い形: ページ番号（PFN）から、記述子表・avail・used の場所を決める
-    private func setLegacyQueue(_ i: Int, pfn: UInt32) {
-        queues[i].pfn = pfn
-        if pfn == 0 { queues[i].ready = 0; queues[i].lastAvail = 0; return }
-        let num = UInt64(queues[i].size)
-        let desc = UInt64(pfn) * UInt64(guestPageSize)
-        let avail = desc + 16 * num
-        let align = UInt64(queues[i].align)
-        let availEnd = avail + 4 + 2 * num + 2
-        queues[i].desc = desc
-        queues[i].avail = avail
-        queues[i].used = (availEnd + align - 1) / align * align
-        queues[i].lastAvail = 0
-        queues[i].ready = 1
-    }
-
-    private func setLow(_ x: UInt64, _ v: UInt32) -> UInt64 { (x & 0xFFFF_FFFF_0000_0000) | UInt64(v) }
-    private func setHigh(_ x: UInt64, _ v: UInt32) -> UInt64 { (x & 0xFFFF_FFFF) | (UInt64(v) << 32) }
-
-    // MARK: キュー（RAM はゲストが書いた場所なので、確かめながら読み書きする）
-
-    private func load16(_ pa: UInt64) -> UInt16 { ram.pointer(pa, count: 2)?.loadUnaligned(as: UInt16.self) ?? 0 }
-    private func load32(_ pa: UInt64) -> UInt32 { ram.pointer(pa, count: 4)?.loadUnaligned(as: UInt32.self) ?? 0 }
-    private func load64(_ pa: UInt64) -> UInt64 { ram.pointer(pa, count: 8)?.loadUnaligned(as: UInt64.self) ?? 0 }
-    private func store16(_ pa: UInt64, _ v: UInt16) { ram.pointer(pa, count: 2)?.storeBytes(of: v, as: UInt16.self) }
-    private func store32(_ pa: UInt64, _ v: UInt32) { ram.pointer(pa, count: 4)?.storeBytes(of: v, as: UInt32.self) }
-
-    /// ドライバが並べた番号（avail.idx）
-    private func availIdx(_ q: Queue) -> UInt16 { load16(q.avail + 2) }
-    /// 次に取り出す入れ物の先頭の記述子
-    private func nextAvailHead(_ q: Queue) -> UInt16 { load16(q.avail + 4 + 2 * UInt64(q.lastAvail % q.size)) }
-
-    /// 記述子のつながり: (アドレス, 長さ, 書き込み用か)
-    private func chain(_ q: Queue, head: UInt16) -> [(addr: UInt64, len: Int, writable: Bool)] {
-        var out: [(addr: UInt64, len: Int, writable: Bool)] = []
-        var i = head
-        let num = q.size
-        for _ in 0..<Int(num) {
-            let d = q.desc + 16 * UInt64(i % num)
-            let flags = load16(d + 12)
-            out.append((load64(d), Int(load32(d + 8)), flags & VirtioMMIO.descWrite != 0))
-            if flags & VirtioMMIO.descNext == 0 { break }
-            i = load16(d + 14)
-        }
-        return out
-    }
-
-    /// 使い終わった入れ物を used リングに返す
-    private func pushUsed(_ q: Queue, head: UInt16, len: Int) {
-        let usedIdx = load16(q.used + 2)
-        let slot = q.used + 4 + 8 * UInt64(usedIdx % q.size)
-        store32(slot, UInt32(head))
-        store32(slot + 4, UInt32(len))
-        store16(q.used + 2, usedIdx &+ 1)
-    }
-
-    /// 送り出し用のキューに並んだフレームを取り出して onTransmit に渡す
-    private func transmit() {
-        let qi = VirtioMMIO.txQueue
-        guard queues[qi].ready != 0 else { return }
-        let end = availIdx(queues[qi])
-        var did = false
-        var guardCount = 0
-        while queues[qi].lastAvail != end && guardCount < Int(queues[qi].size) * 2 {
-            guardCount += 1
-            let head = nextAvailHead(queues[qi])
-            var bytes: [UInt8] = []
-            for d in chain(queues[qi], head: head) where !d.writable {
-                guard d.len > 0, d.len <= 65536, let p = ram.pointer(d.addr, count: d.len) else { continue }
-                bytes.append(contentsOf: UnsafeRawBufferPointer(start: p, count: d.len))
-            }
-            if bytes.count > VirtioMMIO.netHeaderSize {
-                onTransmit?(Array(bytes[VirtioMMIO.netHeaderSize...]))
-            }
-            pushUsed(queues[qi], head: head, len: 0)
-            queues[qi].lastAvail &+= 1
-            did = true
-        }
-        if did { interruptStatus |= 1 }
-    }
-
-    /// 取っておいたフレームを、OS が並べた受け取り用の入れ物に書く
-    private func deliverPending() {
-        let qi = VirtioMMIO.rxQueue
-        guard queues[qi].ready != 0 else { return }
-        var did = false
-        lock.lock()
-        while !pending.isEmpty {
-            if queues[qi].lastAvail == availIdx(queues[qi]) { break }       // 入れ物が無い: あとで
-            let head = nextAvailHead(queues[qi])
-            // ヘッダ（10 バイトの 0）+ フレームを、入れ物の記述子に順に詰める
-            let full = [UInt8](repeating: 0, count: VirtioMMIO.netHeaderSize) + pending.removeFirst()
-            var written = 0
-            for d in chain(queues[qi], head: head) where d.writable {
-                if written >= full.count { break }
-                let n = min(d.len, full.count - written)
-                guard n > 0, let p = ram.pointer(d.addr, count: n) else { continue }
-                full.withUnsafeBytes { src in p.copyMemory(from: src.baseAddress! + written, byteCount: n) }
-                written += n
-            }
-            pushUsed(queues[qi], head: head, len: written)
-            queues[qi].lastAvail &+= 1
-            did = true
-        }
-        hasPending = !pending.isEmpty
-        lock.unlock()
-        if did { interruptStatus |= 1 }
     }
 }

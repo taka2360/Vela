@@ -193,6 +193,8 @@ open class WKWebsiteDataStore: NSObject {
     open class func nonPersistent() -> WKWebsiteDataStore { WKWebsiteDataStore() }
     open var httpCookieStore: WKHTTPCookieStore { WKHTTPCookieStore() }
     open var isPersistent: Bool { true }
+    open class func allWebsiteDataTypes() -> Set<String> { [] }
+    open func removeData(ofTypes dataTypes: Set<String>, modifiedSince date: Date, completionHandler: @escaping @MainActor () -> Void) {}
 }
 
 public struct WKAudiovisualMediaTypes: OptionSet {

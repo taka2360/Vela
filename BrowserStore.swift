@@ -68,8 +68,15 @@ final class BrowserStore: ObservableObject {
     /// VNet の様子（ツールバー・開発者パネル用）
     @Published private(set) var vnetReady = false
     @Published private(set) var vnetStatus = "準備中…"
-    /// 開発者パネルのログ（パネルを開いている間だけ更新する）
-    @Published private(set) var logText = ""
+    /// 開発者パネルを描き直す合図（パネルを開いている間だけ、0.5 秒ごとに増える）
+    @Published private(set) var devTick = 0
+    /// VNet の数字（開発者パネル用）
+    @Published private(set) var vnetStats: VNetMachine.Stats?
+    @Published var showSettings = false
+    /// 起動した時刻
+    let launchedAt = Date()
+    /// 通信の記録（VNet が引き受けた要求 1 つずつ）
+    let netLog = NetLog()
     @Published var showDownloads = false
     /// 前回は落ちて終わった（開発者パネルで前回の記録を見られる）
     @Published private(set) var hadCrash = false
@@ -453,12 +460,41 @@ final class BrowserStore: ObservableObject {
             Task { @MainActor in
                 store?.vnetReady = s.ready
                 store?.vnetStatus = text
+                if store?.showDevPanel == true { store?.vnetStats = s }
             }
         }
     }
 
     private func flushLogIfVisible() {
-        guard showDevPanel, let t = logs.take(lines: 400) else { return }
-        logText = t
+        guard showDevPanel else { return }
+        devTick += 1
     }
+
+    // MARK: 設定・データ
+
+    /// Cookie の決まりなど、すぐ効かせられる設定を入れ直す
+    func applySettings() {
+        cookieJar.settings = VelaSettings.cookiePolicy
+        for t in tabs { t.applySettings() }
+        logs.add("設定を変えました", level: .info, category: .app)
+    }
+
+    /// Cookie・キャッシュ・サイトのデータを消す
+    func clearWebsiteData() {
+        let types = WKWebsiteDataStore.allWebsiteDataTypes()
+        WKWebsiteDataStore.default().removeData(ofTypes: types, modifiedSince: Date.distantPast) { [weak self] in
+            let store = self
+            Task { @MainActor in
+                store?.cookieJar.removeAll()
+                store?.logs.add("Cookie とサイトのデータを消しました", level: .info, category: .cookie)
+            }
+        }
+    }
+
+    func clearHSTS() {
+        hsts.removeAll()
+        logs.add("HSTS の記録を消しました", level: .info, category: .security)
+    }
+
+    func clearClosedTabs() { closedTabs = [] }
 }

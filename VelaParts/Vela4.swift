@@ -17,6 +17,368 @@ import Security
 #endif
 
 // ======================================================================
+// MARK: - Library.swift
+// ======================================================================
+
+// MARK: - ブックマークと履歴の置き場（bookmarks.json・history.json）と、アドレス欄の入力の様子
+//
+// 中身の決まり（重ならない・上限・候補の順番）は LibraryModel.swift。ここは保存と画面への知らせだけ
+
+@MainActor
+final class Library: ObservableObject {
+    @Published private(set) var bookmarks = BookmarkList()
+    @Published private(set) var history = HistoryLog()
+    var log: ((String) -> Void)?
+    private let bookmarkFile = JSONFile<BookmarkList>(name: "bookmarks.json", delay: 0.5)
+    /// 履歴はページを開くたびに変わるので、まとめて書く
+    private let historyFile = JSONFile<HistoryLog>(name: "history.json", delay: 5)
+    private var loaded = false
+
+    /// BrowserStore の初期値として作られる（MainActor の外のことがある）ので、ここでは何もしない。読むのは load
+    nonisolated init() {}
+
+    func load(logs: DevLog) {
+        if loaded { return }
+        loaded = true
+        log = { s in logs.add(s, level: .info, category: .app) }
+        bookmarkFile.log = { s in logs.add(s) }
+        historyFile.log = { s in logs.add(s) }
+        bookmarks = bookmarkFile.load() ?? BookmarkList()
+        history = historyFile.load() ?? HistoryLog()
+        log?("ブックマーク \(bookmarks.items.count) 件・履歴 \(history.entries.count) 件を読みました")
+    }
+
+    func saveNow() {
+        bookmarkFile.saveNow()
+        historyFile.saveNow()
+    }
+
+    // MARK: ブックマーク
+
+    func isBookmarked(_ u: URL?) -> Bool {
+        guard let u else { return false }
+        return bookmarks.contains(u.absoluteString)
+    }
+
+    /// 付いていなければ付ける、付いていれば外す。付けたら true
+    @discardableResult
+    func toggleBookmark(url: URL, title: String) -> Bool {
+        let s = url.absoluteString
+        if bookmarks.contains(s) {
+            bookmarks.remove(url: s)
+            log?("ブックマークを外しました: \(s)")
+            bookmarkFile.save(bookmarks)
+            return false
+        }
+        guard LibraryKey.isRecordable(url) else { return false }
+        bookmarks.add(title: title, url: s)
+        log?("ブックマークに入れました: \(s)")
+        bookmarkFile.save(bookmarks)
+        return true
+    }
+
+    func removeBookmark(_ id: UUID) {
+        bookmarks.remove(id: id)
+        bookmarkFile.save(bookmarks)
+    }
+
+    func renameBookmark(_ id: UUID, title: String) {
+        bookmarks.rename(id: id, title: title)
+        bookmarkFile.save(bookmarks)
+    }
+
+    func moveBookmark(_ id: UUID, by delta: Int) {
+        bookmarks.move(id: id, by: delta)
+        bookmarkFile.save(bookmarks)
+    }
+
+    // MARK: 履歴
+
+    func recordVisit(url: URL, title: String) {
+        if history.record(url: url, title: title) { historyFile.save(history) }
+    }
+
+    func updateTitle(url: URL, title: String) {
+        let before = history
+        history.updateTitle(url: url, title: title)
+        if history != before { historyFile.save(history) }
+    }
+
+    func removeHistory(_ url: String) {
+        history.remove(url: url)
+        historyFile.save(history)
+    }
+
+    /// since より後の履歴を消す（nil なら全部）
+    func clearHistory(since: Date?) {
+        history.clear(since: since)
+        historyFile.saveNow(history)
+        log?(since == nil ? "履歴を全部消しました" : "履歴を消しました（\(since!) から後）")
+    }
+
+    func suggestions(for text: String) -> [Suggestion] {
+        Suggestions.rank(query: text, bookmarks: bookmarks.items, history: history.entries)
+    }
+}
+
+/// アドレス欄の入力（打つたびに変わるので、BrowserStore とは分けて、見る所だけを描き直す）
+@MainActor
+final class AddressEditor: ObservableObject {
+    @Published var text = ""
+    @Published var editing = false
+    /// 増やすとアドレス欄にフォーカスを当てる（⌘L）
+    @Published private(set) var focusRequest = 0
+    /// 増やすとアドレス欄から離れる（候補を選んだ・外を押した）
+    @Published private(set) var blurRequest = 0
+
+    nonisolated init() {}
+
+    func focus() { focusRequest += 1 }
+    func blur() { blurRequest += 1 }
+}
+
+// ======================================================================
+// MARK: - LibraryModel.swift
+// ======================================================================
+
+// MARK: - ブックマーク・履歴・アドレス欄の候補・文字の大きさ（UI と WebKit に頼らない部分。Linux でテストする）
+//
+// ・同じページかどうかは LibraryKey.normalize で比べる（#… を外す・スキームとホストを小文字に・末尾の「/」だけの違いを無視）
+// ・履歴は URL ごとに 1 つ（最後に見た時刻・見た回数・タイトル）。新しい順。最大 HistoryLog.maxEntries 件
+// ・候補は「入れた文字で始まるサイト」を一番上に。ブックマーク・よく見る・最近見たものを上げる
+
+enum LibraryKey {
+    /// 比べるための形（保存はしない）
+    static func normalize(_ s: String) -> String {
+        guard var c = URLComponents(string: s) else { return s }
+        c.fragment = nil
+        c.scheme = c.scheme?.lowercased()
+        c.host = c.host?.lowercased()
+        if c.path == "/" && c.query == nil { c.path = "" }
+        return c.string ?? s
+    }
+
+    /// 履歴・ブックマークに入れてよい URL か（http・https だけ）
+    static func isRecordable(_ u: URL) -> Bool {
+        let s = u.scheme?.lowercased()
+        return (s == "http" || s == "https") && u.host?.isEmpty == false
+    }
+
+    /// 候補の照らし合わせ用（スキームと「www.」を外して小文字に）
+    static func bare(_ s: String) -> String {
+        var t = s.lowercased()
+        for p in ["https://", "http://"] where t.hasPrefix(p) { t.removeFirst(p.count) }
+        if t.hasPrefix("www.") { t.removeFirst(4) }
+        return t
+    }
+}
+
+struct Bookmark: Codable, Identifiable, Equatable {
+    var id: UUID
+    var title: String
+    var url: String
+    var added: Date
+}
+
+struct BookmarkList: Codable, Equatable {
+    var items: [Bookmark] = []
+
+    func find(_ url: String) -> Bookmark? {
+        let k = LibraryKey.normalize(url)
+        return items.first { LibraryKey.normalize($0.url) == k }
+    }
+
+    func contains(_ url: String) -> Bool { find(url) != nil }
+
+    /// 足す（同じページが既にあれば足さずに false）
+    @discardableResult
+    mutating func add(title: String, url: String, now: Date = Date()) -> Bool {
+        if contains(url) { return false }
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        items.append(Bookmark(id: UUID(), title: t.isEmpty ? url : t, url: url, added: now))
+        return true
+    }
+
+    mutating func remove(id: UUID) { items.removeAll { $0.id == id } }
+
+    mutating func remove(url: String) {
+        let k = LibraryKey.normalize(url)
+        items.removeAll { LibraryKey.normalize($0.url) == k }
+    }
+
+    mutating func rename(id: UUID, title: String) {
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty, let i = items.firstIndex(where: { $0.id == id }) else { return }
+        items[i].title = t
+    }
+
+    /// 並べ替え（delta: -1 で 1 つ上、+1 で 1 つ下）
+    mutating func move(id: UUID, by delta: Int) {
+        guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        let j = max(0, min(items.count - 1, i + delta))
+        if i == j { return }
+        let b = items.remove(at: i)
+        items.insert(b, at: j)
+    }
+}
+
+struct HistoryEntry: Codable, Identifiable, Equatable {
+    var url: String
+    var title: String
+    var lastVisit: Date
+    var visits: Int
+    var id: String { url }
+}
+
+struct HistoryLog: Codable, Equatable {
+    static let maxEntries = 5000
+    /// 新しい順
+    var entries: [HistoryEntry] = []
+
+    /// 見たページを記録する（http・https だけ）。記録したら true
+    @discardableResult
+    mutating func record(url: URL, title: String, at now: Date = Date()) -> Bool {
+        guard LibraryKey.isRecordable(url) else { return false }
+        let s = url.absoluteString
+        let k = LibraryKey.normalize(s)
+        var e = HistoryEntry(url: s, title: title, lastVisit: now, visits: 1)
+        if let i = entries.firstIndex(where: { LibraryKey.normalize($0.url) == k }) {
+            let old = entries.remove(at: i)
+            e.visits = old.visits + 1
+            if title.isEmpty { e.title = old.title }
+        }
+        entries.insert(e, at: 0)
+        if entries.count > HistoryLog.maxEntries { entries.removeLast(entries.count - HistoryLog.maxEntries) }
+        return true
+    }
+
+    /// ページのタイトルが後から変わった（読み込みの後に JavaScript が変えるなど）
+    mutating func updateTitle(url: URL, title: String) {
+        guard !title.isEmpty else { return }
+        let k = LibraryKey.normalize(url.absoluteString)
+        if let i = entries.firstIndex(where: { LibraryKey.normalize($0.url) == k }), entries[i].title != title {
+            entries[i].title = title
+        }
+    }
+
+    mutating func remove(url: String) {
+        let k = LibraryKey.normalize(url)
+        entries.removeAll { LibraryKey.normalize($0.url) == k }
+    }
+
+    /// since より後に見たものを消す（nil なら全部）
+    mutating func clear(since: Date?) {
+        guard let since else { entries = []; return }
+        entries.removeAll { $0.lastVisit >= since }
+    }
+
+    /// 文字で探す（タイトルと URL。新しい順）
+    func search(_ q: String, limit: Int = 500) -> [HistoryEntry] {
+        let t = q.trimmingCharacters(in: .whitespaces).lowercased()
+        if t.isEmpty { return Array(entries.prefix(limit)) }
+        return Array(entries.lazy.filter { $0.title.lowercased().contains(t) || $0.url.lowercased().contains(t) }.prefix(limit))
+    }
+
+    /// よく見るサイト（ホストごとに 1 つ。回数の多い順）
+    func topSites(limit: Int = 8) -> [HistoryEntry] {
+        var best: [String: HistoryEntry] = [:]
+        var total: [String: Int] = [:]
+        for e in entries {
+            guard let h = URL(string: e.url)?.host?.lowercased() else { continue }
+            total[h, default: 0] += e.visits
+            if let b = best[h], b.visits >= e.visits { continue }
+            best[h] = e
+        }
+        return best.sorted { a, b in
+            let ta = total[a.key] ?? 0, tb = total[b.key] ?? 0
+            return ta != tb ? ta > tb : a.value.lastVisit > b.value.lastVisit
+        }.prefix(limit).map { $0.value }
+    }
+
+    /// 日ごとに分ける（見出し・その日の分）。entries は新しい順のまま渡す
+    static func groupByDay(_ list: [HistoryEntry], now: Date = Date(), calendar: Calendar = .current) -> [(title: String, entries: [HistoryEntry])] {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "ja_JP")
+        f.dateFormat = "M月d日（E）"
+        var out: [(title: String, entries: [HistoryEntry])] = []
+        var lastDay: Date?
+        for e in list {
+            let day = calendar.startOfDay(for: e.lastVisit)
+            if day != lastDay {
+                let title: String
+                if calendar.isDate(day, inSameDayAs: now) { title = "今日" }
+                else if let y = calendar.date(byAdding: .day, value: -1, to: now), calendar.isDate(day, inSameDayAs: y) { title = "昨日" }
+                else { title = f.string(from: day) }
+                out.append((title, []))
+                lastDay = day
+            }
+            out[out.count - 1].entries.append(e)
+        }
+        return out
+    }
+}
+
+// MARK: アドレス欄の候補
+
+struct Suggestion: Identifiable, Equatable {
+    enum Kind: Equatable { case bookmark, history }
+    let kind: Kind
+    let title: String
+    let url: String
+    var id: String { url }
+}
+
+enum Suggestions {
+    static func rank(query: String, bookmarks: [Bookmark], history: [HistoryEntry], now: Date = Date(), limit: Int = 8) -> [Suggestion] {
+        let q = LibraryKey.bare(query.trimmingCharacters(in: .whitespaces))
+        if q.isEmpty { return [] }
+        var scored: [String: (Int, Suggestion)] = [:]
+        func consider(_ s: Suggestion, bonus: Int) {
+            let u = LibraryKey.bare(s.url)
+            let title = s.title.lowercased()
+            var score: Int
+            if u.hasPrefix(q) { score = 100 }
+            else if title.hasPrefix(q) || title.contains(" " + q) { score = 60 }
+            else if u.contains(q) || title.contains(q) { score = 30 }
+            else { return }
+            score += bonus
+            let k = LibraryKey.normalize(s.url)
+            if let old = scored[k], old.0 >= score { return }
+            scored[k] = (score, s)
+        }
+        for b in bookmarks { consider(Suggestion(kind: .bookmark, title: b.title, url: b.url), bonus: 25) }
+        // 履歴は全部を見ると重いので、新しい 2,000 件まで
+        for h in history.prefix(2000) {
+            var bonus = min(h.visits, 20) * 2
+            let age = now.timeIntervalSince(h.lastVisit)
+            if age < 86_400 { bonus += 10 } else if age < 7 * 86_400 { bonus += 5 }
+            // 短い URL（サイトの入口）を少し上げる
+            if (URL(string: h.url)?.path.count ?? 0) <= 1 { bonus += 8 }
+            consider(Suggestion(kind: .history, title: h.title, url: h.url), bonus: bonus)
+        }
+        return scored.values.sorted { a, b in
+            a.0 != b.0 ? a.0 > b.0 : a.1.url.count < b.1.url.count
+        }.prefix(limit).map { $0.1 }
+    }
+}
+
+// MARK: 文字の大きさ（ページの拡大率）
+
+enum PageZoom {
+    static let steps: [Double] = [0.5, 0.75, 0.85, 1.0, 1.15, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]
+
+    /// 今の値から段を delta だけ動かした値（delta が 0 なら 100%）
+    static func step(from z: Double, by delta: Int) -> Double {
+        if delta == 0 { return 1.0 }
+        // 今の値に一番近い段から動かす
+        let i = steps.indices.min { abs(steps[$0] - z) < abs(steps[$1] - z) } ?? 3
+        return steps[max(0, min(steps.count - 1, i + delta))]
+    }
+
+    static func percent(_ z: Double) -> String { "\(Int((z * 100).rounded()))%" }
+}
+
+// ======================================================================
 // MARK: - AddressInput.swift
 // ======================================================================
 
@@ -276,6 +638,148 @@ enum ErrorPage {
             }
         }
         return o
+    }
+}
+
+// ======================================================================
+// MARK: - NetLog.swift
+// ======================================================================
+
+// MARK: - 通信の記録（開発者パネルの「通信」。VNet が引き受けた要求 1 つずつ）
+//
+// 要求ごとに、メソッド・URL・種類・結果（返事の番号・大きさ・かかった時間）と、途中で決めたこと
+// （HSTS で https に上げた・リダイレクト・Cookie を保存した・広告ブロックで止めた など）をメモとして持つ。
+// 最新 maxRecords 件まで。どのスレッドから書いてもよい
+
+struct NetRecord: Identifiable, Sendable, Equatable {
+    enum Outcome: Sendable, Equatable {
+        case pending
+        case ok
+        case failed(String)
+        case blocked(String)
+        case cancelled
+        case download
+
+        var label: String {
+            switch self {
+            case .pending: return "…"
+            case .ok: return "完了"
+            case .failed: return "失敗"
+            case .blocked: return "ブロック"
+            case .cancelled: return "取り消し"
+            case .download: return "ダウンロード"
+            }
+        }
+    }
+
+    let id: Int
+    let tab: Int?
+    let started: Date
+    var method: String
+    var url: String
+    /// 種類（ページ・画像・スクリプト など。当て推量）
+    var kind: String
+    var topLevel: Bool
+    var status: Int?
+    var bytes = 0
+    var finished: Date?
+    var outcome = Outcome.pending
+    var notes: [String] = []
+
+    var durationMs: Int? { finished.map { Int($0.timeIntervalSince(started) * 1000) } }
+    var isProblem: Bool {
+        switch outcome {
+        case .failed, .blocked: return true
+        default: return (status ?? 0) >= 400
+        }
+    }
+
+    /// 1 行の説明
+    var line: String {
+        let st = status.map(String.init) ?? outcome.label
+        let ms = durationMs.map { "\($0)ms" } ?? "…"
+        let kb = bytes > 0 ? "・\(bytes / 1024)KB" : ""
+        var s = "\(st) \(method) \(kind)\(topLevel ? "（ページ）" : "") \(ms)\(kb) \(url)"
+        switch outcome {
+        case .failed(let m): s += "  ✕ \(m)"
+        case .blocked(let r): s += "  🚫 \(r)"
+        default: break
+        }
+        return s
+    }
+}
+
+final class NetLog: @unchecked Sendable {
+    static let maxRecords = 1000
+    private let lock = NSLock()
+    private var records: [NetRecord] = []
+    private var positions: [Int: Int] = [:]     // id → records の中の位置
+    private var nextID = 1
+    /// 変わるたびに増える（画面が描き直すかを決める）
+    private(set) var version = 0
+
+    init() {}
+
+    /// 始まった要求を記録して、番号を返す
+    func begin(tab: Int?, method: String, url: String, kind: String, topLevel: Bool, now: Date = Date()) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let id = nextID
+        nextID += 1
+        records.append(NetRecord(id: id, tab: tab, started: now, method: method, url: url, kind: kind, topLevel: topLevel))
+        positions[id] = records.count - 1
+        if records.count > NetLog.maxRecords + 100 {
+            // まとめて古いものを捨てる（1 件ずつだと位置の付け直しが重い）
+            records.removeFirst(records.count - NetLog.maxRecords)
+            positions = [:]
+            for (i, r) in records.enumerated() { positions[r.id] = i }
+        }
+        version += 1
+        return id
+    }
+
+    func update(_ id: Int, _ change: (inout NetRecord) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        guard id > 0, let i = positions[id], i < records.count, records[i].id == id else { return }
+        change(&records[i])
+        version += 1
+    }
+
+    func note(_ id: Int, _ s: String) {
+        update(id) { $0.notes.append(s) }
+    }
+
+    /// 終わった（status が分かっていれば入れる）
+    func finish(_ id: Int, outcome: NetRecord.Outcome, status: Int? = nil, bytes: Int? = nil, now: Date = Date()) {
+        update(id) { r in
+            if r.finished != nil && r.outcome != .pending { return }      // 先に終わっていたら変えない
+            r.outcome = outcome
+            if let status { r.status = status }
+            if let bytes { r.bytes = bytes }
+            r.finished = now
+        }
+    }
+
+    /// 新しい順
+    func recent(limit: Int = 300, filter: (NetRecord) -> Bool = { _ in true }) -> [NetRecord] {
+        lock.lock(); defer { lock.unlock() }
+        var out: [NetRecord] = []
+        for r in records.reversed() where filter(r) {
+            out.append(r)
+            if out.count >= limit { break }
+        }
+        return out
+    }
+
+    var count: Int { lock.lock(); defer { lock.unlock() }; return records.count }
+
+    func clear() {
+        lock.lock(); records = []; positions = [:]; version += 1; lock.unlock()
+    }
+
+    func export() -> String {
+        recent(limit: NetLog.maxRecords).reversed().map { r in
+            ([r.line] + r.notes.map { "    " + $0 }).joined(separator: "\n")
+        }.joined(separator: "\n")
     }
 }
 
@@ -634,513 +1138,5 @@ final class AdBlocker: ObservableObject {
 
     private func saveState() {
         stateFile.save(AdBlockState(lists: lists, lastAutoUpdate: lastAutoUpdate))
-    }
-}
-
-// ======================================================================
-// MARK: - ABPFilter.swift
-// ======================================================================
-
-// MARK: - 広告ブロックのルール（Adblock Plus の書き方）を読む
-//
-// EasyList・EasyPrivacy・AdGuard Japanese などの 1 行ずつのルールを、通信のルールと、要素を隠すルールに分ける。
-// 対応するもの:
-//   通信: ||host^ ・ |先頭 ・ 末尾| ・ * ・ ^ ・ @@（例外）と、$ の後の指定
-//         （third-party / first-party、script / image / stylesheet / xmlhttprequest / subdocument / font / media /
-//          websocket / ping / other / document、domain=、match-case、important、~ の打ち消し）
-//   隠す: ##セレクタ（全部のサイト）・a.com,b.com##セレクタ（そのサイト）・#@#（例外）
-// 対応しないもの（数えて読み飛ばす）: /正規表現/、$redirect・$csp・$removeparam など、#?#・#$#・#%#（スクリプト・拡張の書き方）、
-//   $popup・$elemhide など、:has-text() などの拡張セレクタ
-
-/// 読み込みの種類（ルールの $script などと照らし合わせる）
-enum ResourceType: String, CaseIterable, Hashable {
-    case document, subdocument, script, image, stylesheet, font, media, xhr, websocket, ping, other
-}
-
-struct NetworkRule: Equatable {
-    /// 本体（$ の前。|| や | の印は外してある。match-case でなければ小文字）
-    var body: String
-    var hostAnchor = false      // ||
-    var startAnchor = false     // |…
-    var endAnchor = false       // …|
-    var isException = false     // @@
-    var important = false
-    var matchCase = false
-    /// third-party: true / first-party: false / 指定なし: nil
-    var thirdParty: Bool?
-    /// 当てはまる種類（nil なら全部）
-    var types: Set<ResourceType>?
-    /// domain= の、当てはまるサイトと除くサイト
-    var includeDomains: [String] = []
-    var excludeDomains: [String] = []
-    /// 元の行（ログ・開発者向け）
-    var text: String
-}
-
-struct CosmeticRule: Equatable {
-    var selector: String
-    var includeDomains: [String] = []
-    var excludeDomains: [String] = []
-    var isException = false
-}
-
-struct ParsedFilterList {
-    var network: [NetworkRule] = []
-    var cosmetic: [CosmeticRule] = []
-    var lines = 0
-    var unsupported = 0
-    /// リストの見出しの「! Title:」
-    var title: String?
-}
-
-enum ABPParser {
-    static func parse(_ text: String) -> ParsedFilterList {
-        var out = ParsedFilterList()
-        text.enumerateLines { raw, _ in
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            if line.isEmpty { return }
-            out.lines += 1
-            if line.hasPrefix("!") {
-                if out.title == nil, line.hasPrefix("! Title:") { out.title = String(line.dropFirst(8)).trimmingCharacters(in: .whitespaces) }
-                return
-            }
-            if line.hasPrefix("[") { return }
-            if let r = parseLine(line) {
-                switch r {
-                case .network(let n): out.network.append(n)
-                case .cosmetic(let c): out.cosmetic.append(c)
-                }
-            } else {
-                out.unsupported += 1
-            }
-        }
-        return out
-    }
-
-    enum Rule { case network(NetworkRule), cosmetic(CosmeticRule) }
-
-    /// 1 行を読む。対応しない書き方なら nil
-    static func parseLine(_ line: String) -> Rule? {
-        // 隠すルール（## / #@#）。スクリプトや拡張の書き方（#?# #$# #%# #@?# など）は読まない
-        if let r = line.range(of: "#@#") ?? line.range(of: "##") {
-            let isException = line[r] == "#@#"
-            let domainsPart = String(line[..<r.lowerBound])
-            let selector = String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces)
-            if domainsPart.contains("#") || domainsPart.contains("$") || domainsPart.contains("/") { return nil }
-            guard isSafeSelector(selector) else { return nil }
-            var c = CosmeticRule(selector: selector, isException: isException)
-            for d in domainsPart.split(separator: ",") {
-                let t = d.trimmingCharacters(in: .whitespaces).lowercased()
-                if t.isEmpty { continue }
-                if t.hasPrefix("~") { c.excludeDomains.append(String(t.dropFirst())) } else { c.includeDomains.append(t) }
-            }
-            if c.includeDomains.contains(where: { $0.contains("*") }) || c.excludeDomains.contains(where: { $0.contains("*") }) { return nil }
-            return .cosmetic(c)
-        }
-        if line.contains("#?#") || line.contains("#$#") || line.contains("#%#") || line.contains("$$") || line.contains("#@") { return nil }
-        return parseNetwork(line).map { .network($0) }
-    }
-
-    /// WebKit の css-display-none に渡しても大丈夫そうなセレクタか（拡張の書き方・壊れたものを入れるとリスト全体がだめになる）
-    static func isSafeSelector(_ s: String) -> Bool {
-        if s.isEmpty || s.count > 500 { return false }
-        if s.hasPrefix("+js") || s.hasPrefix("^") || s.contains("\\") || s.contains("{") || s.contains("}") { return false }
-        guard s.unicodeScalars.allSatisfy({ $0.isASCII && $0.value >= 0x20 }) else { return false }
-        // 使ってよい疑似クラスだけ
-        if s.contains(":") {
-            let allowed = [":not(", ":nth-child(", ":nth-of-type(", ":first-child", ":last-child", ":first-of-type", ":last-of-type",
-                           ":only-child", ":empty", ":has(", ":is(", ":where("]
-            var rest = s
-            for a in allowed { rest = rest.replacingOccurrences(of: a, with: "") }
-            // 属性の中の「:」（[href^="http:"] など）は構わない
-            var depth = 0
-            for ch in rest {
-                if ch == "[" { depth += 1 } else if ch == "]" { depth -= 1 } else if ch == ":" && depth == 0 { return false }
-            }
-        }
-        // 括弧・角括弧・引用符の数が合っているか（壊れたセレクタを避ける）
-        var paren = 0, bracket = 0, dq = 0, sq = 0
-        for ch in s {
-            switch ch {
-            case "(": paren += 1
-            case ")": paren -= 1; if paren < 0 { return false }
-            case "[": bracket += 1
-            case "]": bracket -= 1; if bracket < 0 { return false }
-            case "\"": dq += 1
-            case "'": sq += 1
-            default: break
-            }
-        }
-        return paren == 0 && bracket == 0 && dq % 2 == 0 && sq % 2 == 0
-    }
-
-    static func parseNetwork(_ line: String) -> NetworkRule? {
-        var s = Substring(line)
-        var r = NetworkRule(body: "", text: line)
-        if s.hasPrefix("@@") { r.isException = true; s = s.dropFirst(2) }
-        // 正規表現のルールは読まない
-        if s.hasPrefix("/") && s.count > 2 && (s.hasSuffix("/") || s.contains("/$")) { return nil }
-        // $ の後の指定（最後の $ から。本体に $ を含むことはまれ）
-        if let dollar = s.lastIndex(of: "$") {
-            let opts = s[s.index(after: dollar)...]
-            let body = s[..<dollar]
-            if !opts.isEmpty, !opts.contains("/") || opts.contains("domain=") {
-                guard applyOptions(String(opts), to: &r) else { return nil }
-                s = body
-            }
-        }
-        if s.hasPrefix("||") { r.hostAnchor = true; s = s.dropFirst(2) }
-        else if s.hasPrefix("|") { r.startAnchor = true; s = s.dropFirst() }
-        if s.hasSuffix("|") { r.endAnchor = true; s = s.dropLast() }
-        // 先頭・末尾の * は意味が無い
-        while s.hasPrefix("*") { s = s.dropFirst(); r.hostAnchor = false; r.startAnchor = false }
-        while s.hasSuffix("*") { s = s.dropLast(); r.endAnchor = false }
-        if s.isEmpty && r.includeDomains.isEmpty { return nil }      // 全部に当たるルールは危ないので読まない
-        if s.contains("|") { return nil }
-        guard s.unicodeScalars.allSatisfy({ $0.isASCII && $0.value > 0x20 }) else { return nil }
-        r.body = r.matchCase ? String(s) : s.lowercased()
-        return r
-    }
-
-    /// $ の後の指定を読む。対応しない指定があれば false（ルールごと読まない）
-    static func applyOptions(_ opts: String, to r: inout NetworkRule) -> Bool {
-        var include = Set<ResourceType>(), exclude = Set<ResourceType>()
-        for raw in opts.split(separator: ",") {
-            var o = raw.trimmingCharacters(in: .whitespaces).lowercased()
-            let negated = o.hasPrefix("~")
-            if negated { o.removeFirst() }
-            let type: ResourceType?
-            switch o {
-            case "script": type = .script
-            case "image": type = .image
-            case "stylesheet", "css": type = .stylesheet
-            case "xmlhttprequest", "xhr": type = .xhr
-            case "subdocument", "frame": type = .subdocument
-            case "document", "doc": type = .document
-            case "font": type = .font
-            case "media": type = .media
-            case "websocket": type = .websocket
-            case "ping", "beacon": type = .ping
-            case "other", "object", "object-subrequest": type = .other
-            default: type = nil
-            }
-            if let type {
-                if negated { exclude.insert(type) } else { include.insert(type) }
-                continue
-            }
-            switch o {
-            case "third-party", "3p": r.thirdParty = !negated
-            case "first-party", "1p": r.thirdParty = negated
-            case "match-case": r.matchCase = true
-            case "important": r.important = true
-            case "all": include.formUnion(ResourceType.allCases)
-            case "cname": break
-            default:
-                if o.hasPrefix("domain=") || o.hasPrefix("from=") {
-                    let list = o.drop(while: { $0 != "=" }).dropFirst()
-                    for d in list.split(separator: "|") {
-                        let t = String(d)
-                        if t.contains("*") || t.hasPrefix("/") { return false }
-                        if t.hasPrefix("~") { r.excludeDomains.append(String(t.dropFirst())) } else { r.includeDomains.append(t) }
-                    }
-                } else {
-                    // redirect・csp・removeparam・popup・elemhide・badfilter など
-                    return false
-                }
-            }
-        }
-        if !include.isEmpty { r.types = include.subtracting(exclude) }
-        else if !exclude.isEmpty { r.types = Set(ResourceType.allCases).subtracting(exclude).subtracting([.document]) }
-        if r.types?.isEmpty == true { return false }
-        return true
-    }
-}
-
-// ======================================================================
-// MARK: - BlockEngine.swift
-// ======================================================================
-
-// MARK: - 広告ブロックの判定（VNet のタブの通信を 1 つずつ調べる）
-//
-// ルールが何万もあるので、全部を毎回調べない。ルールごとに「必ず URL に入っている言葉」（英数字の並び）を 1 つ選んで索引にし、
-// URL に入っている言葉の索引だけを調べる（言葉を選べないルールは毎回調べる）。
-// 当てはめは正規表現を使わず、* と ^ だけの簡単な照らし合わせ（速い）。
-// 作った後は変えないので、どのスレッドから使ってもよい
-
-final class BlockEngine: @unchecked Sendable {
-    struct Decision: Equatable {
-        /// 当たったブロックのルール（元の行）
-        let rule: String
-    }
-
-    private struct Compiled {
-        let rule: NetworkRule
-        let body: [UInt8]
-    }
-
-    private var blocks: [Compiled] = []
-    private var exceptions: [Compiled] = []
-    private var important: [Compiled] = []
-    /// 言葉 → ルールの番号（種類ごと）
-    private var blockIndex: [String: [Int]] = [:]
-    private var exceptionIndex: [String: [Int]] = [:]
-    private var importantIndex: [String: [Int]] = [:]
-    private var blockGeneric: [Int] = []
-    private var exceptionGeneric: [Int] = []
-    private var importantGeneric: [Int] = []
-
-    private(set) var ruleCount = 0
-
-    init(rules: [NetworkRule] = []) {
-        // 言葉は「ルールの中で一番珍しいもの」を選ぶ（"ads" などに何千ものルールが集まると、毎回たくさん調べることになる）
-        let candidates = rules.map { BlockEngine.candidateTokens($0) }
-        var freq: [String: Int] = [:]
-        for c in candidates { for t in c { freq[t, default: 0] += 1 } }
-        for (r, c) in zip(rules, candidates) {
-            let token = c.min { a, b in
-                let fa = freq[a] ?? 0, fb = freq[b] ?? 0
-                return fa != fb ? fa < fb : a.count > b.count
-            }
-            add(r, token: token)
-        }
-    }
-
-    /// 調べたときの数（開発者向け）: (言葉の種類, 言葉を選べなかったルール)
-    var indexStats: (tokens: Int, generic: Int) {
-        (blockIndex.count + exceptionIndex.count + importantIndex.count, blockGeneric.count + exceptionGeneric.count + importantGeneric.count)
-    }
-
-    static let empty = BlockEngine()
-
-    private func add(_ r: NetworkRule, token: String?) {
-        // document だけのルール（ページそのものを止める）は VNet では使わない（ページ本体は止めない）
-        if let t = r.types, t == [.document] { return }
-        let c = Compiled(rule: r, body: Array(r.body.utf8))
-        if r.isException {
-            exceptions.append(c)
-            BlockEngine.insert(token, exceptions.count - 1, &exceptionIndex, &exceptionGeneric)
-        } else if r.important {
-            important.append(c)
-            BlockEngine.insert(token, important.count - 1, &importantIndex, &importantGeneric)
-        } else {
-            blocks.append(c)
-            BlockEngine.insert(token, blocks.count - 1, &blockIndex, &blockGeneric)
-        }
-        ruleCount += 1
-    }
-
-    private static func insert(_ token: String?, _ i: Int, _ index: inout [String: [Int]], _ generic: inout [Int]) {
-        if let token { index[token, default: []].append(i) } else { generic.append(i) }
-    }
-
-    /// 言葉として使わないもの（ほとんどの URL に入っている）
-    private static let commonTokens: Set<String> = ["http", "https", "www", "com", "net", "org", "html", "js", "jpg", "png", "gif"]
-
-    /// 必ず URL に丸ごと入っている英数字の並びのうち、一番長いもの
-    static func bestToken(_ r: NetworkRule) -> String? {
-        candidateTokens(r).max { $0.count < $1.count }
-    }
-
-    /// 必ず URL に丸ごと入っている英数字の並び（索引に使えるもの）
-    static func candidateTokens(_ r: NetworkRule) -> [String] {
-        let b = Array(r.body.lowercased().utf8)
-        var out: [String] = []
-        var i = 0
-        while i < b.count {
-            guard isAlnum(b[i]) else { i += 1; continue }
-            var j = i
-            while j < b.count && isAlnum(b[j]) { j += 1 }
-            // 前後が「*」や本体の端（印の無い端）だと、URL の中ではもっと長い並びの一部かもしれない
-            let leftOK = i > 0 ? b[i - 1] != UInt8(ascii: "*") : (r.hostAnchor || r.startAnchor)
-            let rightOK = j < b.count ? b[j] != UInt8(ascii: "*") : r.endAnchor
-            if leftOK && rightOK && j - i >= 2 {
-                let t = String(decoding: b[i..<j], as: UTF8.self)
-                if !commonTokens.contains(t) { out.append(t) }
-            }
-            i = j
-        }
-        return out
-    }
-
-    @inline(__always) static func isAlnum(_ c: UInt8) -> Bool {
-        (c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x7A) || (c >= 0x41 && c <= 0x5A)
-    }
-
-    /// 「^」に当たる文字（英数字と _ - . % 以外）
-    @inline(__always) static func isSeparator(_ c: UInt8) -> Bool {
-        !(isAlnum(c) || c == UInt8(ascii: "_") || c == UInt8(ascii: "-") || c == UInt8(ascii: ".") || c == UInt8(ascii: "%"))
-    }
-
-    /// 調べる。止めるなら、当たったルール
-    /// - types: 読み込みの種類（はっきりしないときは、ありそうなもの全部）
-    /// - sourceHost: その読み込みをしたページのホスト（domain= と third-party の判定）
-    func match(url: URL, types: Set<ResourceType>, sourceHost: String?) -> Decision? {
-        let s = url.absoluteString
-        let lower = Array(s.lowercased().utf8)
-        let original = Array(s.utf8)
-        guard let hostRange = BlockEngine.hostRange(lower) else { return nil }
-        let host = String(decoding: lower[hostRange], as: UTF8.self)
-        let thirdParty: Bool? = sourceHost.map { SiteUtil.registrableDomain($0.lowercased()) != SiteUtil.registrableDomain(host) }
-        let tokens = BlockEngine.tokens(lower)
-        let req = Request(lower: lower, original: original, host: hostRange, types: types,
-                          source: sourceHost?.lowercased(), thirdParty: thirdParty)
-        if let i = find(important, importantIndex, importantGeneric, tokens, req) { return Decision(rule: important[i].rule.text) }
-        guard let i = find(blocks, blockIndex, blockGeneric, tokens, req) else { return nil }
-        if find(exceptions, exceptionIndex, exceptionGeneric, tokens, req) != nil { return nil }
-        return Decision(rule: blocks[i].rule.text)
-    }
-
-    private struct Request {
-        let lower: [UInt8]
-        let original: [UInt8]
-        let host: Range<Int>
-        let types: Set<ResourceType>
-        let source: String?
-        let thirdParty: Bool?
-    }
-
-    private func find(_ list: [Compiled], _ index: [String: [Int]], _ generic: [Int], _ tokens: [String], _ req: Request) -> Int? {
-        for t in tokens {
-            if let ids = index[t] { for i in ids where BlockEngine.matches(list[i], req) { return i } }
-        }
-        for i in generic where BlockEngine.matches(list[i], req) { return i }
-        return nil
-    }
-
-    private static func matches(_ c: Compiled, _ req: Request) -> Bool {
-        let r = c.rule
-        if let t = r.types, t.isDisjoint(with: req.types) { return false }
-        if let tp = r.thirdParty {
-            guard let actual = req.thirdParty, actual == tp else { return false }
-        }
-        if !r.includeDomains.isEmpty || !r.excludeDomains.isEmpty {
-            guard let src = req.source else { return false }
-            if r.excludeDomains.contains(where: { domainMatches(src, $0) }) { return false }
-            if !r.includeDomains.isEmpty && !r.includeDomains.contains(where: { domainMatches(src, $0) }) { return false }
-        }
-        if c.body.isEmpty { return true }
-        return patternMatches(c.body, in: r.matchCase ? req.original : req.lower, host: req.host,
-                              hostAnchor: r.hostAnchor, startAnchor: r.startAnchor, endAnchor: r.endAnchor)
-    }
-
-    static func domainMatches(_ host: String, _ d: String) -> Bool {
-        host == d || host.hasSuffix("." + d)
-    }
-
-    /// URL のホストの位置（"scheme://" の後から、/ ? # : の前まで）
-    static func hostRange(_ u: [UInt8]) -> Range<Int>? {
-        var i = 0
-        while i + 2 < u.count, !(u[i] == UInt8(ascii: ":") && u[i + 1] == UInt8(ascii: "/") && u[i + 2] == UInt8(ascii: "/")) { i += 1 }
-        guard i + 2 < u.count else { return nil }
-        let start = i + 3
-        var end = start
-        while end < u.count, ![UInt8(ascii: "/"), UInt8(ascii: "?"), UInt8(ascii: "#"), UInt8(ascii: ":")].contains(u[end]) { end += 1 }
-        return start < end ? start..<end : nil
-    }
-
-    static func tokens(_ u: [UInt8]) -> [String] {
-        var out: [String] = []
-        var i = 0
-        while i < u.count {
-            guard isAlnum(u[i]) else { i += 1; continue }
-            var j = i
-            while j < u.count && isAlnum(u[j]) { j += 1 }
-            if j - i >= 2 { out.append(String(decoding: u[i..<j], as: UTF8.self)) }
-            i = j
-        }
-        return out
-    }
-
-    /// * と ^ の入った本体を、URL に当てはめる
-    static func patternMatches(_ p: [UInt8], in u: [UInt8], host: Range<Int>, hostAnchor: Bool, startAnchor: Bool, endAnchor: Bool) -> Bool {
-        // 「*」で区切る
-        var segments: [ArraySlice<UInt8>] = []
-        var s = 0
-        for (i, c) in p.enumerated() where c == UInt8(ascii: "*") {
-            if i > s { segments.append(p[s..<i]) }
-            s = i + 1
-        }
-        if s < p.count { segments.append(p[s..<p.count]) }
-        if segments.isEmpty { return true }
-
-        func matchAt(_ seg: ArraySlice<UInt8>, _ pos: Int) -> Int? {
-            var k = pos
-            for c in seg {
-                if c == UInt8(ascii: "^") {
-                    if k == u.count { continue }       // 終わりにも当たる
-                    if !isSeparator(u[k]) { return nil }
-                } else {
-                    if k >= u.count || u[k] != c { return nil }
-                }
-                k += 1
-            }
-            return min(k, u.count)
-        }
-        func search(_ seg: ArraySlice<UInt8>, from: Int) -> (Int, Int)? {
-            var i = from
-            while i <= u.count {
-                if let e = matchAt(seg, i) { return (i, e) }
-                i += 1
-            }
-            return nil
-        }
-        func rest(_ from: Int, _ idx: Int) -> Bool {
-            var pos = from
-            for k in idx..<segments.count {
-                if k == segments.count - 1 && endAnchor {
-                    // 最後の区切りは URL の終わりで終わらなければならない
-                    var i = pos
-                    while i <= u.count {
-                        if let e = matchAt(segments[k], i), e == u.count { return true }
-                        i += 1
-                    }
-                    return false
-                }
-                guard let (_, e) = search(segments[k], from: pos) else { return false }
-                pos = e
-            }
-            return true
-        }
-
-        var starts: [Int] = []
-        if hostAnchor {
-            // ホストの始め、またはホストの中の「.」の後
-            starts.append(host.lowerBound)
-            for i in host where u[i] == UInt8(ascii: ".") { starts.append(i + 1) }
-        } else if startAnchor {
-            starts.append(0)
-        } else {
-            if segments.count == 1 && !endAnchor { return search(segments[0], from: 0) != nil }
-            // 最初の区切りが当たる所を順に試す
-            var i = 0
-            while let (st, e) = search(segments[0], from: i) {
-                if segments.count == 1 { if !endAnchor || e == u.count { return true } }
-                else if rest(e, 1) { return true }
-                i = st + 1
-            }
-            return false
-        }
-        for st in starts {
-            if let e = matchAt(segments[0], st) {
-                if segments.count == 1 { if !endAnchor || e == u.count { return true } }
-                else if rest(e, 1) { return true }
-            }
-        }
-        return false
-    }
-
-    /// VNet が受けた要求の種類を当てる（WebKit は種類を教えてくれないので、Accept と拡張子から）
-    static func guessTypes(url: URL, accept: String?, isTopLevel: Bool) -> Set<ResourceType> {
-        if isTopLevel { return [.document] }
-        let a = (accept ?? "").lowercased()
-        let ext = url.pathExtension.lowercased()
-        if a.hasPrefix("text/html") || a.hasPrefix("application/xhtml") { return [.subdocument] }
-        if a.hasPrefix("image/") || ["png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "ico", "bmp"].contains(ext) { return [.image] }
-        if a.hasPrefix("text/css") || ext == "css" { return [.stylesheet] }
-        if ["woff", "woff2", "ttf", "otf", "eot"].contains(ext) || a.hasPrefix("font/") { return [.font] }
-        if ["mp4", "webm", "m3u8", "ts", "mp3", "m4a", "aac", "ogg", "mov"].contains(ext) || a.hasPrefix("video/") || a.hasPrefix("audio/") { return [.media] }
-        if ext == "js" || ext == "mjs" { return [.script] }
-        // 分からない: スクリプトか、fetch / XHR か、その他
-        return [.script, .xhr, .other, .ping]
     }
 }
