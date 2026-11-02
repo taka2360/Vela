@@ -8,14 +8,8 @@ set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 PROJECT=$(cd "$HERE/../.." && pwd)
-TC=$HOME/toolchains/swift-5.8.1-RELEASE-ubuntu22.04
-export LD_LIBRARY_PATH=$HOME/toolchains/extra/root/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-SWIFTC=$TC/usr/bin/swiftc
-
-if [ ! -x "$SWIFTC" ]; then
-    echo "Swift 5.8.1 が入っていないので入れます…"
-    bash "$PROJECT/tools/swiftcheck/setup.sh" || exit 2
-fi
+# Swift 5.8.1 の場所（$SWIFTC）。無ければ入れる
+source "$PROJECT/tools/swiftenv.sh"
 
 FILES=()
 while IFS= read -r line; do

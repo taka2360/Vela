@@ -5,8 +5,8 @@ param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Filters)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-$full = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot 'run.sh')).Path
-$script = "/mnt/" + $full.Substring(0, 1).ToLower() + ($full.Substring(2) -replace '\\', '/')
+. (Join-Path $PSScriptRoot '..\wsl.ps1')   # To-WslPath
+$script = To-WslPath (Join-Path $PSScriptRoot 'run.sh')
 $wslArgs = @()
 foreach ($f in $Filters) { if ($f) { $wslArgs += $f } }
 

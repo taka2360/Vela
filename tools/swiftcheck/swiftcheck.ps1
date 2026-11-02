@@ -5,12 +5,7 @@ param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Targets)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-function To-WslPath([string]$p) {
-    if ($p -like '--*') { return $p }
-    $full = (Resolve-Path -LiteralPath $p).Path
-    $drive = $full.Substring(0, 1).ToLower()
-    return "/mnt/$drive" + ($full.Substring(2) -replace '\\', '/')
-}
+. (Join-Path $PSScriptRoot '..\wsl.ps1')   # To-WslPath
 
 $script = To-WslPath (Join-Path $PSScriptRoot 'check.sh')
 $wslArgs = @()

@@ -68,6 +68,8 @@ Playgrounds/          Playgrounds に入れる、まとめたもの（自動生�
   VelaParts/Vela1〜10.swift
 tools/
   merge_swift.py      Sources → Playgrounds を作る
+  swiftenv.sh         swiftcheck と tests が使う Swift 5.8.1 の場所（無ければ入れる）
+  wsl.ps1             Windows のパス → WSL のパス（swiftcheck.ps1・runtests.ps1 が使う）
   swiftcheck/         Windows（WSL）で Swift 5.8 の型チェック
   tests/              単体テスト
 ```
