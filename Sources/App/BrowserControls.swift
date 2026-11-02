@@ -27,11 +27,7 @@ struct PageMenu: View {
             Divider()
             AdBlockMenuItems(store: store, tab: tab, adblock: store.adblock)
             Divider()
-            if tab.mode.usesVNet {
-                Button { tab.switchMode(to: .native) } label: { Label("標準の通信で開き直す", systemImage: "network") }
-            } else if store.defaultMode.usesVNet {
-                Button { tab.switchMode(to: store.defaultMode) } label: { Label("VNet で開き直す", systemImage: "cpu") }
-            }
+            ModeSwitchItems(store: store, tab: tab)
         } label: {
             Text("ぁあ")
                 .font(.system(size: 15, weight: .medium))

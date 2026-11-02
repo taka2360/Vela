@@ -261,6 +261,21 @@ struct ModeBadge: View {
     private var color: Color { tab.mode.usesVNet ? .green : .blue }
 }
 
+// MARK: 通信の作りを変えて開き直す（「ぁあ」と「…」のメニューで同じもの）
+
+struct ModeSwitchItems: View {
+    @ObservedObject var store: BrowserStore
+    @ObservedObject var tab: BrowserTab
+
+    var body: some View {
+        if tab.mode.usesVNet {
+            Button { tab.switchMode(to: .native) } label: { Label("標準の通信で開き直す", systemImage: "network") }
+        } else if store.defaultMode.usesVNet {
+            Button { tab.switchMode(to: store.defaultMode) } label: { Label("VNet で開き直す", systemImage: "cpu") }
+        }
+    }
+}
+
 // MARK: 「…」メニュー
 
 struct MoreMenu: View {
@@ -269,11 +284,7 @@ struct MoreMenu: View {
 
     var body: some View {
         Menu {
-            if tab.mode.usesVNet {
-                Button { tab.switchMode(to: .native) } label: { Label("標準の通信で開き直す", systemImage: "network") }
-            } else if store.defaultMode.usesVNet {
-                Button { tab.switchMode(to: store.defaultMode) } label: { Label("VNet で開き直す", systemImage: "cpu") }
-            }
+            ModeSwitchItems(store: store, tab: tab)
             Button { store.openLibrary(.bookmarks) } label: { Label("ブックマーク", systemImage: "book") }
             Button { store.openLibrary(.history) } label: { Label("履歴", systemImage: "clock") }
             Divider()
