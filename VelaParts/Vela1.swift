@@ -42,6 +42,7 @@ struct VelaApp: App {
 // 中身は BrowserStore と BrowserTab。ここは見た目だけ。
 // Playgrounds で作るのが遅くならないよう、1 つの View を小さく分けている（大きな式は型チェックが遅い）
 
+@MainActor
 struct BrowserView: View {
     @StateObject private var store = BrowserStore()
     @Environment(\.scenePhase) private var scenePhase
@@ -59,13 +60,21 @@ struct BrowserView: View {
             }
             Divider()
             PageArea(store: store)
+                .overlay(alignment: .top) { SuggestionOverlay(store: store, editor: store.address) }
         }
+        .background(ShortcutKeys(store: store))
         .sheet(isPresented: $store.showDevPanel) { DevPanel(store: store) }
+        .sheet(isPresented: $store.showLibrary) { LibraryView(store: store, library: store.library) }
+        .sheet(isPresented: shareShown) { if let u = store.shareURL { ShareSheet(items: [u]) } }
         .fullScreenCover(isPresented: $store.showTabOverview) { TabOverview(store: store) }
         .modifier(DialogModifier(store: store))
         .onChange(of: scenePhase) { phase in
             if phase != .active { store.saveSessionNow() }
         }
+    }
+
+    private var shareShown: Binding<Bool> {
+        Binding(get: { store.shareURL != nil }, set: { if !$0 { store.shareURL = nil } })
     }
 }
 
@@ -79,7 +88,8 @@ struct TopBar: View {
         VStack(spacing: 0) {
             HStack(spacing: 14) {
                 NavButtons(tab: tab)
-                AddressField(store: store, tab: tab)
+                Button { store.openLibrary(.bookmarks) } label: { Image(systemName: "book") }
+                AddressField(store: store, tab: tab, editor: store.address, library: store.library)
                 ReloadButton(tab: tab)
                 DownloadsButton(manager: store.downloads, show: $store.showDownloads)
                 MoreMenu(store: store, tab: tab)
@@ -179,26 +189,37 @@ struct LoadingBar: View {
 struct AddressField: View {
     @ObservedObject var store: BrowserStore
     @ObservedObject var tab: BrowserTab
-    @State private var text = ""
+    @ObservedObject var editor: AddressEditor
+    let library: Library
     @FocusState private var focused: Bool
 
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 10).fill(Color(UIColor.tertiarySystemFill))
-            // TextField はいつも置いておく（focused = true にした時に無いとフォーカスが当たらずキーボードが出ない）
-            editor
-                .opacity(focused ? 1 : 0)
+        HStack(spacing: 0) {
             if !focused {
-                Button { beginEditing() } label: { display.contentShape(Rectangle()) }
-                    .buttonStyle(.plain)
+                PageMenu(store: store, tab: tab, library: library)
+            }
+            ZStack {
+                // TextField はいつも置いておく（focused = true にした時に無いとフォーカスが当たらずキーボードが出ない）
+                field
+                    .opacity(focused ? 1 : 0)
+                if !focused {
+                    Button { beginEditing() } label: { display.contentShape(Rectangle()) }
+                        .buttonStyle(.plain)
+                }
             }
         }
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color(UIColor.tertiarySystemFill)))
         .frame(height: 36)
         .frame(maxWidth: .infinity)
+        .onChange(of: focused) { f in
+            if editor.editing != f { editor.editing = f }
+        }
+        .onChange(of: editor.focusRequest) { _ in beginEditing() }
+        .onChange(of: editor.blurRequest) { _ in focused = false }
     }
 
-    private var editor: some View {
-        TextField("検索・アドレスを入力", text: $text)
+    private var field: some View {
+        TextField("検索・アドレスを入力", text: $editor.text)
             .focused($focused)
             .textFieldStyle(.plain)
             .autocorrectionDisabled()
@@ -206,7 +227,7 @@ struct AddressField: View {
             .keyboardType(.webSearch)
             .submitLabel(.go)
             .onSubmit {
-                store.open(text, in: tab)
+                store.open(editor.text, in: tab)
                 focused = false
             }
             .padding(.horizontal, 10)
@@ -231,7 +252,7 @@ struct AddressField: View {
     }
 
     private func beginEditing() {
-        text = AddressInput.searchTerms(in: tab.url) ?? tab.url?.absoluteString ?? ""
+        editor.text = AddressInput.searchTerms(in: tab.url) ?? tab.url?.absoluteString ?? ""
         focused = true
     }
 }
@@ -278,6 +299,9 @@ struct MoreMenu: View {
             } else if store.defaultMode.usesVNet {
                 Button { tab.switchMode(to: store.defaultMode) } label: { Label("VNet で開き直す", systemImage: "cpu") }
             }
+            Button { store.openLibrary(.bookmarks) } label: { Label("ブックマーク", systemImage: "book") }
+            Button { store.openLibrary(.history) } label: { Label("履歴", systemImage: "clock") }
+            Divider()
             if store.canReopenClosedTab {
                 Button { store.reopenClosedTab() } label: { Label("閉じたタブを戻す", systemImage: "arrow.uturn.backward") }
             }
@@ -299,34 +323,23 @@ struct PageArea: View {
         ZStack {
             Color(UIColor.systemBackground)
             if let tab = store.selectedTab {
-                TabPage(tab: tab)
+                TabPage(store: store, tab: tab)
             }
         }
     }
 }
 
 struct TabPage: View {
+    let store: BrowserStore
     @ObservedObject var tab: BrowserTab
 
     var body: some View {
         ZStack {
             WebHost(webView: tab.webView)
             if tab.url == nil {
-                StartPage()
+                StartPage(store: store, library: store.library)
             }
         }
-    }
-}
-
-/// 新しいタブ（何も開いていないとき）
-struct StartPage: View {
-    var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "globe").font(.system(size: 44)).foregroundStyle(.secondary)
-            Text("上のアドレス欄に、URL か調べたいことを入れてください").foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(UIColor.systemBackground))
     }
 }
 
@@ -391,6 +404,95 @@ struct DialogButtons: View {
             Button("OK") { store.answerDialog(ok: true) }
         default:
             Button("OK") { store.answerDialog(ok: true) }
+        }
+    }
+}
+
+// ======================================================================
+// MARK: - BrowserControls.swift
+// ======================================================================
+
+// MARK: - 「ぁあ」メニュー（ページごとの操作）と、キーボードショートカット
+
+/// アドレス欄の左の「ぁあ」: 文字の大きさ・ページ内を検索・ブックマーク・共有・通信の切り替え
+struct PageMenu: View {
+    @ObservedObject var store: BrowserStore
+    @ObservedObject var tab: BrowserTab
+    @ObservedObject var library: Library
+
+    var body: some View {
+        Menu {
+            Button { tab.changeZoom(1) } label: { Label("文字を大きく", systemImage: "textformat.size.larger") }
+            Button { tab.changeZoom(0) } label: { Label("文字の大きさ: \(PageZoom.percent(tab.zoom))（元に戻す）", systemImage: "textformat.size") }
+            Button { tab.changeZoom(-1) } label: { Label("文字を小さく", systemImage: "textformat.size.smaller") }
+            Divider()
+            Button { tab.findInPage() } label: { Label("ページ内を検索", systemImage: "doc.text.magnifyingglass") }
+            if tab.url != nil {
+                Button { store.toggleBookmark() } label: {
+                    library.isBookmarked(tab.url)
+                        ? Label("ブックマークを外す", systemImage: "book.fill")
+                        : Label("ブックマークに入れる", systemImage: "book")
+                }
+                Button { UIPasteboard.general.url = tab.url } label: { Label("リンクをコピー", systemImage: "doc.on.doc") }
+                Button { store.shareURL = tab.url } label: { Label("共有…", systemImage: "square.and.arrow.up") }
+            }
+            Divider()
+            if tab.mode.usesVNet {
+                Button { tab.switchMode(to: .native) } label: { Label("標準の通信で開き直す", systemImage: "network") }
+            } else if store.defaultMode.usesVNet {
+                Button { tab.switchMode(to: store.defaultMode) } label: { Label("VNet で開き直す", systemImage: "cpu") }
+            }
+        } label: {
+            Text("ぁあ")
+                .font(.system(size: 15, weight: .medium))
+                .padding(.horizontal, 6)
+        }
+    }
+}
+
+/// キーボードのショートカット（見えないボタン。⌘ を長押しすると一覧に出る）
+/// ⌘T・⌘R・⌘[・⌘] はツールバーのボタンに付けてある
+struct ShortcutKeys: View {
+    @ObservedObject var store: BrowserStore
+
+    var body: some View {
+        ZStack {
+            Group {
+            Button("アドレス欄へ") { store.focusAddressBar() }.keyboardShortcut("l", modifiers: .command)
+            Button("タブを閉じる") { if let t = store.selectedTab { store.close(t) } }.keyboardShortcut("w", modifiers: .command)
+            Button("閉じたタブを戻す") { store.reopenClosedTab() }.keyboardShortcut("t", modifiers: [.command, .shift])
+            Button("次のタブ") { store.selectNextTab(1) }.keyboardShortcut("]", modifiers: [.command, .shift])
+            Button("前のタブ") { store.selectNextTab(-1) }.keyboardShortcut("[", modifiers: [.command, .shift])
+            Button("次のタブ ") { store.selectNextTab(1) }.keyboardShortcut(.tab, modifiers: .control)
+            Button("前のタブ ") { store.selectNextTab(-1) }.keyboardShortcut(.tab, modifiers: [.control, .shift])
+            TabNumberKeys(store: store)
+            }
+            Group {
+            Button("ページ内を検索") { store.selectedTab?.findInPage() }.keyboardShortcut("f", modifiers: .command)
+            Button("ブックマークに入れる・外す") { store.toggleBookmark() }.keyboardShortcut("d", modifiers: .command)
+            Button("ブックマーク") { store.openLibrary(.bookmarks) }.keyboardShortcut("b", modifiers: [.command, .option])
+            Button("履歴") { store.openLibrary(.history) }.keyboardShortcut("y", modifiers: .command)
+            Button("文字を大きく") { store.selectedTab?.changeZoom(1) }.keyboardShortcut("+", modifiers: .command)
+            Button("文字を大きく ") { store.selectedTab?.changeZoom(1) }.keyboardShortcut("=", modifiers: .command)
+            Button("文字を小さく") { store.selectedTab?.changeZoom(-1) }.keyboardShortcut("-", modifiers: .command)
+            Button("文字の大きさを元に戻す") { store.selectedTab?.changeZoom(0) }.keyboardShortcut("0", modifiers: .command)
+            Button("読み込みを止める") { store.selectedTab?.stop() }.keyboardShortcut(".", modifiers: .command)
+            Button("開発者パネル") { store.showDevPanel = true }.keyboardShortcut("i", modifiers: [.command, .option])
+            }
+        }
+        .frame(width: 0, height: 0)
+        .opacity(0)
+    }
+}
+
+/// ⌘1〜⌘9: タブを選ぶ（9 は最後のタブ）
+struct TabNumberKeys: View {
+    let store: BrowserStore
+
+    var body: some View {
+        ForEach(1..<10) { n in
+            Button("タブ \(n)") { store.selectTab(number: n) }
+                .keyboardShortcut(KeyEquivalent(Character("\(n)")), modifiers: .command)
         }
     }
 }
@@ -527,424 +629,374 @@ struct TabCard: View {
 }
 
 // ======================================================================
-// MARK: - DevPanel.swift
+// MARK: - LibraryView.swift
 // ======================================================================
 
-// MARK: - 開発者パネル（簡易版。完成版はフェーズ G）
-//
-// 通信の様子・タブごとの状態・ログ。普段の画面とは分けて、「…」メニューから開く
+// MARK: - ブックマーク・履歴の画面（シート）、アドレス欄の候補、新しいタブの画面
 
-struct DevPanel: View {
+struct LibraryView: View {
     @ObservedObject var store: BrowserStore
+    @ObservedObject var library: Library
     @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("開発者パネル").font(.headline)
-                Spacer()
-                Button("ログをコピー") { UIPasteboard.general.string = store.logs.export() }
-                Button(store.hadCrash ? "前回の記録をコピー（落ちた）" : "前回の記録をコピー") {
-                    UIPasteboard.general.string = CrashLog.previous() ?? "（前回の記録はありません）"
-                }
-                .padding(.leading, 12)
-                Button("閉じる") { dismiss() }.padding(.leading, 12)
-            }
-            DevStatus(store: store)
-            DevTabList(store: store)
-            DevLogView(text: store.logText)
-        }
-        .padding()
-    }
-}
-
-struct DevStatus: View {
-    @ObservedObject var store: BrowserStore
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(store.takeover.description)
-            Text("新しいタブの通信: \(store.defaultMode.rawValue)")
-            Text("VNet: \(store.vnetStatus)")
-            Text("タブ \(store.tabs.count) 枚・動いている WebView \(store.liveWebViewCount) / \(BrowserStore.maxLiveWebViews)")
-            Text("Cookie（写し）\(store.cookieJar.count) 個・HSTS \(store.hsts.all().count) 件")
-            Text("ネットワーク: \(store.isOnline ? "つながっている" : "つながっていない")・ダウンロード中 \(store.downloads.runningCount) 件")
-        }
-        .font(.system(size: 12, design: .monospaced))
-    }
-}
-
-struct DevTabList: View {
-    @ObservedObject var store: BrowserStore
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            ForEach(store.tabs) { tab in
-                DevTabRow(tab: tab, selected: tab.id == store.selectedID)
-            }
-        }
-        .font(.system(size: 11, design: .monospaced))
-    }
-}
-
-struct DevTabRow: View {
-    @ObservedObject var tab: BrowserTab
-    let selected: Bool
-
-    var body: some View {
-        Text("\(selected ? "▶" : " ") #\(tab.id) [\(tab.mode.short)・\(tab.state.rawValue)\(tab.isLoading ? "・読み込み中 \(Int(tab.progress * 100))%" : "")] \(tab.url?.absoluteString ?? "（空）")")
-            .lineLimit(1)
-    }
-}
-
-struct DevLogView: View {
-    let text: String
-
-    var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                Text(text)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(.green)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-                Color.clear.frame(height: 1).id("end")
-            }
-            .background(Color.black)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            .onChange(of: text) { _ in proxy.scrollTo("end", anchor: .bottom) }
-        }
-    }
-}
-
-// ======================================================================
-// MARK: - Downloads.swift
-// ======================================================================
-
-// MARK: - ダウンロード
-//
-// ・WebKit の WKDownload を使う（VNet のタブでも標準の通信のタブでも同じ。VNet は返事を流す形で渡すので、大きいファイルでもメモリにためない）
-// ・保存先は Documents/Downloads（同じ名前があれば「名前 (2).zip」のようにする）
-// ・進み具合は 0.5 秒ごとに見る。取り消し・やり直し（途中から: resumeData）・共有（「ファイル」に保存など）・削除ができる
-// ・起動したときに、前にダウンロードしたファイルを一覧に戻す
-
-@MainActor
-final class DownloadItem: ObservableObject, Identifiable {
-    enum State: Equatable {
-        case running
-        case finished
-        case failed(String)
-        case cancelled
-    }
-
-    let id = UUID()
-    @Published var filename: String
-    @Published var received: Int64 = 0
-    @Published var expected: Int64 = -1
-    @Published var state = State.running
-    @Published var fileURL: URL?
-    let source: URL?
-    var download: WKDownload?
-    var resumeData: Data?
-    /// VNet が自分で書いているダウンロード（VNet のタブ）
-    var vnet: VNetDownload?
-    /// やり直すとき（VNet のダウンロードは、同じ URL をもう一度 VNet で読む）
-    var restart: (() -> Void)?
-
-    /// VNet のダウンロードの様子を写す
-    func syncVNet() {
-        guard let v = vnet else { return }
-        received = v.received
-        switch v.state {
-        case .running: state = .running
-        case .finished: state = .finished; expected = received
-        case .cancelled: state = .cancelled
-        case .failed(let why): state = .failed(why)
-        }
-    }
-
-    init(filename: String, source: URL?) {
-        self.filename = filename
-        self.source = source
-    }
-
-    var fraction: Double? { expected > 0 ? min(1, Double(received) / Double(expected)) : nil }
-}
-
-@MainActor
-final class DownloadManager: NSObject, ObservableObject, WKDownloadDelegate {
-    @Published private(set) var items: [DownloadItem] = []
-    /// ログ（どのスレッドからでもよい）
-    var log: (@Sendable (String) -> Void)?
-    /// やり直し（途中から）に使う WebView を返す
-    var webViewForResume: (() -> WKWebView?)?
-    private var timer: Timer?
-
-    /// BrowserStore の nonisolated init から作られるので、ここでは何もしない（準備は loadExisting）
-    nonisolated override init() {
-        super.init()
-    }
-
-    var runningCount: Int { items.filter { $0.state == .running }.count }
-
-    nonisolated static var folder: URL { DownloadFiles.folder }
-
-    /// 前にダウンロードしたファイルを一覧に入れる（新しい順）
-    func loadExisting() {
-        let fm = FileManager.default
-        let files = (try? fm.contentsOfDirectory(at: DownloadManager.folder, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
-        let sorted = files.sorted { a, b in
-            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            return da > db
-        }
-        for f in sorted where !f.lastPathComponent.hasPrefix(".") {
-            let item = DownloadItem(filename: f.lastPathComponent, source: nil)
-            item.fileURL = f
-            item.state = .finished
-            let size = (try? fm.attributesOfItem(atPath: f.path)[.size] as? NSNumber)?.int64Value ?? 0
-            item.received = size
-            item.expected = size
-            items.append(item)
-        }
-    }
-
-    /// WebKit がダウンロードに変えたものを受け取る
-    func adopt(_ d: WKDownload, source: URL?) {
-        let item = DownloadItem(filename: source?.lastPathComponent ?? "download", source: source)
-        item.download = d
-        d.delegate = self
-        items.insert(item, at: 0)
-        log?("⬇︎ ダウンロード開始: \(source?.absoluteString ?? "?")")
-        startTimer()
-    }
-
-    /// VNet が自分で書き始めたダウンロードを一覧に入れる
-    func register(_ dl: VNetDownload, restart: (() -> Void)?) {
-        let item = DownloadItem(filename: dl.fileURL.lastPathComponent, source: dl.source)
-        item.vnet = dl
-        item.fileURL = dl.fileURL
-        item.expected = dl.expected
-        item.restart = restart
-        dl.onChange = { [weak item] in
-            let it = item
-            Task { @MainActor in it?.syncVNet() }
-        }
-        items.insert(item, at: 0)
-        item.syncVNet()
-        log?("⬇︎ ダウンロード開始（VNet）: \(dl.source.absoluteString)")
-    }
-
-    private func item(for d: WKDownload) -> DownloadItem? { items.first { $0.download === d } }
-
-    // MARK: WKDownloadDelegate
-
-    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String) async -> URL? {
-        let url = DownloadFiles.uniqueURL(for: suggestedFilename)
-        if let item = item(for: download) {
-            item.filename = url.lastPathComponent
-            item.fileURL = url
-            item.expected = response.expectedContentLength
-        }
-        return url
-    }
-
-    func downloadDidFinish(_ download: WKDownload) {
-        guard let item = item(for: download) else { return }
-        item.state = .finished
-        if let f = item.fileURL, let size = (try? FileManager.default.attributesOfItem(atPath: f.path)[.size] as? NSNumber)?.int64Value {
-            item.received = size
-            item.expected = size
-        }
-        item.download = nil
-        log?("⬇︎ ダウンロード完了: \(item.filename)（\(item.received / 1024)KB）")
-    }
-
-    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
-        guard let item = item(for: download) else { return }
-        item.resumeData = resumeData
-        item.download = nil
-        if item.state == .cancelled { return }
-        item.state = .failed(error.localizedDescription)
-        log?("⬇︎✕ ダウンロード失敗: \(item.filename)：\(error.localizedDescription)\(resumeData != nil ? "（途中から再開できます）" : "")")
-    }
-
-    // MARK: 操作
-
-    func cancel(_ item: DownloadItem) {
-        if let v = item.vnet {
-            item.state = .cancelled
-            v.cancel()
-            log?("⬇︎ ダウンロードを取り消しました: \(item.filename)")
-            return
-        }
-        guard let d = item.download else { return }
-        item.state = .cancelled
-        d.cancel { [weak item] data in
-            item?.resumeData = data
-        }
-        log?("⬇︎ ダウンロードを取り消しました: \(item.filename)")
-    }
-
-    /// やり直す（途中までのデータがあれば、そこから）
-    func retry(_ item: DownloadItem) {
-        if item.vnet != nil {
-            let again = item.restart
-            remove(item)
-            again?()
-            return
-        }
-        if let data = item.resumeData, let wv = webViewForResume?() {
-            item.state = .running
-            item.resumeData = nil
-            wv.resumeDownload(fromResumeData: data) { [weak self, weak item] d in
-                guard let self, let item else { return }
-                item.download = d
-                d.delegate = self
-                self.startTimer()
-            }
-            log?("⬇︎ 途中から再開します: \(item.filename)")
-        } else if let src = item.source, let wv = webViewForResume?() {
-            remove(item)
-            wv.startDownload(using: URLRequest(url: src)) { [weak self] d in
-                self?.adopt(d, source: src)
-            }
-        }
-    }
-
-    /// 一覧から外して、ファイルも消す
-    func remove(_ item: DownloadItem) {
-        if item.state == .running { cancel(item) }
-        if let f = item.fileURL { try? FileManager.default.removeItem(at: f) }
-        items.removeAll { $0 === item }
-    }
-
-    func clearFinished() {
-        items.removeAll { $0.state != .running }
-    }
-
-    private func startTimer() {
-        if timer != nil { return }
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            let me = self
-            Task { @MainActor in me?.tick() }
-        }
-    }
-
-    private func tick() {
-        var running = false
-        for item in items where item.state == .running {
-            guard let d = item.download else { continue }
-            running = true
-            item.received = d.progress.completedUnitCount
-            if d.progress.totalUnitCount > 0 { item.expected = d.progress.totalUnitCount }
-        }
-        if !running { timer?.invalidate(); timer = nil }
-    }
-}
-
-// MARK: - 画面
-
-/// ツールバーのダウンロードのボタン（ダウンロードがあるときだけ出す）
-struct DownloadsButton: View {
-    @ObservedObject var manager: DownloadManager
-    @Binding var show: Bool
-
-    var body: some View {
-        if !manager.items.isEmpty {
-            Button { show = true } label: {
-                Image(systemName: manager.runningCount > 0 ? "arrow.down.circle.fill" : "arrow.down.circle")
-            }
-        }
-    }
-}
-
-struct DownloadsView: View {
-    @ObservedObject var manager: DownloadManager
-    @Environment(\.dismiss) private var dismiss
-    @State private var sharing: URL?
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("ダウンロード").font(.headline)
+                Picker("表示", selection: $store.libraryPage) {
+                    ForEach(LibraryPage.allCases, id: \.self) { p in Text(p.rawValue).tag(p) }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 320)
                 Spacer()
-                Button("終わったものを一覧から外す") { manager.clearFinished() }
-                Button("閉じる") { dismiss() }.padding(.leading, 12)
+                Button("完了") { dismiss() }
             }
             .padding()
-            ScrollView {
-                LazyVStack(spacing: 10) {
-                    ForEach(manager.items) { item in
-                        DownloadRow(manager: manager, item: item) { sharing = $0 }
-                    }
-                }
-                .padding(.horizontal)
+            if store.libraryPage == .bookmarks {
+                BookmarksPage(store: store, library: library) { dismiss() }
+            } else {
+                HistoryPage(store: store, library: library) { dismiss() }
             }
-        }
-        .sheet(isPresented: Binding(get: { sharing != nil }, set: { if !$0 { sharing = nil } })) {
-            if let u = sharing { ShareSheet(items: [u]) }
         }
     }
 }
 
-struct DownloadRow: View {
-    @ObservedObject var manager: DownloadManager
-    @ObservedObject var item: DownloadItem
-    let share: (URL) -> Void
+@MainActor
+struct BookmarksPage: View {
+    @ObservedObject var store: BrowserStore
+    @ObservedObject var library: Library
+    let done: () -> Void
+    @State private var renaming: Bookmark?
+    @State private var newTitle = ""
+
+    var body: some View {
+        Group {
+            if library.bookmarks.items.isEmpty {
+                EmptyNote(icon: "book", text: "ブックマークはまだありません。\n「ぁあ」メニューか ⌘D で、見ているページを入れられます")
+            } else {
+                List {
+                    ForEach(library.bookmarks.items) { b in
+                        BookmarkRow(store: store, library: library, bookmark: b, done: done) {
+                            newTitle = b.title
+                            renaming = b
+                        }
+                    }
+                    .onDelete { idx in
+                        let ids = idx.map { library.bookmarks.items[$0].id }
+                        for id in ids { library.removeBookmark(id) }
+                    }
+                }
+                .listStyle(.plain)
+            }
+        }
+        .alert("名前を変える", isPresented: renameShown) {
+            TextField("名前", text: $newTitle)
+            Button("キャンセル", role: .cancel) { renaming = nil }
+            Button("OK") {
+                if let b = renaming { library.renameBookmark(b.id, title: newTitle) }
+                renaming = nil
+            }
+        } message: {
+            Text(renaming?.url ?? "")
+        }
+    }
+
+    private var renameShown: Binding<Bool> {
+        Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })
+    }
+}
+
+@MainActor
+struct BookmarkRow: View {
+    let store: BrowserStore
+    let library: Library
+    let bookmark: Bookmark
+    let done: () -> Void
+    let rename: () -> Void
+
+    var body: some View {
+        Button {
+            open(newTab: false)
+        } label: {
+            SiteRow(icon: "book", title: bookmark.title, url: bookmark.url)
+        }
+        .contextMenu {
+            Button { open(newTab: true) } label: { Label("新しいタブで開く", systemImage: "plus.square.on.square") }
+            Button { UIPasteboard.general.string = bookmark.url } label: { Label("リンクをコピー", systemImage: "doc.on.doc") }
+            Button { rename() } label: { Label("名前を変える", systemImage: "pencil") }
+            Button { library.moveBookmark(bookmark.id, by: -1) } label: { Label("上へ", systemImage: "arrow.up") }
+            Button { library.moveBookmark(bookmark.id, by: 1) } label: { Label("下へ", systemImage: "arrow.down") }
+            Button(role: .destructive) { library.removeBookmark(bookmark.id) } label: { Label("削除", systemImage: "trash") }
+        }
+    }
+
+    private func open(newTab: Bool) {
+        guard let u = URL(string: bookmark.url) else { return }
+        store.open(url: u, newTab: newTab)
+        done()
+    }
+}
+
+struct HistoryPage: View {
+    @ObservedObject var store: BrowserStore
+    @ObservedObject var library: Library
+    let done: () -> Void
+    @State private var query = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                TextField("履歴を検索", text: $query)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                ClearHistoryMenu(library: library)
+            }
+            .padding(.horizontal)
+            .padding(.bottom, 8)
+            if library.history.entries.isEmpty {
+                EmptyNote(icon: "clock", text: "履歴はありません")
+            } else {
+                HistoryList(store: store, library: library, groups: HistoryLog.groupByDay(library.history.search(query)), done: done)
+            }
+        }
+    }
+}
+
+struct HistoryList: View {
+    let store: BrowserStore
+    let library: Library
+    let groups: [(title: String, entries: [HistoryEntry])]
+    let done: () -> Void
+
+    var body: some View {
+        List {
+            ForEach(groups, id: \.title) { g in
+                Section {
+                    ForEach(g.entries) { e in
+                        HistoryRow(store: store, library: library, entry: e, done: done)
+                    }
+                    .onDelete { idx in
+                        let urls = idx.map { g.entries[$0].url }
+                        for u in urls { library.removeHistory(u) }
+                    }
+                } header: {
+                    Text(g.title)
+                }
+            }
+        }
+        .listStyle(.plain)
+    }
+}
+
+@MainActor
+struct HistoryRow: View {
+    let store: BrowserStore
+    let library: Library
+    let entry: HistoryEntry
+    let done: () -> Void
+
+    var body: some View {
+        Button {
+            open(newTab: false)
+        } label: {
+            SiteRow(icon: "clock", title: entry.title.isEmpty ? entry.url : entry.title, url: entry.url)
+        }
+        .contextMenu {
+            Button { open(newTab: true) } label: { Label("新しいタブで開く", systemImage: "plus.square.on.square") }
+            Button { UIPasteboard.general.string = entry.url } label: { Label("リンクをコピー", systemImage: "doc.on.doc") }
+            Button(role: .destructive) { library.removeHistory(entry.url) } label: { Label("履歴から消す", systemImage: "trash") }
+        }
+    }
+
+    private func open(newTab: Bool) {
+        guard let u = URL(string: entry.url) else { return }
+        store.open(url: u, newTab: newTab)
+        done()
+    }
+}
+
+struct ClearHistoryMenu: View {
+    let library: Library
+
+    var body: some View {
+        Menu {
+            Button(role: .destructive) { library.clearHistory(since: Date().addingTimeInterval(-3600)) } label: { Text("直近 1 時間") }
+            Button(role: .destructive) { library.clearHistory(since: Calendar.current.startOfDay(for: Date())) } label: { Text("今日") }
+            Button(role: .destructive) { library.clearHistory(since: Calendar.current.startOfDay(for: Date()).addingTimeInterval(-86_400)) } label: { Text("今日と昨日") }
+            Button(role: .destructive) { library.clearHistory(since: nil) } label: { Text("すべて") }
+        } label: {
+            Text("消去…").foregroundColor(.red)
+        }
+    }
+}
+
+/// 一覧の 1 行（タイトルと URL）
+struct SiteRow: View {
+    let icon: String
+    let title: String
+    let url: String
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: "doc").font(.system(size: 24)).foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(item.filename).lineLimit(1)
-                if item.state == .running {
-                    ProgressView(value: item.fraction ?? 0)
+            Image(systemName: icon).foregroundStyle(.secondary).frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).lineLimit(1).foregroundColor(.primary)
+                Text(url).font(.system(size: 12)).lineLimit(1).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .contentShape(Rectangle())
+    }
+}
+
+struct EmptyNote: View {
+    let icon: String
+    let text: String
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: icon).font(.system(size: 36)).foregroundStyle(.secondary)
+            Text(text).multilineTextAlignment(.center).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+// MARK: アドレス欄の候補（打っている間、ページの上に重ねる）
+
+struct SuggestionOverlay: View {
+    @ObservedObject var store: BrowserStore
+    @ObservedObject var editor: AddressEditor
+
+    var body: some View {
+        if editor.editing {
+            ZStack(alignment: .top) {
+                // 外を押したらアドレス欄から離れる
+                Color.black.opacity(0.08)
+                    .onTapGesture { editor.blur() }
+                if !editor.text.trimmingCharacters(in: .whitespaces).isEmpty {
+                    SuggestionList(store: store, editor: editor, items: store.library.suggestions(for: editor.text))
                 }
-                Text(statusText).font(.system(size: 12)).foregroundStyle(.secondary)
             }
-            Spacer()
-            buttons
-        }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color(UIColor.secondarySystemBackground)))
-    }
-
-    @ViewBuilder private var buttons: some View {
-        switch item.state {
-        case .running:
-            Button { manager.cancel(item) } label: { Image(systemName: "xmark.circle") }
-        case .finished:
-            if let f = item.fileURL {
-                Button { share(f) } label: { Image(systemName: "square.and.arrow.up") }
-            }
-            Button { manager.remove(item) } label: { Image(systemName: "trash") }
-        case .failed, .cancelled:
-            Button { manager.retry(item) } label: { Image(systemName: "arrow.clockwise") }
-            Button { manager.remove(item) } label: { Image(systemName: "trash") }
-        }
-    }
-
-    private var statusText: String {
-        let size = ByteCountFormatter.string(fromByteCount: item.received, countStyle: .file)
-        switch item.state {
-        case .running:
-            if item.expected > 0 { return "\(size) / \(ByteCountFormatter.string(fromByteCount: item.expected, countStyle: .file))" }
-            return size
-        case .finished: return "完了・\(size)"
-        case .failed(let why): return "失敗: \(why)\(item.resumeData != nil ? "（途中から再開できます）" : "")"
-        case .cancelled: return "取り消しました"
         }
     }
 }
 
-/// 共有シート（「ファイル」に保存・ほかのアプリで開く など）
-struct ShareSheet: UIViewControllerRepresentable {
-    let items: [Any]
+@MainActor
+struct SuggestionList: View {
+    let store: BrowserStore
+    let editor: AddressEditor
+    let items: [Suggestion]
 
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    var body: some View {
+        VStack(spacing: 0) {
+            Button { go(nil) } label: {
+                SiteRow(icon: "magnifyingglass", title: editor.text, url: firstLine)
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            ForEach(items) { s in
+                Divider()
+                Button { go(s) } label: {
+                    SiteRow(icon: s.kind == .bookmark ? "book" : "clock", title: s.title.isEmpty ? s.url : s.title, url: s.url)
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color(UIColor.systemBackground)))
+        .shadow(radius: 8, y: 2)
+        .frame(maxWidth: 680)
+        .padding(.horizontal, 24)
+        .padding(.top, 6)
     }
 
-    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+    private var firstLine: String {
+        switch AddressInput.resolve(editor.text, engine: store.searchEngine) {
+        case .url(let u)?: return "\(u.absoluteString) を開く"
+        default: return "\(store.searchEngine.name) で検索"
+        }
+    }
+
+    private func go(_ s: Suggestion?) {
+        if let s, let u = URL(string: s.url) { store.open(url: u) } else { store.open(editor.text) }
+        editor.blur()
+    }
+}
+
+// MARK: 新しいタブの画面（ブックマークとよく見るサイト）
+
+struct StartPage: View {
+    @ObservedObject var store: BrowserStore
+    @ObservedObject var library: Library
+    private let columns = [GridItem(.adaptive(minimum: 96), spacing: 16)]
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                let favorites = Array(library.bookmarks.items.prefix(12))
+                let top = library.history.topSites(limit: 8)
+                if favorites.isEmpty && top.isEmpty {
+                    EmptyNote(icon: "globe", text: "上のアドレス欄に、URL か調べたいことを入れてください")
+                        .padding(.top, 120)
+                }
+                if !favorites.isEmpty {
+                    SiteGrid(store: store, title: "ブックマーク", sites: favorites.map { ($0.title, $0.url) }, columns: columns)
+                }
+                if !top.isEmpty {
+                    SiteGrid(store: store, title: "よく見るサイト", sites: top.map { ($0.title, $0.url) }, columns: columns)
+                }
+            }
+            .frame(maxWidth: 760)
+            .padding(32)
+            .frame(maxWidth: .infinity)
+        }
+        .background(Color(UIColor.systemBackground))
+    }
+}
+
+struct SiteGrid: View {
+    let store: BrowserStore
+    let title: String
+    let sites: [(String, String)]
+    let columns: [GridItem]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title).font(.headline)
+            LazyVGrid(columns: columns, spacing: 16) {
+                ForEach(sites, id: \.1) { site in
+                    SiteTile(title: site.0, url: site.1) {
+                        if let u = URL(string: site.1) { store.open(url: u) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct SiteTile: View {
+    let title: String
+    let url: String
+    let open: () -> Void
+
+    var body: some View {
+        Button(action: open) {
+            VStack(spacing: 6) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 14).fill(Color(UIColor.tertiarySystemFill))
+                    Text(initial).font(.system(size: 26, weight: .semibold)).foregroundStyle(.secondary)
+                }
+                .frame(width: 64, height: 64)
+                Text(title.isEmpty ? host : title).font(.system(size: 12)).lineLimit(2).multilineTextAlignment(.center)
+                    .foregroundColor(.primary)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var host: String { AddressInput.shortDisplay(URL(string: url)) }
+    private var initial: String { String(host.first ?? "?").uppercased() }
 }

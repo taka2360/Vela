@@ -20,3 +20,4 @@ AddressInput.swift
 ErrorPages.swift
 DownloadFiles.swift
 CrashLog.swift
+LibraryModel.swift

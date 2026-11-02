@@ -10,6 +10,7 @@ import WebKit
 // 中身は BrowserStore と BrowserTab。ここは見た目だけ。
 // Playgrounds で作るのが遅くならないよう、1 つの View を小さく分けている（大きな式は型チェックが遅い）
 
+@MainActor
 struct BrowserView: View {
     @StateObject private var store = BrowserStore()
     @Environment(\.scenePhase) private var scenePhase
@@ -27,13 +28,21 @@ struct BrowserView: View {
             }
             Divider()
             PageArea(store: store)
+                .overlay(alignment: .top) { SuggestionOverlay(store: store, editor: store.address) }
         }
+        .background(ShortcutKeys(store: store))
         .sheet(isPresented: $store.showDevPanel) { DevPanel(store: store) }
+        .sheet(isPresented: $store.showLibrary) { LibraryView(store: store, library: store.library) }
+        .sheet(isPresented: shareShown) { if let u = store.shareURL { ShareSheet(items: [u]) } }
         .fullScreenCover(isPresented: $store.showTabOverview) { TabOverview(store: store) }
         .modifier(DialogModifier(store: store))
         .onChange(of: scenePhase) { phase in
             if phase != .active { store.saveSessionNow() }
         }
+    }
+
+    private var shareShown: Binding<Bool> {
+        Binding(get: { store.shareURL != nil }, set: { if !$0 { store.shareURL = nil } })
     }
 }
 
@@ -47,7 +56,8 @@ struct TopBar: View {
         VStack(spacing: 0) {
             HStack(spacing: 14) {
                 NavButtons(tab: tab)
-                AddressField(store: store, tab: tab)
+                Button { store.openLibrary(.bookmarks) } label: { Image(systemName: "book") }
+                AddressField(store: store, tab: tab, editor: store.address, library: store.library)
                 ReloadButton(tab: tab)
                 DownloadsButton(manager: store.downloads, show: $store.showDownloads)
                 MoreMenu(store: store, tab: tab)
@@ -147,26 +157,37 @@ struct LoadingBar: View {
 struct AddressField: View {
     @ObservedObject var store: BrowserStore
     @ObservedObject var tab: BrowserTab
-    @State private var text = ""
+    @ObservedObject var editor: AddressEditor
+    let library: Library
     @FocusState private var focused: Bool
 
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 10).fill(Color(UIColor.tertiarySystemFill))
-            // TextField はいつも置いておく（focused = true にした時に無いとフォーカスが当たらずキーボードが出ない）
-            editor
-                .opacity(focused ? 1 : 0)
+        HStack(spacing: 0) {
             if !focused {
-                Button { beginEditing() } label: { display.contentShape(Rectangle()) }
-                    .buttonStyle(.plain)
+                PageMenu(store: store, tab: tab, library: library)
+            }
+            ZStack {
+                // TextField はいつも置いておく（focused = true にした時に無いとフォーカスが当たらずキーボードが出ない）
+                field
+                    .opacity(focused ? 1 : 0)
+                if !focused {
+                    Button { beginEditing() } label: { display.contentShape(Rectangle()) }
+                        .buttonStyle(.plain)
+                }
             }
         }
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color(UIColor.tertiarySystemFill)))
         .frame(height: 36)
         .frame(maxWidth: .infinity)
+        .onChange(of: focused) { f in
+            if editor.editing != f { editor.editing = f }
+        }
+        .onChange(of: editor.focusRequest) { _ in beginEditing() }
+        .onChange(of: editor.blurRequest) { _ in focused = false }
     }
 
-    private var editor: some View {
-        TextField("検索・アドレスを入力", text: $text)
+    private var field: some View {
+        TextField("検索・アドレスを入力", text: $editor.text)
             .focused($focused)
             .textFieldStyle(.plain)
             .autocorrectionDisabled()
@@ -174,7 +195,7 @@ struct AddressField: View {
             .keyboardType(.webSearch)
             .submitLabel(.go)
             .onSubmit {
-                store.open(text, in: tab)
+                store.open(editor.text, in: tab)
                 focused = false
             }
             .padding(.horizontal, 10)
@@ -199,7 +220,7 @@ struct AddressField: View {
     }
 
     private func beginEditing() {
-        text = AddressInput.searchTerms(in: tab.url) ?? tab.url?.absoluteString ?? ""
+        editor.text = AddressInput.searchTerms(in: tab.url) ?? tab.url?.absoluteString ?? ""
         focused = true
     }
 }
@@ -246,6 +267,9 @@ struct MoreMenu: View {
             } else if store.defaultMode.usesVNet {
                 Button { tab.switchMode(to: store.defaultMode) } label: { Label("VNet で開き直す", systemImage: "cpu") }
             }
+            Button { store.openLibrary(.bookmarks) } label: { Label("ブックマーク", systemImage: "book") }
+            Button { store.openLibrary(.history) } label: { Label("履歴", systemImage: "clock") }
+            Divider()
             if store.canReopenClosedTab {
                 Button { store.reopenClosedTab() } label: { Label("閉じたタブを戻す", systemImage: "arrow.uturn.backward") }
             }
@@ -267,34 +291,23 @@ struct PageArea: View {
         ZStack {
             Color(UIColor.systemBackground)
             if let tab = store.selectedTab {
-                TabPage(tab: tab)
+                TabPage(store: store, tab: tab)
             }
         }
     }
 }
 
 struct TabPage: View {
+    let store: BrowserStore
     @ObservedObject var tab: BrowserTab
 
     var body: some View {
         ZStack {
             WebHost(webView: tab.webView)
             if tab.url == nil {
-                StartPage()
+                StartPage(store: store, library: store.library)
             }
         }
-    }
-}
-
-/// 新しいタブ（何も開いていないとき）
-struct StartPage: View {
-    var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "globe").font(.system(size: 44)).foregroundStyle(.secondary)
-            Text("上のアドレス欄に、URL か調べたいことを入れてください").foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(UIColor.systemBackground))
     }
 }
 

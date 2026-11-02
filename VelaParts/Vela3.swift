@@ -50,6 +50,8 @@ final class BrowserTab: ObservableObject, Identifiable {
     @Published private(set) var snapshot: UIImage?
     /// このページが使った、VNet を通らない通信（"WebSocket" など）
     @Published private(set) var nonVNetUsage: Set<String> = []
+    /// 文字の大きさ（ページの拡大率。サイトごとに覚える）
+    @Published private(set) var zoom = 1.0
     /// 最後に見た時刻（WebView を捨てる順番を決める）
     var lastSelected = Date()
 
@@ -70,6 +72,10 @@ final class BrowserTab: ObservableObject, Identifiable {
     private var httpsFirstFrom: URL?
     /// HTTPS-First で「http のまま開く」を選んだホスト
     private var httpAllowedHosts = Set<String>()
+    /// エラーページを出した URL（履歴に入れない）
+    private var errorPageURL: URL?
+    /// 最後に履歴に入れた URL（後からタイトルが変わったら直す）
+    private var lastRecorded: URL?
 
     init(id: Int, store: BrowserStore, mode: NetMode) {
         self.id = id
@@ -126,6 +132,8 @@ final class BrowserTab: ObservableObject, Identifiable {
         // アプリの中のブラウザやロボットだと思われて、エラーや「不審なトラフィック」の画面になりやすい
         wv.customUserAgent = BrowserIdentity.userAgent
         wv.allowsBackForwardNavigationGestures = true
+        // ページ内を検索（⌘F・「ぁあ」メニュー）
+        wv.isFindInteractionEnabled = true
         if #available(iOS 16.4, *) { wv.isInspectable = VelaSettings.webInspector }
         let d = TabWebDelegate(tab: self)
         wv.navigationDelegate = d
@@ -244,7 +252,11 @@ final class BrowserTab: ObservableObject, Identifiable {
             url = real
             nonVNetUsage = []
         }
-        title = wv.title ?? ""
+        let newTitle = wv.title ?? ""
+        if newTitle != title, !newTitle.isEmpty, let r = lastRecorded, r == real {
+            store?.library.updateTitle(url: r, title: newTitle)
+        }
+        title = newTitle
         progress = wv.estimatedProgress
         isLoading = wv.isLoading
         canGoBack = wv.canGoBack
@@ -381,6 +393,7 @@ final class BrowserTab: ObservableObject, Identifiable {
 
     /// VNet でページ本体を読めなかった。設定で選んであれば、標準の通信に自動で切り替える
     private func vnetFailed(_ u: URL, _ e: FetchError) {
+        errorPageURL = u
         let kinds: Set<FetchError.Kind> = [.tls, .tlsVersion, .connect, .timeout, .reset, .malformed, .notReady]
         guard VelaSettings.autoFallbackToNative, mode.usesVNet, kinds.contains(e.kind) else { return }
         log("VNet で読めなかったので、標準の通信に自動で切り替えます（\(e.kind.rawValue)）", level: .warning)
@@ -403,6 +416,34 @@ final class BrowserTab: ObservableObject, Identifiable {
     func didCommitNavigation() {
         httpsFirstFrom = nil
         syncFromWebView()
+        applySiteZoom()
+    }
+
+    func didStartNavigation() {
+        errorPageURL = nil
+    }
+
+    // MARK: 文字の大きさ・ページ内を検索
+
+    /// そのサイトで覚えている大きさにする
+    private func applySiteZoom() {
+        guard let wv = webView else { return }
+        let z = VelaSettings.zoom(for: url?.host)
+        zoom = z
+        if abs(Double(wv.pageZoom) - z) > 0.001 { wv.pageZoom = CGFloat(z) }
+    }
+
+    /// 大きく（+1）・小さく（-1）・元に戻す（0）。サイトごとに覚える
+    func changeZoom(_ delta: Int) {
+        let z = PageZoom.step(from: zoom, by: delta)
+        VelaSettings.setZoom(z, for: url?.host)
+        applySiteZoom()
+        log("文字の大きさ: \(PageZoom.percent(z))（\(url?.host ?? "")）")
+    }
+
+    func findInPage() {
+        ensureWebView()
+        webView?.findInteraction?.presentFindNavigator(showingReplace: false)
     }
 
     /// WebKit（標準の通信など）が読めなかった: エラーページを出す
@@ -413,6 +454,7 @@ final class BrowserTab: ObservableObject, Identifiable {
         guard let wv = webView else { return }
         let failing = (ns.userInfo[NSURLErrorFailingURLErrorKey] as? URL) ?? url
         guard let f = failing.flatMap({ VNetURL.toReal($0) }) else { return }
+        errorPageURL = f
         let html: String
         if let http = httpsFirstFrom, f.host?.lowercased() == http.host?.lowercased() {
             html = ErrorPage.html(title: "https では開けませんでした", lines: [
@@ -462,6 +504,11 @@ final class BrowserTab: ObservableObject, Identifiable {
 
     func didFinish() {
         syncFromWebView()
+        // 履歴に入れる（エラーページは入れない）
+        if let u = url, u != errorPageURL, LibraryKey.isRecordable(u) {
+            store?.recordVisit(url: u, title: title)
+            lastRecorded = u
+        }
         store?.saveSession()
     }
 
@@ -556,6 +603,7 @@ final class TabWebDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        tab?.didStartNavigation()
         tab?.navigationEvent("読み込み開始: \(webView.url?.absoluteString ?? "")")
     }
 
@@ -668,264 +716,363 @@ final class TabWebDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
 }
 
 // ======================================================================
-// MARK: - AddressInput.swift
+// MARK: - Library.swift
 // ======================================================================
 
-// MARK: - アドレス欄に入れた文字を、開く URL にする（URL か検索語かを決める）
+// MARK: - ブックマークと履歴の置き場（bookmarks.json・history.json）と、アドレス欄の入力の様子
 //
-// ・「://」がある・about: で始まる → そのまま URL
-// ・空白がある → 検索
-// ・ホスト名らしい（example.com・192.168.0.1・localhost・[::1]・ポートやパス付きも） → URL
-//   LAN のアドレス（数字の LAN・localhost・.local）は http://、それ以外は https://
-// ・それ以外 → 検索
+// 中身の決まり（重ならない・上限・候補の順番）は LibraryModel.swift。ここは保存と画面への知らせだけ
 
-enum SearchEngine: String, CaseIterable, Codable, Sendable {
-    case google, duckDuckGo, bing, yahooJapan
+@MainActor
+final class Library: ObservableObject {
+    @Published private(set) var bookmarks = BookmarkList()
+    @Published private(set) var history = HistoryLog()
+    var log: ((String) -> Void)?
+    private let bookmarkFile = JSONFile<BookmarkList>(name: "bookmarks.json", delay: 0.5)
+    /// 履歴はページを開くたびに変わるので、まとめて書く
+    private let historyFile = JSONFile<HistoryLog>(name: "history.json", delay: 5)
+    private var loaded = false
 
-    var name: String {
-        switch self {
-        case .google: return "Google"
-        case .duckDuckGo: return "DuckDuckGo"
-        case .bing: return "Bing"
-        case .yahooJapan: return "Yahoo! JAPAN"
-        }
+    /// BrowserStore の初期値として作られる（MainActor の外のことがある）ので、ここでは何もしない。読むのは load
+    nonisolated init() {}
+
+    func load(logs: DevLog) {
+        if loaded { return }
+        loaded = true
+        log = { s in logs.add(s, level: .info, category: .app) }
+        bookmarkFile.log = { s in logs.add(s) }
+        historyFile.log = { s in logs.add(s) }
+        bookmarks = bookmarkFile.load() ?? BookmarkList()
+        history = historyFile.load() ?? HistoryLog()
+        log?("ブックマーク \(bookmarks.items.count) 件・履歴 \(history.entries.count) 件を読みました")
     }
 
-    func searchURL(_ query: String) -> URL? {
-        var c: URLComponents
-        switch self {
-        case .google: c = URLComponents(string: "https://www.google.com/search")!; c.queryItems = [URLQueryItem(name: "q", value: query)]
-        case .duckDuckGo: c = URLComponents(string: "https://duckduckgo.com/")!; c.queryItems = [URLQueryItem(name: "q", value: query)]
-        case .bing: c = URLComponents(string: "https://www.bing.com/search")!; c.queryItems = [URLQueryItem(name: "q", value: query)]
-        case .yahooJapan: c = URLComponents(string: "https://search.yahoo.co.jp/search")!; c.queryItems = [URLQueryItem(name: "p", value: query)]
+    func saveNow() {
+        bookmarkFile.saveNow()
+        historyFile.saveNow()
+    }
+
+    // MARK: ブックマーク
+
+    func isBookmarked(_ u: URL?) -> Bool {
+        guard let u else { return false }
+        return bookmarks.contains(u.absoluteString)
+    }
+
+    /// 付いていなければ付ける、付いていれば外す。付けたら true
+    @discardableResult
+    func toggleBookmark(url: URL, title: String) -> Bool {
+        let s = url.absoluteString
+        if bookmarks.contains(s) {
+            bookmarks.remove(url: s)
+            log?("ブックマークを外しました: \(s)")
+            bookmarkFile.save(bookmarks)
+            return false
         }
-        // URLComponents は「+」をそのまま残すので、検索語の「+」を %2B にする（空白と区別するため）
-        c.percentEncodedQuery = c.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
-        return c.url
+        guard LibraryKey.isRecordable(url) else { return false }
+        bookmarks.add(title: title, url: s)
+        log?("ブックマークに入れました: \(s)")
+        bookmarkFile.save(bookmarks)
+        return true
+    }
+
+    func removeBookmark(_ id: UUID) {
+        bookmarks.remove(id: id)
+        bookmarkFile.save(bookmarks)
+    }
+
+    func renameBookmark(_ id: UUID, title: String) {
+        bookmarks.rename(id: id, title: title)
+        bookmarkFile.save(bookmarks)
+    }
+
+    func moveBookmark(_ id: UUID, by delta: Int) {
+        bookmarks.move(id: id, by: delta)
+        bookmarkFile.save(bookmarks)
+    }
+
+    // MARK: 履歴
+
+    func recordVisit(url: URL, title: String) {
+        if history.record(url: url, title: title) { historyFile.save(history) }
+    }
+
+    func updateTitle(url: URL, title: String) {
+        let before = history
+        history.updateTitle(url: url, title: title)
+        if history != before { historyFile.save(history) }
+    }
+
+    func removeHistory(_ url: String) {
+        history.remove(url: url)
+        historyFile.save(history)
+    }
+
+    /// since より後の履歴を消す（nil なら全部）
+    func clearHistory(since: Date?) {
+        history.clear(since: since)
+        historyFile.saveNow(history)
+        log?(since == nil ? "履歴を全部消しました" : "履歴を消しました（\(since!) から後）")
+    }
+
+    func suggestions(for text: String) -> [Suggestion] {
+        Suggestions.rank(query: text, bookmarks: bookmarks.items, history: history.entries)
     }
 }
 
-enum AddressInput {
-    enum Resolved: Equatable {
-        case url(URL)
-        case search(String, URL)
-    }
+/// アドレス欄の入力（打つたびに変わるので、BrowserStore とは分けて、見る所だけを描き直す）
+@MainActor
+final class AddressEditor: ObservableObject {
+    @Published var text = ""
+    @Published var editing = false
+    /// 増やすとアドレス欄にフォーカスを当てる（⌘L）
+    @Published private(set) var focusRequest = 0
+    /// 増やすとアドレス欄から離れる（候補を選んだ・外を押した）
+    @Published private(set) var blurRequest = 0
 
-    /// 入れた文字を開く URL にする。空なら nil
-    static func resolve(_ raw: String, engine: SearchEngine) -> Resolved? {
-        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if text.isEmpty { return nil }
-        let lower = text.lowercased()
-        if lower.hasPrefix("about:") { return URL(string: lower).map { .url($0) } }
-        if text.contains("://"), let u = URL(string: text), u.scheme != nil, u.host != nil || lower.hasPrefix("file:") {
-            return .url(u)
-        }
-        if text.rangeOfCharacter(from: .whitespaces) == nil, let u = hostLikeURL(text) { return .url(u) }
-        return engine.searchURL(text).map { .search(text, $0) }
-    }
+    nonisolated init() {}
 
-    /// ホスト名らしいものなら URL にする
-    static func hostLikeURL(_ text: String) -> URL? {
-        // ホストの部分（最初の / ? # まで）
-        let hostEnd = text.firstIndex(where: { $0 == "/" || $0 == "?" || $0 == "#" }) ?? text.endIndex
-        var hostPort = String(text[..<hostEnd])
-        let rest = String(text[hostEnd...])
-        if hostPort.isEmpty { return nil }
-        var host = hostPort
-        // ポート（[v6]:8080 と host:8080）
-        if hostPort.hasPrefix("[") {
-            guard let close = hostPort.firstIndex(of: "]") else { return nil }
-            host = String(hostPort[hostPort.index(after: hostPort.startIndex)..<close])
-            let after = hostPort[hostPort.index(after: close)...]
-            if !after.isEmpty && !(after.hasPrefix(":") && after.dropFirst().allSatisfy({ $0.isNumber }) && after.count > 1) { return nil }
-            guard IPAddressText.v6(host) != nil else { return nil }
-        } else if let colon = hostPort.lastIndex(of: ":") {
-            let port = hostPort[hostPort.index(after: colon)...]
-            guard !port.isEmpty, port.allSatisfy({ $0.isASCII && $0.isNumber }), let p = Int(port), p > 0, p < 65536 else { return nil }
-            host = String(hostPort[..<colon])
-        }
-        host = host.lowercased()
-        hostPort = hostPort.lowercased()
-        let local: Bool
-        if hostPort.hasPrefix("[") {
-            local = LocalNetworkPolicy.classify(host: host)?.isLocal ?? false
-        } else if IPAddressText.v4(host) != nil {
-            local = LocalNetworkPolicy.classify(host: host)?.isLocal ?? false
-        } else if host == "localhost" || host.hasSuffix(".localhost") || host.hasSuffix(".local") {
-            local = true
-        } else {
-            guard looksLikeDomain(host) else { return nil }
-            local = false
-        }
-        return URL(string: (local ? "http://" : "https://") + hostPort + rest)
-    }
-
-    /// ドメイン名らしいか（点で区切った各部分が英数字とハイフン、最後は英字 2 文字以上か xn--）
-    static func looksLikeDomain(_ h: String) -> Bool {
-        let labels = h.split(separator: ".", omittingEmptySubsequences: false)
-        guard labels.count >= 2 else { return false }
-        for l in labels {
-            guard !l.isEmpty, l.count <= 63, !l.hasPrefix("-"), !l.hasSuffix("-"),
-                  l.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }) else { return false }
-        }
-        let tld = labels.last!
-        return tld.hasPrefix("xn--") || (tld.count >= 2 && tld.allSatisfy { $0.isLetter })
-    }
-
-    /// アドレス欄を触っていないときに見せる短い形（ホスト名。www. は外す）
-    static func shortDisplay(_ url: URL?) -> String {
-        guard let u = url else { return "" }
-        if u.scheme == "about" { return "" }
-        guard var h = u.host, !h.isEmpty else { return u.absoluteString }
-        if h.hasPrefix("www.") { h.removeFirst(4) }
-        return h
-    }
-
-    /// 検索の結果のページなら、その検索語（アドレス欄に戻すため）
-    static func searchTerms(in url: URL?) -> String? {
-        guard let u = url, let c = URLComponents(url: u, resolvingAgainstBaseURL: false), let host = u.host?.lowercased() else { return nil }
-        let key: String
-        if host.hasSuffix("google.com") && u.path == "/search" { key = "q" }
-        else if host == "duckduckgo.com" { key = "q" }
-        else if host.hasSuffix("bing.com") && u.path == "/search" { key = "q" }
-        else if host == "search.yahoo.co.jp" { key = "p" }
-        else { return nil }
-        return c.queryItems?.first(where: { $0.name == key })?.value
-    }
+    func focus() { focusRequest += 1 }
+    func blur() { blurRequest += 1 }
 }
 
 // ======================================================================
-// MARK: - ErrorPages.swift
+// MARK: - LibraryModel.swift
 // ======================================================================
 
-// MARK: - エラーページ・確認のページ
+// MARK: - ブックマーク・履歴・アドレス欄の候補・文字の大きさ（UI と WebKit に頼らない部分。Linux でテストする）
 //
-// ・読めなかったときに、原因の説明と、できること（再試行・標準の通信で開く など）のボタンを出す
-// ・ボタンは window.webkit.messageHandlers.velaAction に {action: "page", nonce} を送る。
-//   合言葉（nonce）は 1 回だけ・10 分まで使える。ページは失敗した URL のオリジンで出すので、元のページからは合言葉を読めない
-//   （LAN の確認のように、押されると困るボタンもあるため。合言葉の無い知らせは受け付けない）
+// ・同じページかどうかは LibraryKey.normalize で比べる（#… を外す・スキームとホストを小文字に・末尾の「/」だけの違いを無視）
+// ・履歴は URL ごとに 1 つ（最後に見た時刻・見た回数・タイトル）。新しい順。最大 HistoryLog.maxEntries 件
+// ・候補は「入れた文字で始まるサイト」を一番上に。ブックマーク・よく見る・最近見たものを上げる
 
-/// ページのボタンの合言葉 → してほしいこと（画面のスレッドでだけ使う）
-final class PageActions {
-    struct Item {
-        let action: String
-        let url: URL
-        let at: Date
-    }
-    private var items: [String: Item] = [:]
-    static let lifetime: TimeInterval = 600
-
-    init() {}
-
-    /// 合言葉を作る
-    func make(_ action: String, url: URL, now: Date = Date()) -> String {
-        items = items.filter { now.timeIntervalSince($0.value.at) < PageActions.lifetime }
-        let n = UUID().uuidString.replacingOccurrences(of: "-", with: "") + UUID().uuidString.replacingOccurrences(of: "-", with: "")
-        items[n] = Item(action: action, url: url, at: now)
-        return n
+enum LibraryKey {
+    /// 比べるための形（保存はしない）
+    static func normalize(_ s: String) -> String {
+        guard var c = URLComponents(string: s) else { return s }
+        c.fragment = nil
+        c.scheme = c.scheme?.lowercased()
+        c.host = c.host?.lowercased()
+        if c.path == "/" && c.query == nil { c.path = "" }
+        return c.string ?? s
     }
 
-    /// 合言葉を確かめて、してほしいことを返す（1 回だけ）
-    func consume(_ nonce: String, now: Date = Date()) -> Item? {
-        guard let i = items.removeValue(forKey: nonce), now.timeIntervalSince(i.at) < PageActions.lifetime else { return nil }
-        return i
+    /// 履歴・ブックマークに入れてよい URL か（http・https だけ）
+    static func isRecordable(_ u: URL) -> Bool {
+        let s = u.scheme?.lowercased()
+        return (s == "http" || s == "https") && u.host?.isEmpty == false
+    }
+
+    /// 候補の照らし合わせ用（スキームと「www.」を外して小文字に）
+    static func bare(_ s: String) -> String {
+        var t = s.lowercased()
+        for p in ["https://", "http://"] where t.hasPrefix(p) { t.removeFirst(p.count) }
+        if t.hasPrefix("www.") { t.removeFirst(4) }
+        return t
     }
 }
 
-enum ErrorPage {
-    /// ページの中のボタン（label・合言葉）
-    struct Button {
-        let label: String
-        let nonce: String
-        let primary: Bool
+struct Bookmark: Codable, Identifiable, Equatable {
+    var id: UUID
+    var title: String
+    var url: String
+    var added: Date
+}
+
+struct BookmarkList: Codable, Equatable {
+    var items: [Bookmark] = []
+
+    func find(_ url: String) -> Bookmark? {
+        let k = LibraryKey.normalize(url)
+        return items.first { LibraryKey.normalize($0.url) == k }
     }
 
-    /// 説明（見出し・ひとこと・標準の通信で開く案内を出すか）
-    struct Description {
-        let title: String
-        let hint: String
-        let offerNative: Bool
+    func contains(_ url: String) -> Bool { find(url) != nil }
+
+    /// 足す（同じページが既にあれば足さずに false）
+    @discardableResult
+    mutating func add(title: String, url: String, now: Date = Date()) -> Bool {
+        if contains(url) { return false }
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        items.append(Bookmark(id: UUID(), title: t.isEmpty ? url : t, url: url, added: now))
+        return true
     }
 
-    static func describe(_ e: FetchError) -> Description {
-        switch e.kind {
-        case .dns: return Description(title: "サーバーが見つかりません", hint: "アドレスが正しいか、ネットワークにつながっているかを確かめてください。", offerNative: true)
-        case .timeout: return Description(title: "時間切れです", hint: "サーバーから返事がありません。しばらくしてから試してください。", offerNative: true)
-        case .tls: return Description(title: "安全な接続を作れませんでした", hint: "証明書に問題があるか、VNet の TLS では話せない相手です。", offerNative: true)
-        case .tlsVersion: return Description(title: "このサイトは VNet の TLS では開けません", hint: "相手が TLS 1.3 だけを使っています（VNet の TLS は 1.2 まで）。標準の通信なら開けます。", offerNative: true)
-        case .connect: return Description(title: "サーバーにつながりません", hint: "サーバーが止まっているか、ネットワークに問題があります。", offerNative: true)
-        case .reset: return Description(title: "接続が途中で切れました", hint: "もう一度試してください。", offerNative: true)
-        case .malformed, .tooLarge: return Description(title: "サーバーの返事を読めません", hint: e.description, offerNative: true)
-        case .redirect: return Description(title: "リダイレクトが多すぎます", hint: "サーバーの設定に問題があるかもしれません。", offerNative: false)
-        case .busy: return Description(title: "要求が多すぎます", hint: "少し待ってから試してください。", offerNative: false)
-        case .blocked: return Description(title: "Vela の守りで止めました", hint: e.description, offerNative: false)
-        case .localNetworkConsent: return Description(title: "LAN の機器を開きますか？", hint: e.description, offerNative: false)
-        case .notReady: return Description(title: "VNet の準備ができていません", hint: "少し待ってから試してください。", offerNative: true)
-        case .cancelled: return Description(title: "取り消しました", hint: "", offerNative: false)
-        case .other: return Description(title: "読めませんでした", hint: e.description, offerNative: true)
+    mutating func remove(id: UUID) { items.removeAll { $0.id == id } }
+
+    mutating func remove(url: String) {
+        let k = LibraryKey.normalize(url)
+        items.removeAll { LibraryKey.normalize($0.url) == k }
+    }
+
+    mutating func rename(id: UUID, title: String) {
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty, let i = items.firstIndex(where: { $0.id == id }) else { return }
+        items[i].title = t
+    }
+
+    /// 並べ替え（delta: -1 で 1 つ上、+1 で 1 つ下）
+    mutating func move(id: UUID, by delta: Int) {
+        guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        let j = max(0, min(items.count - 1, i + delta))
+        if i == j { return }
+        let b = items.remove(at: i)
+        items.insert(b, at: j)
+    }
+}
+
+struct HistoryEntry: Codable, Identifiable, Equatable {
+    var url: String
+    var title: String
+    var lastVisit: Date
+    var visits: Int
+    var id: String { url }
+}
+
+struct HistoryLog: Codable, Equatable {
+    static let maxEntries = 5000
+    /// 新しい順
+    var entries: [HistoryEntry] = []
+
+    /// 見たページを記録する（http・https だけ）。記録したら true
+    @discardableResult
+    mutating func record(url: URL, title: String, at now: Date = Date()) -> Bool {
+        guard LibraryKey.isRecordable(url) else { return false }
+        let s = url.absoluteString
+        let k = LibraryKey.normalize(s)
+        var e = HistoryEntry(url: s, title: title, lastVisit: now, visits: 1)
+        if let i = entries.firstIndex(where: { LibraryKey.normalize($0.url) == k }) {
+            let old = entries.remove(at: i)
+            e.visits = old.visits + 1
+            if title.isEmpty { e.title = old.title }
+        }
+        entries.insert(e, at: 0)
+        if entries.count > HistoryLog.maxEntries { entries.removeLast(entries.count - HistoryLog.maxEntries) }
+        return true
+    }
+
+    /// ページのタイトルが後から変わった（読み込みの後に JavaScript が変えるなど）
+    mutating func updateTitle(url: URL, title: String) {
+        guard !title.isEmpty else { return }
+        let k = LibraryKey.normalize(url.absoluteString)
+        if let i = entries.firstIndex(where: { LibraryKey.normalize($0.url) == k }), entries[i].title != title {
+            entries[i].title = title
         }
     }
 
-    /// 標準の通信（WebKit）の失敗の説明（NSURLErrorDomain の番号）
-    static func describe(nsErrorCode code: Int, domain: String, message: String) -> Description {
-        guard domain == NSURLErrorDomain else { return Description(title: "読めませんでした", hint: message, offerNative: false) }
-        switch code {
-        case NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost, NSURLErrorDataNotAllowed:
-            return Description(title: "インターネットにつながっていません", hint: "Wi-Fi やモバイル通信を確かめてください。", offerNative: false)
-        case NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed:
-            return Description(title: "サーバーが見つかりません", hint: "アドレスが正しいかを確かめてください。", offerNative: false)
-        case NSURLErrorTimedOut:
-            return Description(title: "時間切れです", hint: "サーバーから返事がありません。", offerNative: false)
-        case NSURLErrorCannotConnectToHost:
-            return Description(title: "サーバーにつながりません", hint: message, offerNative: false)
-        case NSURLErrorSecureConnectionFailed, NSURLErrorServerCertificateHasBadDate, NSURLErrorServerCertificateUntrusted,
-             NSURLErrorServerCertificateHasUnknownRoot, NSURLErrorServerCertificateNotYetValid, NSURLErrorClientCertificateRejected:
-            return Description(title: "安全な接続を作れませんでした", hint: "証明書に問題があります。このサイトは開かないでください。", offerNative: false)
-        default:
-            return Description(title: "読めませんでした", hint: message, offerNative: false)
-        }
+    mutating func remove(url: String) {
+        let k = LibraryKey.normalize(url)
+        entries.removeAll { LibraryKey.normalize($0.url) == k }
     }
 
-    /// エラーページの HTML（文字は全部エスケープする。暗い表示にも合わせる）
-    static func html(title: String, lines: [String], detail: String? = nil, buttons: [Button], kind: String) -> String {
-        var s = """
-        <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-        <meta name="color-scheme" content="light dark"><title>\(escape(title))</title><style>
-        body{font:17px -apple-system,system-ui;margin:0;padding:48px 24px;color:#1c1c1e;background:#f2f2f7}
-        @media (prefers-color-scheme:dark){body{color:#f2f2f7;background:#1c1c1e}.d{background:#2c2c2e}}
-        main{max-width:620px;margin:0 auto}h1{font-size:24px;margin:0 0 16px}p{line-height:1.5;word-break:break-all}
-        .u{color:#8e8e93;font-size:14px}.d{background:#e5e5ea;border-radius:8px;padding:8px 12px;font:12px ui-monospace,monospace;white-space:pre-wrap}
-        button{font-size:16px;padding:10px 20px;margin:8px 8px 0 0;border-radius:10px;border:0;background:#d1d1d6;color:inherit}
-        button.p{background:#0a84ff;color:#fff}
-        </style></head><body><main>
-        """
-        s += "<h1>\(escape(title))</h1>"
-        for l in lines where !l.isEmpty { s += "<p>\(escape(l))</p>" }
-        if !buttons.isEmpty {
-            s += "<div>"
-            for b in buttons {
-                let js = "window.webkit.messageHandlers.velaAction.postMessage({action:'page',nonce:'\(b.nonce)'})"
-                s += "<button class=\"\(b.primary ? "p" : "")\" onclick=\"\(escape(js))\">\(escape(b.label))</button>"
+    /// since より後に見たものを消す（nil なら全部）
+    mutating func clear(since: Date?) {
+        guard let since else { entries = []; return }
+        entries.removeAll { $0.lastVisit >= since }
+    }
+
+    /// 文字で探す（タイトルと URL。新しい順）
+    func search(_ q: String, limit: Int = 500) -> [HistoryEntry] {
+        let t = q.trimmingCharacters(in: .whitespaces).lowercased()
+        if t.isEmpty { return Array(entries.prefix(limit)) }
+        return Array(entries.lazy.filter { $0.title.lowercased().contains(t) || $0.url.lowercased().contains(t) }.prefix(limit))
+    }
+
+    /// よく見るサイト（ホストごとに 1 つ。回数の多い順）
+    func topSites(limit: Int = 8) -> [HistoryEntry] {
+        var best: [String: HistoryEntry] = [:]
+        var total: [String: Int] = [:]
+        for e in entries {
+            guard let h = URL(string: e.url)?.host?.lowercased() else { continue }
+            total[h, default: 0] += e.visits
+            if let b = best[h], b.visits >= e.visits { continue }
+            best[h] = e
+        }
+        return best.sorted { a, b in
+            let ta = total[a.key] ?? 0, tb = total[b.key] ?? 0
+            return ta != tb ? ta > tb : a.value.lastVisit > b.value.lastVisit
+        }.prefix(limit).map { $0.value }
+    }
+
+    /// 日ごとに分ける（見出し・その日の分）。entries は新しい順のまま渡す
+    static func groupByDay(_ list: [HistoryEntry], now: Date = Date(), calendar: Calendar = .current) -> [(title: String, entries: [HistoryEntry])] {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "ja_JP")
+        f.dateFormat = "M月d日（E）"
+        var out: [(title: String, entries: [HistoryEntry])] = []
+        var lastDay: Date?
+        for e in list {
+            let day = calendar.startOfDay(for: e.lastVisit)
+            if day != lastDay {
+                let title: String
+                if calendar.isDate(day, inSameDayAs: now) { title = "今日" }
+                else if let y = calendar.date(byAdding: .day, value: -1, to: now), calendar.isDate(day, inSameDayAs: y) { title = "昨日" }
+                else { title = f.string(from: day) }
+                out.append((title, []))
+                lastDay = day
             }
-            s += "</div>"
+            out[out.count - 1].entries.append(e)
         }
-        if let d = detail, !d.isEmpty { s += "<details><summary class=\"u\">くわしく</summary><p class=\"d\">\(escape(d))</p></details>" }
-        s += "</main></body></html><!-- vela-error:\(escape(kind)) -->"
-        return s
+        return out
+    }
+}
+
+// MARK: アドレス欄の候補
+
+struct Suggestion: Identifiable, Equatable {
+    enum Kind: Equatable { case bookmark, history }
+    let kind: Kind
+    let title: String
+    let url: String
+    var id: String { url }
+}
+
+enum Suggestions {
+    static func rank(query: String, bookmarks: [Bookmark], history: [HistoryEntry], now: Date = Date(), limit: Int = 8) -> [Suggestion] {
+        let q = LibraryKey.bare(query.trimmingCharacters(in: .whitespaces))
+        if q.isEmpty { return [] }
+        var scored: [String: (Int, Suggestion)] = [:]
+        func consider(_ s: Suggestion, bonus: Int) {
+            let u = LibraryKey.bare(s.url)
+            let title = s.title.lowercased()
+            var score: Int
+            if u.hasPrefix(q) { score = 100 }
+            else if title.hasPrefix(q) || title.contains(" " + q) { score = 60 }
+            else if u.contains(q) || title.contains(q) { score = 30 }
+            else { return }
+            score += bonus
+            let k = LibraryKey.normalize(s.url)
+            if let old = scored[k], old.0 >= score { return }
+            scored[k] = (score, s)
+        }
+        for b in bookmarks { consider(Suggestion(kind: .bookmark, title: b.title, url: b.url), bonus: 25) }
+        // 履歴は全部を見ると重いので、新しい 2,000 件まで
+        for h in history.prefix(2000) {
+            var bonus = min(h.visits, 20) * 2
+            let age = now.timeIntervalSince(h.lastVisit)
+            if age < 86_400 { bonus += 10 } else if age < 7 * 86_400 { bonus += 5 }
+            // 短い URL（サイトの入口）を少し上げる
+            if (URL(string: h.url)?.path.count ?? 0) <= 1 { bonus += 8 }
+            consider(Suggestion(kind: .history, title: h.title, url: h.url), bonus: bonus)
+        }
+        return scored.values.sorted { a, b in
+            a.0 != b.0 ? a.0 > b.0 : a.1.url.count < b.1.url.count
+        }.prefix(limit).map { $0.1 }
+    }
+}
+
+// MARK: 文字の大きさ（ページの拡大率）
+
+enum PageZoom {
+    static let steps: [Double] = [0.5, 0.75, 0.85, 1.0, 1.15, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]
+
+    /// 今の値から段を delta だけ動かした値（delta が 0 なら 100%）
+    static func step(from z: Double, by delta: Int) -> Double {
+        if delta == 0 { return 1.0 }
+        // 今の値に一番近い段から動かす
+        let i = steps.indices.min { abs(steps[$0] - z) < abs(steps[$1] - z) } ?? 3
+        return steps[max(0, min(steps.count - 1, i + delta))]
     }
 
-    static func escape(_ s: String) -> String {
-        var o = ""
-        for c in s {
-            switch c {
-            case "&": o += "&amp;"
-            case "<": o += "&lt;"
-            case ">": o += "&gt;"
-            case "\"": o += "&quot;"
-            case "'": o += "&#39;"
-            default: o.append(c)
-            }
-        }
-        return o
-    }
+    static func percent(_ z: Double) -> String { "\(Int((z * 100).rounded()))%" }
 }

@@ -31,6 +31,8 @@ final class BrowserTab: ObservableObject, Identifiable {
     @Published private(set) var snapshot: UIImage?
     /// このページが使った、VNet を通らない通信（"WebSocket" など）
     @Published private(set) var nonVNetUsage: Set<String> = []
+    /// 文字の大きさ（ページの拡大率。サイトごとに覚える）
+    @Published private(set) var zoom = 1.0
     /// 最後に見た時刻（WebView を捨てる順番を決める）
     var lastSelected = Date()
 
@@ -51,6 +53,10 @@ final class BrowserTab: ObservableObject, Identifiable {
     private var httpsFirstFrom: URL?
     /// HTTPS-First で「http のまま開く」を選んだホスト
     private var httpAllowedHosts = Set<String>()
+    /// エラーページを出した URL（履歴に入れない）
+    private var errorPageURL: URL?
+    /// 最後に履歴に入れた URL（後からタイトルが変わったら直す）
+    private var lastRecorded: URL?
 
     init(id: Int, store: BrowserStore, mode: NetMode) {
         self.id = id
@@ -107,6 +113,8 @@ final class BrowserTab: ObservableObject, Identifiable {
         // アプリの中のブラウザやロボットだと思われて、エラーや「不審なトラフィック」の画面になりやすい
         wv.customUserAgent = BrowserIdentity.userAgent
         wv.allowsBackForwardNavigationGestures = true
+        // ページ内を検索（⌘F・「ぁあ」メニュー）
+        wv.isFindInteractionEnabled = true
         if #available(iOS 16.4, *) { wv.isInspectable = VelaSettings.webInspector }
         let d = TabWebDelegate(tab: self)
         wv.navigationDelegate = d
@@ -225,7 +233,11 @@ final class BrowserTab: ObservableObject, Identifiable {
             url = real
             nonVNetUsage = []
         }
-        title = wv.title ?? ""
+        let newTitle = wv.title ?? ""
+        if newTitle != title, !newTitle.isEmpty, let r = lastRecorded, r == real {
+            store?.library.updateTitle(url: r, title: newTitle)
+        }
+        title = newTitle
         progress = wv.estimatedProgress
         isLoading = wv.isLoading
         canGoBack = wv.canGoBack
@@ -362,6 +374,7 @@ final class BrowserTab: ObservableObject, Identifiable {
 
     /// VNet でページ本体を読めなかった。設定で選んであれば、標準の通信に自動で切り替える
     private func vnetFailed(_ u: URL, _ e: FetchError) {
+        errorPageURL = u
         let kinds: Set<FetchError.Kind> = [.tls, .tlsVersion, .connect, .timeout, .reset, .malformed, .notReady]
         guard VelaSettings.autoFallbackToNative, mode.usesVNet, kinds.contains(e.kind) else { return }
         log("VNet で読めなかったので、標準の通信に自動で切り替えます（\(e.kind.rawValue)）", level: .warning)
@@ -384,6 +397,34 @@ final class BrowserTab: ObservableObject, Identifiable {
     func didCommitNavigation() {
         httpsFirstFrom = nil
         syncFromWebView()
+        applySiteZoom()
+    }
+
+    func didStartNavigation() {
+        errorPageURL = nil
+    }
+
+    // MARK: 文字の大きさ・ページ内を検索
+
+    /// そのサイトで覚えている大きさにする
+    private func applySiteZoom() {
+        guard let wv = webView else { return }
+        let z = VelaSettings.zoom(for: url?.host)
+        zoom = z
+        if abs(Double(wv.pageZoom) - z) > 0.001 { wv.pageZoom = CGFloat(z) }
+    }
+
+    /// 大きく（+1）・小さく（-1）・元に戻す（0）。サイトごとに覚える
+    func changeZoom(_ delta: Int) {
+        let z = PageZoom.step(from: zoom, by: delta)
+        VelaSettings.setZoom(z, for: url?.host)
+        applySiteZoom()
+        log("文字の大きさ: \(PageZoom.percent(z))（\(url?.host ?? "")）")
+    }
+
+    func findInPage() {
+        ensureWebView()
+        webView?.findInteraction?.presentFindNavigator(showingReplace: false)
     }
 
     /// WebKit（標準の通信など）が読めなかった: エラーページを出す
@@ -394,6 +435,7 @@ final class BrowserTab: ObservableObject, Identifiable {
         guard let wv = webView else { return }
         let failing = (ns.userInfo[NSURLErrorFailingURLErrorKey] as? URL) ?? url
         guard let f = failing.flatMap({ VNetURL.toReal($0) }) else { return }
+        errorPageURL = f
         let html: String
         if let http = httpsFirstFrom, f.host?.lowercased() == http.host?.lowercased() {
             html = ErrorPage.html(title: "https では開けませんでした", lines: [
@@ -443,6 +485,11 @@ final class BrowserTab: ObservableObject, Identifiable {
 
     func didFinish() {
         syncFromWebView()
+        // 履歴に入れる（エラーページは入れない）
+        if let u = url, u != errorPageURL, LibraryKey.isRecordable(u) {
+            store?.recordVisit(url: u, title: title)
+            lastRecorded = u
+        }
         store?.saveSession()
     }
 
@@ -537,6 +584,7 @@ final class TabWebDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        tab?.didStartNavigation()
         tab?.navigationEvent("読み込み開始: \(webView.url?.absoluteString ?? "")")
     }
 

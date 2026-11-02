@@ -6,6 +6,12 @@
 
 @MainActor open class UIResponder: NSObject {}
 
+@MainActor open class UIFindInteraction: NSObject {
+    open func presentFindNavigator(showingReplace: Bool) {}
+    open func dismissFindNavigator() {}
+    open var isFindNavigatorVisible: Bool { false }
+}
+
 open class UIView: UIResponder {
     public struct AutoresizingMask: OptionSet {
         public let rawValue: UInt

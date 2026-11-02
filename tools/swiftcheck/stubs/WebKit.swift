@@ -262,6 +262,9 @@ open class WKBackForwardList: NSObject {
     @MainActor open var customUserAgent: String?
     @MainActor open var allowsBackForwardNavigationGestures = false
     @MainActor open var isInspectable = false
+    @MainActor open var pageZoom: CGFloat = 1
+    @MainActor open var isFindInteractionEnabled = false
+    @MainActor open var findInteraction: UIFindInteraction? { nil }
     @MainActor open var scrollView: UIScrollView { UIScrollView() }
     @MainActor open var backForwardList: WKBackForwardList { WKBackForwardList() }
     @MainActor @discardableResult open func load(_ request: URLRequest) -> WKNavigation? { nil }

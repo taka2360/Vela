@@ -17,6 +17,515 @@ import Security
 #endif
 
 // ======================================================================
+// MARK: - HTTPSupport.swift
+// ======================================================================
+
+// MARK: - http の小さな道具（ヘッダ・gzip・ブラウザらしさ）
+//
+// Cookie は CookieJar.swift（WebKit の置き場の写し）と NetPolicy.swift の CookiePolicy に移した
+
+/// ヘッダ（名前, 値）の並び。名前の大文字小文字は区別しない
+extension Array where Element == (String, String) {
+    func value(for name: String) -> String? {
+        let n = name.lowercased()
+        return first { $0.0.lowercased() == n }?.1
+    }
+
+    func values(for name: String) -> [String] {
+        let n = name.lowercased()
+        return filter { $0.0.lowercased() == n }.map { $0.1 }
+    }
+
+    /// names は小文字で渡す
+    mutating func removeAll(named names: Set<String>) {
+        removeAll { names.contains($0.0.lowercased()) }
+    }
+}
+
+// MARK: 縮めた中身を戻す（gzip・deflate・br）
+
+enum ContentDecoding {
+    /// 送る Accept-Encoding（Safari と同じ。br は iOS 15 から）
+    static var acceptEncoding: String {
+        #if canImport(Compression)
+        if #available(iOS 15.0, macOS 12.0, *) { return "gzip, deflate, br" }
+        return "gzip, deflate"
+        #else
+        return "identity"
+        #endif
+    }
+
+    enum Failure: Error, Equatable {
+        /// 知らない縮め方（この環境で戻せないものも）
+        case unsupported(String)
+        /// 壊れている・途中で切れている
+        case corrupt(String)
+        /// 戻した大きさが上限を超えた（圧縮爆弾など）
+        case tooLarge(Int)
+
+        var description: String {
+            switch self {
+            case .unsupported(let e): return "戻せない縮め方です（\(e)）"
+            case .corrupt(let e): return "縮めた中身（\(e)）が壊れています"
+            case .tooLarge(let n): return "戻した中身が \(n >> 20)MB を超えます"
+            }
+        }
+    }
+
+    /// Content-Encoding に従って戻す。戻した大きさは maxOutput まで
+    static func decode(_ d: Data, encoding: String, maxOutput: Int = 32 << 20) -> Result<Data, Failure> {
+        // "gzip, br" のように重ねてあるときは、後ろから戻す
+        var out = d
+        for e in encoding.lowercased().split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }).reversed() {
+            let r: Result<Data, Failure>
+            switch e {
+            case "", "identity": continue
+            case "gzip", "x-gzip": r = gunzip(out, maxOutput: maxOutput)
+            case "deflate": r = inflateZlib(out, maxOutput: maxOutput)
+            case "br": r = brotli(out, maxOutput: maxOutput)
+            default: return .failure(.unsupported(e))
+            }
+            switch r {
+            case .success(let g): out = g
+            case .failure(let f): return .failure(f)
+            }
+        }
+        return .success(out)
+    }
+
+    /// gzip: 前（10 バイト〜）と後ろ（8 バイト）を外して、生の deflate として戻す
+    static func gunzip(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
+        let b = [UInt8](d)
+        guard b.count >= 18, b[0] == 0x1F, b[1] == 0x8B, b[2] == 8 else { return .failure(.corrupt("gzip の頭が違います")) }
+        let flags = b[3]
+        var p = 10
+        if flags & 4 != 0 { guard p + 2 <= b.count else { return .failure(.corrupt("gzip")) }; p += 2 + (Int(b[p]) | Int(b[p + 1]) << 8) }   // FEXTRA
+        if flags & 8 != 0 { while p < b.count && b[p] != 0 { p += 1 }; p += 1 }                                      // FNAME
+        if flags & 16 != 0 { while p < b.count && b[p] != 0 { p += 1 }; p += 1 }                                     // FCOMMENT
+        if flags & 2 != 0 { p += 2 }                                                                                  // FHCRC
+        guard p < b.count else { return .failure(.corrupt("gzip")) }
+        return inflateRaw(b[p...], name: "gzip", maxOutput: maxOutput)
+    }
+
+    /// deflate: 本当は zlib の包み（2 バイト＋後ろ 4 バイト）付き。包みの無い生の deflate を送るサーバーもあるので両方受ける
+    static func inflateZlib(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
+        let b = [UInt8](d)
+        if b.count >= 2 && b[0] & 0x0F == 8 && (Int(b[0]) << 8 | Int(b[1])) % 31 == 0 { return inflateRaw(b[2...], name: "deflate", maxOutput: maxOutput) }
+        return inflateRaw(b[...], name: "deflate", maxOutput: maxOutput)
+    }
+
+    static func inflateRaw(_ b: ArraySlice<UInt8>, name: String, maxOutput: Int) -> Result<Data, Failure> {
+        #if canImport(Compression)
+        return stream(b, COMPRESSION_ZLIB, name: name, maxOutput: maxOutput)      // Apple の ZLIB は「生の deflate」
+        #else
+        return .failure(.unsupported(name))
+        #endif
+    }
+
+    static func brotli(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
+        #if canImport(Compression)
+        if #available(iOS 15.0, macOS 12.0, *) { return stream([UInt8](d)[...], COMPRESSION_BROTLI, name: "br", maxOutput: maxOutput) }
+        #endif
+        return .failure(.unsupported("br"))
+    }
+
+    #if canImport(Compression)
+    /// 元の大きさが分からなくても戻せるよう、少しずつ戻す。最後まで戻せなかったら壊れている扱い
+    private static func stream(_ src: ArraySlice<UInt8>, _ algorithm: compression_algorithm, name: String, maxOutput: Int) -> Result<Data, Failure> {
+        if src.isEmpty { return .success(Data()) }
+        let chunk = 1 << 16
+        let out = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
+        defer { out.deallocate() }
+        var s = compression_stream(dst_ptr: out, dst_size: 0, src_ptr: UnsafePointer(out), src_size: 0, state: nil)
+        guard compression_stream_init(&s, COMPRESSION_STREAM_DECODE, algorithm) == COMPRESSION_STATUS_OK else { return .failure(.unsupported(name)) }
+        defer { compression_stream_destroy(&s) }
+        var result = Data()
+        return src.withUnsafeBufferPointer { sb -> Result<Data, Failure> in
+            guard let base = sb.baseAddress else { return .failure(.corrupt(name)) }
+            s.src_ptr = base
+            s.src_size = sb.count
+            while true {
+                s.dst_ptr = out
+                s.dst_size = chunk
+                let st = compression_stream_process(&s, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
+                let produced = chunk - s.dst_size
+                if result.count + produced > maxOutput { return .failure(.tooLarge(maxOutput)) }
+                if produced > 0 { result.append(out, count: produced) }
+                if st == COMPRESSION_STATUS_END { return .success(result) }
+                if st != COMPRESSION_STATUS_OK { return .failure(.corrupt(name)) }
+                if produced == 0 && s.src_size == 0 { return .failure(.corrupt("\(name)・途中で切れています")) }
+            }
+        }
+    }
+    #endif
+}
+
+// MARK: 少しずつ届く縮めた中身を、少しずつ戻す（流す形のとき）
+
+/// 流す形の返事の Content-Encoding を、届いた分ずつ戻す。1 種類の縮め方だけ（重ねてあるものは流さずに貯める形で読む）
+final class StreamDecoder {
+    enum Kind { case gzip, deflate, br }
+
+    /// 縮め方から作る。縮めていない（identity）なら nil。流す形で戻せないものは失敗
+    static func make(encoding: String) -> Result<StreamDecoder?, ContentDecoding.Failure> {
+        let list = encoding.lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty && $0 != "identity" }
+        if list.isEmpty { return .success(nil) }
+        guard list.count == 1 else { return .failure(.unsupported(encoding)) }
+        let kind: Kind
+        switch list[0] {
+        case "gzip", "x-gzip": kind = .gzip
+        case "deflate": kind = .deflate
+        case "br": kind = .br
+        default: return .failure(.unsupported(list[0]))
+        }
+        #if canImport(Compression)
+        if kind == .br, #unavailable(iOS 15.0, macOS 12.0) { return .failure(.unsupported("br")) }
+        guard let d = StreamDecoder(kind: kind) else { return .failure(.unsupported(list[0])) }
+        return .success(d)
+        #else
+        return .failure(.unsupported(list[0]))
+        #endif
+    }
+
+    let kind: Kind
+    let maxOutput: Int
+    private(set) var produced = 0
+    /// 頭（gzip の 10 バイト〜・zlib の 2 バイト）を読み終えるまで貯めておく
+    private var head = [UInt8]()
+    private var headDone = false
+    private var ended = false
+
+    #if canImport(Compression)
+    private var stream: compression_stream
+    private var started = false
+
+    private init?(kind: Kind, maxOutput: Int = Int.max) {
+        self.kind = kind
+        self.maxOutput = maxOutput
+        let dummy = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
+        defer { dummy.deallocate() }
+        stream = compression_stream(dst_ptr: dummy, dst_size: 0, src_ptr: UnsafePointer(dummy), src_size: 0, state: nil)
+        let algorithm: compression_algorithm
+        if kind == .br {
+            if #available(iOS 15.0, macOS 12.0, *) { algorithm = COMPRESSION_BROTLI } else { return nil }
+        } else {
+            algorithm = COMPRESSION_ZLIB      // Apple の ZLIB は「生の deflate」
+        }
+        guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, algorithm) == COMPRESSION_STATUS_OK else { return nil }
+        started = true
+    }
+
+    deinit { if started { compression_stream_destroy(&stream) } }
+    #else
+    private init?(kind: Kind, maxOutput: Int = Int.max) { return nil }
+    #endif
+
+    /// 届いた分を戻す
+    func feed(_ d: Data) -> Result<Data, ContentDecoding.Failure> {
+        if ended { return .success(Data()) }          // 終わった後のもの（gzip の後ろの 8 バイトなど）は捨てる
+        var bytes = [UInt8](d)
+        if !headDone {
+            head += bytes
+            switch skipHead() {
+            case .needMore: return .success(Data())
+            case .bad(let why): return .failure(.corrupt(why))
+            case .done(let rest): headDone = true; bytes = rest; head = []
+            }
+        }
+        return process(bytes, finalize: false)
+    }
+
+    /// 最後まで届いた
+    func finish() -> Result<Data, ContentDecoding.Failure> {
+        if ended { return .success(Data()) }
+        if !headDone { return .failure(.corrupt("頭の途中で終わりました")) }
+        return process([], finalize: true)
+    }
+
+    private enum HeadResult { case needMore, bad(String), done([UInt8]) }
+
+    private func skipHead() -> HeadResult {
+        let b = head
+        switch kind {
+        case .br:
+            return .done(b)
+        case .deflate:
+            // zlib の包み（2 バイト）があれば外す。無いもの（生の deflate）も受ける
+            if b.count < 2 { return .needMore }
+            if b[0] & 0x0F == 8 && (Int(b[0]) << 8 | Int(b[1])) % 31 == 0 { return .done(Array(b[2...])) }
+            return .done(b)
+        case .gzip:
+            if b.count < 10 { return .needMore }
+            guard b[0] == 0x1F, b[1] == 0x8B, b[2] == 8 else { return .bad("gzip の頭が違います") }
+            let flags = b[3]
+            var p = 10
+            if flags & 4 != 0 {                                         // FEXTRA
+                guard p + 2 <= b.count else { return .needMore }
+                p += 2 + (Int(b[p]) | Int(b[p + 1]) << 8)
+            }
+            for flag in [UInt8(8), 16] where flags & flag != 0 {        // FNAME・FCOMMENT（0 で終わる）
+                guard let z = b[min(p, b.count)...].firstIndex(of: 0) else { return .needMore }
+                p = z + 1
+            }
+            if flags & 2 != 0 { p += 2 }                                 // FHCRC
+            if p > b.count { return .needMore }
+            return .done(Array(b[p...]))
+        }
+    }
+
+    private func process(_ src: [UInt8], finalize: Bool) -> Result<Data, ContentDecoding.Failure> {
+        #if canImport(Compression)
+        let chunk = 1 << 16
+        let out = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
+        defer { out.deallocate() }
+        var result = Data()
+        let name = "\(kind)"
+        return src.withUnsafeBufferPointer { sb -> Result<Data, ContentDecoding.Failure> in
+            let empty: [UInt8] = [0]
+            return empty.withUnsafeBufferPointer { eb -> Result<Data, ContentDecoding.Failure> in
+                stream.src_ptr = sb.baseAddress ?? eb.baseAddress!
+                stream.src_size = sb.count
+                while true {
+                    stream.dst_ptr = out
+                    stream.dst_size = chunk
+                    let flags = finalize ? Int32(COMPRESSION_STREAM_FINALIZE.rawValue) : 0
+                    let st = compression_stream_process(&stream, flags)
+                    let n = chunk - stream.dst_size
+                    if produced + n > maxOutput { return .failure(.tooLarge(maxOutput)) }
+                    if n > 0 { result.append(out, count: n); produced += n }
+                    if st == COMPRESSION_STATUS_END { ended = true; return .success(result) }
+                    if st != COMPRESSION_STATUS_OK { return .failure(.corrupt(name)) }
+                    // 入れたものを全部使い切って、出てくるものも無くなったら、次の分を待つ
+                    if stream.src_size == 0 && n < chunk {
+                        if finalize && n == 0 { return .failure(.corrupt("\(name)・途中で切れています")) }
+                        if !finalize { return .success(result) }
+                    }
+                }
+            }
+        }
+        #else
+        return .failure(.unsupported("\(kind)"))
+        #endif
+    }
+}
+
+// MARK: ブラウザらしさ（User-Agent・言語）
+
+enum BrowserIdentity {
+    /// iPad の Safari（デスクトップ用の表示。iPad の Safari の初期設定と同じ）の User-Agent。
+    /// WKWebView の初期値は「Version/… Safari/…」が無く、アプリの中のブラウザやロボットだと思われやすい
+    static let userAgent: String = {
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/\(v.majorVersion).\(v.minorVersion) Safari/605.1.15"
+    }()
+
+    /// Accept-Language（端末の言語の順。例: "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7"）
+    static let acceptLanguage: String = {
+        var langs: [String] = []
+        for l in Locale.preferredLanguages.prefix(3) {
+            let tag = l.replacingOccurrences(of: "_", with: "-")
+            if !langs.contains(tag) { langs.append(tag) }
+            if let base = tag.split(separator: "-").first.map(String.init), base != tag, !langs.contains(base) { langs.append(base) }
+        }
+        if langs.isEmpty { langs = ["ja-JP", "ja"] }
+        return langs.prefix(6).enumerated().map { i, l in
+            i == 0 ? l : "\(l);q=\(String(format: "%.1f", max(0.1, 1.0 - Double(i) * 0.1)))"
+        }.joined(separator: ",")
+    }()
+}
+
+// ======================================================================
+// MARK: - TLSClient.swift
+// ======================================================================
+
+// MARK: - https の暗号（TLS）を、自作の TCP の上で動かす
+//
+// iPad の普通の通信の部品（Network.framework）は、自分で作った TCP の上では TLS を使えない。
+// そこで、古いけれど今も使える Apple の「SecureTransport」（SSLCreateContext など）を使う。
+// これは「読む・書く」を自分で用意できるので、GuestTCP の上で TLS 1.2 を話せる。
+// 証明書は iPad と同じ仕組みで確かめる（相手の名前も確かめる）。
+// ブラウザらしく見えるよう: ALPN（http/1.1）を名乗る・前の暗号の約束を使い回す（セッション再開。握手が速くなる）
+//
+// 注意（技術的負債）: SecureTransport は 2019 年から非推奨で、TLS 1.3 には対応しない（Apple TN3151）。
+// なので VNet の TLS は 1.2 まで。TLS 1.3 だけのサーバーは版が合わずに失敗する（versionMismatch）。そのときは標準の通信で開く。
+// 自作の TCP の上では Network.framework の TLS を使えないので、TLS エンジンの移行は別の課題にしている
+//
+// 使い方: TLSStream(host:) を作る → TCP がつながったら attach → onReady で write → onData で中身が届く → onClosed
+// SecureTransport が無い環境では TLSStream(host:) が nil を返す（https は使えない）
+
+#if canImport(Security) && os(iOS)
+final class TLSStream: @unchecked Sendable {
+    static let isSupported = true
+    let host: String
+    private let ctx: SSLContext
+    private var tcp: GuestTCP?
+    /// TCP から届いて、まだ TLS に渡していないもの（inbox[inboxPos...]）。先頭を消すと遅いので、位置で覚える
+    private var inbox = [UInt8]()
+    private var inboxPos = 0
+    private var tcpEnded = false
+    private var handshaking = true
+    private var pendingWrite = Data()
+    private var done = false
+    /// 握手に失敗したときの番号（0 なら握手の失敗ではない）
+    private(set) var handshakeError: OSStatus = 0
+    /// 決まった版（"TLS 1.2" など）
+    private(set) var version = ""
+    var onReady: (() -> Void)?
+    var onData: ((Data) -> Void)?
+    var onClosed: ((String?) -> Void)?
+
+    init?(host: String, port: UInt16 = 443) {
+        self.host = host
+        guard let c = SSLCreateContext(nil, .clientSide, .streamType) else { return nil }
+        ctx = c
+        SSLSetIOFuncs(ctx, tlsRead, tlsWrite)
+        SSLSetProtocolVersionMin(ctx, .tlsProtocol12)
+        SSLSetProtocolVersionMax(ctx, .tlsProtocol12)      // SecureTransport は 1.3 を話せない
+        _ = host.withCString { SSLSetPeerDomainName(ctx, $0, strlen($0)) }
+        SSLSetALPNProtocols(ctx, ["http/1.1"] as CFArray)
+        let peer = Array("\(host):\(port)".utf8)
+        _ = peer.withUnsafeBytes { SSLSetPeerID(ctx, $0.baseAddress, $0.count) }
+    }
+
+    /// 証明書の問題での失敗か
+    var failedOnCertificate: Bool { handshakeError <= -9807 && handshakeError >= -9815 }
+
+    /// 版や暗号の組み合わせが合わずに失敗したか（相手が TLS 1.3 だけなど）
+    /// -9836: errSSLPeerProtocolVersion（相手が版を断った）、-9831: errSSLPeerHandshakeFail、-9801: errSSLNegotiation、-9830: errSSLIllegalParam
+    var versionMismatch: Bool { [-9836, -9831, -9801].contains(handshakeError) }
+
+    /// TCP がつながったら呼ぶ
+    func attach(_ t: GuestTCP) {
+        tcp = t
+        SSLSetConnection(ctx, Unmanaged.passUnretained(self).toOpaque())
+        drive()
+    }
+
+    /// TCP から届いたもの
+    func tcpData(_ d: Data) {
+        if inboxPos > 65536 && inboxPos * 2 > inbox.count { inbox.removeFirst(inboxPos); inboxPos = 0 }
+        inbox.append(contentsOf: d)
+        drive()
+    }
+
+    func tcpClosed(_ error: String?) {
+        tcpEnded = true
+        // まだ attach していない（TCP がつながる前に閉じた・取り消した）: SecureTransport には触らない。
+        // SSLSetConnection の前に SSLHandshake を呼ぶと、tlsWrite に null が来て落ちた（実機の記録: TLSStream.writeFrom で 0x28）
+        if tcp != nil { drive() }
+        if !done { finish(error ?? (handshaking ? "TLS の途中で切れました" : nil)) }
+    }
+
+    /// 暗号にして送る（つながる前なら、つながってから送る）
+    func write(_ d: Data) {
+        if done { return }
+        if handshaking { pendingWrite.append(d); return }
+        // 書き込みの関数（tlsWrite）は全部を TCP に渡すので、普通は 1 回で全部書ける。
+        // それでも、書けた分を確かめて残りを書く。エラーなら閉じる（黙って捨てない）
+        var offset = 0
+        while offset < d.count {
+            var processed = 0
+            let st = d.withUnsafeBytes { buf -> OSStatus in
+                SSLWrite(ctx, buf.baseAddress! + offset, d.count - offset, &processed)
+            }
+            offset += processed
+            if st == errSSLWouldBlock && processed > 0 { continue }
+            if st != errSecSuccess {
+                finish("TLS の書き込みに失敗（\(st)）")
+                return
+            }
+            if processed == 0 { finish("TLS の書き込みが進みません"); return }
+        }
+    }
+
+    private func finish(_ error: String?) {
+        if done { return }
+        done = true
+        tcp?.abort()
+        onClosed?(error)
+    }
+
+    /// 進められるところまで進める（握手 → 読む）
+    private func drive() {
+        if done || tcp == nil { return }
+        if handshaking {
+            let st = SSLHandshake(ctx)
+            if st == errSSLWouldBlock { return }
+            if st != errSecSuccess {
+                handshakeError = st
+                finish("TLS の握手に失敗（\(st)）" + (failedOnCertificate ? "：証明書を確かめられません"
+                                                   : versionMismatch ? "：TLS の版が合いません（VNet は TLS 1.2 まで）" : ""))
+                return
+            }
+            handshaking = false
+            var p = SSLProtocol.sslProtocolUnknown
+            SSLGetNegotiatedProtocolVersion(ctx, &p)
+            version = p == .tlsProtocol13 ? "TLS 1.3" : p == .tlsProtocol12 ? "TLS 1.2" : "TLS（\(p.rawValue)）"
+            onReady?()
+            if !pendingWrite.isEmpty { let w = pendingWrite; pendingWrite = Data(); write(w) }
+        }
+        var buf = [UInt8](repeating: 0, count: 65536)
+        while true {
+            var n = 0
+            let st = buf.withUnsafeMutableBytes { SSLRead(ctx, $0.baseAddress!, $0.count, &n) }
+            if n > 0 { onData?(Data(buf[0..<n])) }
+            if st == errSSLWouldBlock { if tcpEnded && inboxPos >= inbox.count { finish(nil) }; return }
+            if st == errSSLClosedGraceful || st == errSSLClosedNoNotify || st == errSSLClosedAbort { finish(nil); return }
+            if st != errSecSuccess { finish("TLS の読み込みに失敗（\(st)）"); return }
+        }
+    }
+
+    // SecureTransport から呼ばれる「読む・書く」
+    fileprivate func readInto(_ p: UnsafeMutableRawPointer, _ want: Int) -> (Int, OSStatus) {
+        let avail = inbox.count - inboxPos
+        if avail <= 0 { return (0, tcpEnded ? errSSLClosedNoNotify : errSSLWouldBlock) }
+        let n = min(want, avail)
+        inbox.withUnsafeBytes { p.copyMemory(from: $0.baseAddress! + inboxPos, byteCount: n) }
+        inboxPos += n
+        return (n, n < want ? errSSLWouldBlock : errSecSuccess)
+    }
+
+    fileprivate func writeFrom(_ p: UnsafeRawPointer, _ n: Int) -> OSStatus {
+        guard let t = tcp else { return errSSLClosedAbort }
+        t.write(Data(bytes: p, count: n))
+        return errSecSuccess
+    }
+}
+
+private func tlsRead(_ conn: SSLConnectionRef, _ data: UnsafeMutableRawPointer, _ length: UnsafeMutablePointer<Int>) -> OSStatus {
+    // 念のため: 接続の印が無ければ（SSLSetConnection の前）何も読まない
+    if Int(bitPattern: conn) == 0 { length.pointee = 0; return errSSLClosedAbort }
+    let s = Unmanaged<TLSStream>.fromOpaque(conn).takeUnretainedValue()
+    let (n, st) = s.readInto(data, length.pointee)
+    length.pointee = n
+    return st
+}
+
+private func tlsWrite(_ conn: SSLConnectionRef, _ data: UnsafeRawPointer, _ length: UnsafeMutablePointer<Int>) -> OSStatus {
+    if Int(bitPattern: conn) == 0 { length.pointee = 0; return errSSLClosedAbort }
+    let s = Unmanaged<TLSStream>.fromOpaque(conn).takeUnretainedValue()
+    return s.writeFrom(data, length.pointee)
+}
+#else
+/// SecureTransport が無い環境用の代わり（作れない）
+final class TLSStream: @unchecked Sendable {
+    static let isSupported = false
+    let handshakeError: Int32 = 0
+    let version = ""
+    var failedOnCertificate: Bool { false }
+    var versionMismatch: Bool { false }
+    var onReady: (() -> Void)?
+    var onData: ((Data) -> Void)?
+    var onClosed: ((String?) -> Void)?
+    init?(host: String, port: UInt16 = 443) { return nil }
+    func attach(_ t: GuestTCP) {}
+    func tcpData(_ d: Data) {}
+    func tcpClosed(_ error: String?) {}
+    func write(_ d: Data) {}
+}
+#endif
+
+// ======================================================================
 // MARK: - GuestStack.swift
 // ======================================================================
 
@@ -502,350 +1011,5 @@ final class GuestTCP: @unchecked Sendable {
             lastProgress = now
             pump()
         }
-    }
-}
-
-// ======================================================================
-// MARK: - DNSMessage.swift
-// ======================================================================
-
-// MARK: - DNS のメッセージ（A レコードだけ）
-//
-// ゲスト側: query で問い合わせを作り、firstA で返事から IPv4 アドレスを取り出す
-// ルーター側: question で問い合わせを読み、reply で返事を作る
-
-enum DNSMessage {
-    /// A レコードの問い合わせ（再帰あり）
-    static func query(name: String, id: UInt16) -> [UInt8] {
-        var q: [UInt8] = []
-        q.appendBE16(id)
-        q += [0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]      // RD=1・質問 1 つ
-        for label in name.split(separator: ".") {
-            let b = Array(label.utf8.prefix(63))
-            q.append(UInt8(b.count))
-            q += b
-        }
-        q += [0, 0, 1, 0, 1]                           // 名前の終わり・A・IN
-        return q
-    }
-
-    /// 返事から最初の A レコード（IPv4 アドレス）を取り出す
-    static func firstA(_ r: [UInt8]) -> [UInt8]? {
-        guard r.count >= 12, r[3] & 0x0F == 0 else { return nil }
-        let qd = Int(r.be16(at: 4)), an = Int(r.be16(at: 6))
-        var i = 12
-        func skipName() {
-            while i < r.count {
-                let l = Int(r[i])
-                if l == 0 { i += 1; return }
-                if l & 0xC0 == 0xC0 { i += 2; return }
-                i += 1 + l
-            }
-        }
-        for _ in 0..<qd { skipName(); i += 4 }
-        for _ in 0..<an {
-            skipName()
-            guard i + 10 <= r.count else { return nil }
-            let type = r.be16(at: i)
-            let rdlen = Int(r.be16(at: i + 8))
-            i += 10
-            if type == 1 && rdlen == 4 && i + 4 <= r.count { return Array(r[i..<(i + 4)]) }
-            i += rdlen
-        }
-        return nil
-    }
-
-    struct Question {
-        let name: String
-        let type: UInt16
-        /// 質問の終わり（返事はここまでを写して作る）
-        let end: Int
-    }
-
-    /// 問い合わせの最初の質問を読む（形が変なら nil）
-    static func question(_ q: [UInt8]) -> Question? {
-        var i = 12
-        var labels: [String] = []
-        while i < q.count {
-            let l = Int(q[i])
-            if l == 0 { i += 1; break }
-            guard l < 64, i + 1 + l <= q.count else { return nil }
-            labels.append(String(decoding: q[(i + 1)..<(i + 1 + l)], as: UTF8.self))
-            i += 1 + l
-        }
-        guard i + 4 <= q.count else { return nil }
-        return Question(name: labels.joined(separator: "."), type: q.be16(at: i), end: i + 4)
-    }
-
-    /// 返事を作る（問い合わせの先頭 questionEnd バイトを写し、A レコードを並べる）
-    static func reply(to q: [UInt8], questionEnd: Int, rcode: UInt8, answers: [[UInt8]]) -> [UInt8] {
-        var r = Array(q[0..<min(questionEnd, q.count)])
-        r[2] = 0x81                                    // QR=1・RD=1
-        r[3] = 0x80 | rcode                            // RA=1
-        r.setBE16(UInt16(answers.count), at: 6)
-        for k in 8..<12 { r[k] = 0 }
-        for a in answers {
-            r += [0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4] + a   // 名前は質問を指す・A・IN・60 秒・4 バイト
-        }
-        return r
-    }
-}
-
-// ======================================================================
-// MARK: - Packet.swift
-// ======================================================================
-
-// MARK: - パケットを組み立てる・読むための共通の部品
-//
-// ゲスト側（GuestStack・GuestTCP）とルーター側（UserNet）の両方が使う。
-// 数はすべてネットワークの順（ビッグエンディアン）。IP アドレスは 4 バイト、MAC アドレスは 6 バイトの [UInt8]
-
-/// この小さなネットワークの決まった値（QEMU の SLIRP と同じ）
-enum Net {
-    static let guestIP: [UInt8] = [10, 0, 2, 15]
-    static let gateway: [UInt8] = [10, 0, 2, 2]
-    static let dns: [UInt8] = [10, 0, 2, 3]
-    static let zeroIP: [UInt8] = [0, 0, 0, 0]
-    static let broadcastIP: [UInt8] = [255, 255, 255, 255]
-    /// ゲスト（仮想 LAN カード）の MAC アドレス（QEMU と同じ）
-    static let guestMAC: [UInt8] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]
-    /// ルーターの MAC アドレス
-    static let routerMAC: [UInt8] = [0x52, 0x55, 0x0A, 0x00, 0x02, 0x02]
-    static let zeroMAC: [UInt8] = [0, 0, 0, 0, 0, 0]
-    static let broadcastMAC: [UInt8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
-    /// 10.0.2.x（ルーターが自分で答える範囲）
-    static func isLocal(_ ip: [UInt8]) -> Bool { ip.count == 4 && ip[0] == 10 && ip[1] == 0 && ip[2] == 2 }
-}
-
-enum EtherType {
-    static let ipv4: UInt16 = 0x0800
-    static let arp: UInt16 = 0x0806
-}
-
-enum IPProto {
-    static let icmp: UInt8 = 1
-    static let tcp: UInt8 = 6
-    static let udp: UInt8 = 17
-}
-
-// MARK: バイト列の読み書き
-
-extension Array where Element == UInt8 {
-    func be16(at i: Int) -> UInt16 { UInt16(self[i]) << 8 | UInt16(self[i + 1]) }
-    func be32(at i: Int) -> UInt32 { UInt32(be16(at: i)) << 16 | UInt32(be16(at: i + 2)) }
-    mutating func appendBE16(_ v: UInt16) { append(UInt8(v >> 8)); append(UInt8(v & 0xFF)) }
-    mutating func appendBE32(_ v: UInt32) { appendBE16(UInt16(v >> 16)); appendBE16(UInt16(v & 0xFFFF)) }
-    mutating func setBE16(_ v: UInt16, at i: Int) { self[i] = UInt8(v >> 8); self[i + 1] = UInt8(v & 0xFF) }
-    mutating func setBE32(_ v: UInt32, at i: Int) { setBE16(UInt16(v >> 16), at: i); setBE16(UInt16(v & 0xFFFF), at: i + 2) }
-
-    /// 10.0.2.15 の形
-    var ipString: String { map { String($0) }.joined(separator: ".") }
-    /// 52:54:00:12:34:56 の形
-    var macString: String { map { String(format: "%02x", $0) }.joined(separator: ":") }
-}
-
-// MARK: 確認用の値（チェックサム）
-
-enum Checksum {
-    /// IP などで使う 16 ビットの 1 の補数の和
-    static func internet(_ b: [UInt8], initial: UInt32 = 0) -> UInt16 {
-        var s = initial
-        var i = 0
-        while i + 1 < b.count { s &+= UInt32(b[i]) << 8 | UInt32(b[i + 1]); i += 2 }
-        if i < b.count { s &+= UInt32(b[i]) << 8 }
-        while s >> 16 != 0 { s = (s & 0xFFFF) &+ (s >> 16) }
-        return ~UInt16(s)
-    }
-
-    /// TCP / UDP 用（疑似ヘッダ込み）
-    static func l4(proto: UInt8, src: [UInt8], dst: [UInt8], _ seg: [UInt8]) -> UInt16 {
-        var s = UInt32(src.be16(at: 0)) &+ UInt32(src.be16(at: 2))
-        s &+= UInt32(dst.be16(at: 0)) &+ UInt32(dst.be16(at: 2))
-        s &+= UInt32(proto) &+ UInt32(seg.count)
-        return internet(seg, initial: s)
-    }
-}
-
-// MARK: イーサネット・ARP
-
-enum Ethernet {
-    static let headerSize = 14
-    static func frame(dst: [UInt8], src: [UInt8], type: UInt16, _ payload: [UInt8]) -> [UInt8] {
-        var f = dst + src
-        f.appendBE16(type)
-        return f + payload
-    }
-}
-
-enum ARP {
-    static let request: UInt16 = 1
-    static let reply: UInt16 = 2
-    /// ARP の中身（イーサネット・IPv4 用）
-    static func packet(op: UInt16, senderMAC: [UInt8], senderIP: [UInt8], targetMAC: [UInt8], targetIP: [UInt8]) -> [UInt8] {
-        var a: [UInt8] = [0, 1, 8, 0, 6, 4]
-        a.appendBE16(op)
-        return a + senderMAC + senderIP + targetMAC + targetIP
-    }
-}
-
-// MARK: IPv4
-
-struct IPv4Packet {
-    let proto: UInt8
-    let src: [UInt8]
-    let dst: [UInt8]
-    let body: [UInt8]
-    /// 分割されたもの（フラグメント）か
-    let isFragment: Bool
-
-    /// 読む（形が変なら nil）
-    init?(_ p: [UInt8]) {
-        guard p.count >= 20, p[0] >> 4 == 4 else { return nil }
-        let ihl = Int(p[0] & 15) * 4
-        let total = min(Int(p.be16(at: 2)), p.count)
-        guard ihl >= 20, total >= ihl else { return nil }
-        proto = p[9]
-        src = Array(p[12..<16])
-        dst = Array(p[16..<20])
-        body = Array(p[ihl..<total])
-        isFragment = p.be16(at: 6) & 0x3FFF != 0
-    }
-
-    /// 組み立てる（オプション無し・TTL 64）
-    static func build(proto: UInt8, id: UInt16, src: [UInt8], dst: [UInt8], dontFragment: Bool = true, _ body: [UInt8]) -> [UInt8] {
-        var h: [UInt8] = [0x45, 0]
-        h.appendBE16(UInt16(20 + body.count))
-        h.appendBE16(id)
-        h += [dontFragment ? 0x40 : 0, 0, 64, proto, 0, 0]
-        h += src + dst
-        h.setBE16(Checksum.internet(h), at: 10)
-        return h + body
-    }
-}
-
-// MARK: UDP
-
-struct UDPDatagram {
-    let sport: UInt16
-    let dport: UInt16
-    let payload: [UInt8]
-
-    init?(_ b: [UInt8]) {
-        guard b.count >= 8 else { return nil }
-        let len = min(Int(b.be16(at: 4)), b.count)
-        guard len >= 8 else { return nil }
-        sport = b.be16(at: 0)
-        dport = b.be16(at: 2)
-        payload = Array(b[8..<len])
-    }
-
-    /// 組み立てる（チェックサム込み。0 になったら 0xFFFF にする決まり）
-    static func build(src: [UInt8], dst: [UInt8], sport: UInt16, dport: UInt16, _ payload: [UInt8]) -> [UInt8] {
-        var u: [UInt8] = []
-        u.appendBE16(sport)
-        u.appendBE16(dport)
-        u.appendBE16(UInt16(8 + payload.count))
-        u += [0, 0]
-        u += payload
-        let c = Checksum.l4(proto: IPProto.udp, src: src, dst: dst, u)
-        u.setBE16(c == 0 ? 0xFFFF : c, at: 6)
-        return u
-    }
-}
-
-// MARK: TCP
-
-struct TCPFlags: OptionSet {
-    let rawValue: UInt8
-    static let fin = TCPFlags(rawValue: 1)
-    static let syn = TCPFlags(rawValue: 2)
-    static let rst = TCPFlags(rawValue: 4)
-    static let psh = TCPFlags(rawValue: 8)
-    static let ack = TCPFlags(rawValue: 16)
-}
-
-struct TCPHeader {
-    let sport: UInt16
-    let dport: UInt16
-    let seq: UInt32
-    let ack: UInt32
-    /// ヘッダの長さ（オプション込み）。中身はここから
-    let headerLength: Int
-    let flags: TCPFlags
-    let window: UInt16
-
-    init?(_ b: [UInt8]) {
-        guard b.count >= 20 else { return nil }
-        let off = Int(b[12] >> 4) * 4
-        guard off >= 20, off <= b.count else { return nil }
-        sport = b.be16(at: 0)
-        dport = b.be16(at: 2)
-        seq = b.be32(at: 4)
-        ack = b.be32(at: 8)
-        headerLength = off
-        flags = TCPFlags(rawValue: b[13])
-        window = b.be16(at: 14)
-    }
-
-    /// オプションの MSS（無ければ nil）
-    static func mss(_ b: [UInt8], headerLength off: Int) -> Int? {
-        var i = 20
-        while i < off {
-            let kind = b[i]
-            if kind == 0 { break }
-            if kind == 1 { i += 1; continue }
-            guard i + 1 < off else { break }
-            let l = Int(b[i + 1])
-            if kind == 2, l == 4, i + 3 < off { return Int(b.be16(at: i + 2)) }
-            i += max(2, l)
-        }
-        return nil
-    }
-}
-
-enum TCPSegment {
-    /// TCP のセグメントを組み立てる（チェックサム込み）。mss = true なら MSS 1460 のオプションを付ける
-    static func build(src: [UInt8], dst: [UInt8], sport: UInt16, dport: UInt16, seq: UInt32, ack: UInt32,
-                      flags: TCPFlags, window: UInt16 = 0xFFFF, mss: Bool = false,
-                      payload: ArraySlice<UInt8> = []) -> [UInt8] {
-        let hlen = mss ? 24 : 20
-        var t: [UInt8] = []
-        t.appendBE16(sport)
-        t.appendBE16(dport)
-        t.appendBE32(seq)
-        t.appendBE32(ack)
-        t += [UInt8(hlen / 4) << 4, flags.rawValue]
-        t.appendBE16(window)
-        t += [0, 0, 0, 0]                              // チェックサム・緊急ポインタ
-        if mss { t += [2, 4, 0x05, 0xB4] }
-        t += payload
-        t.setBE16(Checksum.l4(proto: IPProto.tcp, src: src, dst: dst, t), at: 16)
-        return t
-    }
-}
-
-// MARK: DHCP
-
-enum DHCP {
-    static let magicCookie: [UInt8] = [99, 130, 83, 99]
-    static let discover: UInt8 = 1
-    static let offer: UInt8 = 2
-    static let request: UInt8 = 3
-    static let ack: UInt8 = 5
-
-    /// オプション（番号 → 中身）。240 バイト目から読む
-    static func options(_ p: [UInt8]) -> [UInt8: [UInt8]] {
-        var out: [UInt8: [UInt8]] = [:]
-        var i = 240
-        while i + 1 < p.count {
-            let code = p[i]
-            if code == 255 { break }
-            if code == 0 { i += 1; continue }
-            let l = Int(p[i + 1])
-            guard i + 2 + l <= p.count else { break }
-            out[code] = Array(p[(i + 2)..<(i + 2 + l)])
-            i += 2 + l
-        }
-        return out
     }
 }

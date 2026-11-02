@@ -322,6 +322,32 @@ public struct List<Content: View>: View {
     public init(@ViewBuilder content: () -> Content) {}
     public var body: Never { fatalError() }
 }
+public struct Section<Parent, Content, Footer> { }
+extension Section: View where Parent: View, Content: View, Footer: View { public var body: Never { fatalError() } }
+public extension Section where Parent: View, Content: View, Footer == EmptyView {
+    init(@ViewBuilder content: () -> Content, @ViewBuilder header: () -> Parent) {}
+    init(header: Parent, @ViewBuilder content: () -> Content) {}
+}
+public extension Section where Parent == Text, Content: View, Footer == EmptyView {
+    @_disfavoredOverload init<S: StringProtocol>(_ title: S, @ViewBuilder content: () -> Content) {}
+}
+public extension ForEach {
+    func onDelete(perform action: ((IndexSet) -> Void)?) -> ModifiedContent<Self, _Mod> { .init() }
+}
+public protocol PickerStyle {}
+public struct SegmentedPickerStyle: PickerStyle { public init() {} }
+public extension PickerStyle where Self == SegmentedPickerStyle { static var segmented: SegmentedPickerStyle { .init() } }
+public extension View {
+    func pickerStyle<S: PickerStyle>(_ style: S) -> ModifiedContent<Self, _Mod> { .init() }
+    func tag<V: Hashable>(_ tag: V) -> ModifiedContent<Self, _Mod> { .init() }
+    func listStyle<S: ListStyle>(_ style: S) -> ModifiedContent<Self, _Mod> { .init() }
+}
+public protocol ListStyle {}
+public struct PlainListStyle: ListStyle { public init() {} }
+public struct InsetGroupedListStyle: ListStyle { public init() {} }
+public extension ListStyle where Self == PlainListStyle { static var plain: PlainListStyle { .init() } }
+public extension ListStyle where Self == InsetGroupedListStyle { static var insetGrouped: InsetGroupedListStyle { .init() } }
+
 public struct NavigationView<Content: View>: View {
     public init(@ViewBuilder content: () -> Content) {}
     public var body: Never { fatalError() }

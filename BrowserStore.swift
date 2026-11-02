@@ -45,6 +45,12 @@ struct SavedTab: Codable {
     var state: Data?
 }
 
+/// ブックマーク・履歴の画面のどちらを見せるか
+enum LibraryPage: String, CaseIterable, Hashable {
+    case bookmarks = "ブックマーク"
+    case history = "履歴"
+}
+
 struct SessionData: Codable {
     var tabs: [SavedTab]
     var selected: Int?
@@ -71,6 +77,15 @@ final class BrowserStore: ObservableObject {
     @Published private(set) var isOnline = true
     /// ダウンロード
     let downloads = DownloadManager()
+    /// ブックマークと履歴
+    let library = Library()
+    /// アドレス欄の入力（打つたびに変わるので分けてある）
+    let address = AddressEditor()
+    /// ブックマーク・履歴の画面
+    @Published var showLibrary = false
+    @Published var libraryPage = LibraryPage.bookmarks
+    /// 共有する URL（共有の画面を出している間）
+    @Published var shareURL: URL?
     private let pathMonitor = NWPathMonitor()
 
     let machine = VNetMachine(factory: NWUserNetFactory())
@@ -144,6 +159,7 @@ final class BrowserStore: ObservableObject {
         if VelaSettings.localNetworkProtection { compileLocalNetworkRules() } else { logs.add("⚠️ LAN の保護は切ってあります") }
         if defaultMode == .vnetsLegacy { compileVNetOnlyRules() }
 
+        library.load(logs: logs)
         downloads.log = { s in lb.add(s, level: .info, category: .download) }
         downloads.webViewForResume = { [weak self] in self?.selectedTab?.webView }
         downloads.loadExisting()
@@ -253,6 +269,43 @@ final class BrowserStore: ObservableObject {
         }
     }
 
+    /// ⌘1〜⌘9: その番号のタブへ（9 は最後のタブ）
+    func selectTab(number n: Int) {
+        guard !tabs.isEmpty else { return }
+        select(n >= 9 ? tabs[tabs.count - 1] : tabs[min(n, tabs.count) - 1])
+    }
+
+    // MARK: ブックマーク・履歴
+
+    /// 見ているページのブックマークを付ける・外す（⌘D）
+    func toggleBookmark() {
+        guard let tab = selectedTab, let u = tab.url else { return }
+        library.toggleBookmark(url: u, title: tab.title)
+    }
+
+    func openLibrary(_ page: LibraryPage) {
+        libraryPage = page
+        showLibrary = true
+    }
+
+    /// ブックマーク・履歴・候補から開く（newTab: 新しいタブで）
+    func open(url: URL, newTab inNew: Bool = false) {
+        if inNew { newTab(url: url); return }
+        let target = selectedTab ?? newTab(url: nil)
+        logs.add("―― \(url.absoluteString) を開きます ――", level: .info, category: .nav, tab: target.id)
+        target.load(url, userInitiated: true)
+    }
+
+    /// タブがページを読み終えた: 履歴に入れる
+    func recordVisit(url: URL, title: String) {
+        library.recordVisit(url: url, title: title)
+    }
+
+    /// ⌘L: アドレス欄へ
+    func focusAddressBar() {
+        address.focus()
+    }
+
     /// 動いている WebView が多すぎたら、長く見ていないタブ（見ているタブ以外）から WebView を捨てる
     private func trimLiveWebViews() {
         let live = tabs.filter { $0.webView != nil && $0.id != selectedID }.sorted { $0.lastSelected < $1.lastSelected }
@@ -283,6 +336,7 @@ final class BrowserStore: ObservableObject {
     func saveSessionNow() {
         session.saveNow(SessionData(tabs: tabs.map { $0.saved() }, selected: selectedID))
         hsts.saveNow()
+        library.saveNow()
     }
 
     private func restoreSession() {

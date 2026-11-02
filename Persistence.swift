@@ -122,6 +122,19 @@ enum VelaSettings {
         get { bool("dev.webInspector", false) } set { d.set(newValue, forKey: "dev.webInspector") }
     }
 
+    /// サイト（ホスト）ごとの文字の大きさ（100% のものは持たない）
+    static func zoom(for host: String?) -> Double {
+        guard let h = host?.lowercased(), let z = (d.dictionary(forKey: "zoom.sites") as? [String: Double])?[h] else { return 1.0 }
+        return z
+    }
+    static func setZoom(_ z: Double, for host: String?) {
+        guard let h = host?.lowercased(), !h.isEmpty else { return }
+        var m = (d.dictionary(forKey: "zoom.sites") as? [String: Double]) ?? [:]
+        m[h] = abs(z - 1.0) < 0.001 ? nil : z
+        if m.count > 500 { m = [h: z] }      // 増えすぎたら覚え直す（めったに起きない）
+        d.set(m, forKey: "zoom.sites")
+    }
+
     // MARK: プライバシー・守り
 
     /// サードパーティ Cookie をブロックする
