@@ -725,8 +725,6 @@ final class NetLog: @unchecked Sendable {
     private var records: [NetRecord] = []
     private var positions: [Int: Int] = [:]     // id → records の中の位置
     private var nextID = 1
-    /// 変わるたびに増える（画面が描き直すかを決める）
-    private(set) var version = 0
 
     init() {}
 
@@ -743,7 +741,6 @@ final class NetLog: @unchecked Sendable {
             positions = [:]
             for (i, r) in records.enumerated() { positions[r.id] = i }
         }
-        version += 1
         return id
     }
 
@@ -751,7 +748,6 @@ final class NetLog: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard id > 0, let i = positions[id], i < records.count, records[i].id == id else { return }
         change(&records[i])
-        version += 1
     }
 
     func note(_ id: Int, _ s: String) {
@@ -783,7 +779,7 @@ final class NetLog: @unchecked Sendable {
     var count: Int { lock.lock(); defer { lock.unlock() }; return records.count }
 
     func clear() {
-        lock.lock(); records = []; positions = [:]; version += 1; lock.unlock()
+        lock.lock(); records = []; positions = [:]; lock.unlock()
     }
 
     func export() -> String {

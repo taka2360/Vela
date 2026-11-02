@@ -130,9 +130,6 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         netLog?.finish(p.logID, outcome: .cancelled)
     }
 
-    /// 読み込み中の要求の数（開発者向け）
-    var pendingCount: Int { pending.count }
-
     private func start(_ task: WKURLSchemeTask) {
         guard let shown = task.request.url, let real = VNetURL.toReal(shown), let machine else {
             task.didFailWithError(URLError(.badURL)); return

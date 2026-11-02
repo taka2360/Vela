@@ -46,7 +46,6 @@ struct CosmeticRule: Equatable {
 struct ParsedFilterList {
     var network: [NetworkRule] = []
     var cosmetic: [CosmeticRule] = []
-    var lines = 0
     var unsupported = 0
     /// リストの見出しの「! Title:」
     var title: String?
@@ -58,7 +57,6 @@ enum ABPParser {
         text.enumerateLines { raw, _ in
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.isEmpty { return }
-            out.lines += 1
             if line.hasPrefix("!") {
                 if out.title == nil, line.hasPrefix("! Title:") { out.title = String(line.dropFirst(8)).trimmingCharacters(in: .whitespaces) }
                 return

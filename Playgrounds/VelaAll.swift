@@ -2850,8 +2850,6 @@ final class BrowserStore: ObservableObject {
         hsts.removeAll()
         logs.add("HSTS の記録を消しました", level: .info, category: .security)
     }
-
-    func clearClosedTabs() { closedTabs = [] }
 }
 
 // ======================================================================
@@ -4303,8 +4301,6 @@ final class NetLog: @unchecked Sendable {
     private var records: [NetRecord] = []
     private var positions: [Int: Int] = [:]     // id → records の中の位置
     private var nextID = 1
-    /// 変わるたびに増える（画面が描き直すかを決める）
-    private(set) var version = 0
 
     init() {}
 
@@ -4321,7 +4317,6 @@ final class NetLog: @unchecked Sendable {
             positions = [:]
             for (i, r) in records.enumerated() { positions[r.id] = i }
         }
-        version += 1
         return id
     }
 
@@ -4329,7 +4324,6 @@ final class NetLog: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard id > 0, let i = positions[id], i < records.count, records[i].id == id else { return }
         change(&records[i])
-        version += 1
     }
 
     func note(_ id: Int, _ s: String) {
@@ -4361,7 +4355,7 @@ final class NetLog: @unchecked Sendable {
     var count: Int { lock.lock(); defer { lock.unlock() }; return records.count }
 
     func clear() {
-        lock.lock(); records = []; positions = [:]; version += 1; lock.unlock()
+        lock.lock(); records = []; positions = [:]; lock.unlock()
     }
 
     func export() -> String {
@@ -4779,7 +4773,6 @@ struct CosmeticRule: Equatable {
 struct ParsedFilterList {
     var network: [NetworkRule] = []
     var cosmetic: [CosmeticRule] = []
-    var lines = 0
     var unsupported = 0
     /// リストの見出しの「! Title:」
     var title: String?
@@ -4791,7 +4784,6 @@ enum ABPParser {
         text.enumerateLines { raw, _ in
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.isEmpty { return }
-            out.lines += 1
             if line.hasPrefix("!") {
                 if out.title == nil, line.hasPrefix("! Title:") { out.title = String(line.dropFirst(8)).trimmingCharacters(in: .whitespaces) }
                 return
@@ -4997,11 +4989,6 @@ final class BlockEngine: @unchecked Sendable {
         }
     }
 
-    /// 調べたときの数（開発者向け）: (言葉の種類, 言葉を選べなかったルール)
-    var indexStats: (tokens: Int, generic: Int) {
-        (blockIndex.count + exceptionIndex.count + importantIndex.count, blockGeneric.count + exceptionGeneric.count + importantGeneric.count)
-    }
-
     static let empty = BlockEngine()
 
     private func add(_ r: NetworkRule, token: String?) {
@@ -5027,11 +5014,6 @@ final class BlockEngine: @unchecked Sendable {
 
     /// 言葉として使わないもの（ほとんどの URL に入っている）
     private static let commonTokens: Set<String> = ["http", "https", "www", "com", "net", "org", "html", "js", "jpg", "png", "gif"]
-
-    /// 必ず URL に丸ごと入っている英数字の並びのうち、一番長いもの
-    static func bestToken(_ r: NetworkRule) -> String? {
-        candidateTokens(r).max { $0.count < $1.count }
-    }
 
     /// 必ず URL に丸ごと入っている英数字の並び（索引に使えるもの）
     static func candidateTokens(_ r: NetworkRule) -> [String] {
@@ -5973,9 +5955,6 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         p.token.cancel()
         netLog?.finish(p.logID, outcome: .cancelled)
     }
-
-    /// 読み込み中の要求の数（開発者向け）
-    var pendingCount: Int { pending.count }
 
     private func start(_ task: WKURLSchemeTask) {
         guard let shown = task.request.url, let real = VNetURL.toReal(shown), let machine else {

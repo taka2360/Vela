@@ -45,11 +45,6 @@ final class BlockEngine: @unchecked Sendable {
         }
     }
 
-    /// 調べたときの数（開発者向け）: (言葉の種類, 言葉を選べなかったルール)
-    var indexStats: (tokens: Int, generic: Int) {
-        (blockIndex.count + exceptionIndex.count + importantIndex.count, blockGeneric.count + exceptionGeneric.count + importantGeneric.count)
-    }
-
     static let empty = BlockEngine()
 
     private func add(_ r: NetworkRule, token: String?) {
@@ -75,11 +70,6 @@ final class BlockEngine: @unchecked Sendable {
 
     /// 言葉として使わないもの（ほとんどの URL に入っている）
     private static let commonTokens: Set<String> = ["http", "https", "www", "com", "net", "org", "html", "js", "jpg", "png", "gif"]
-
-    /// 必ず URL に丸ごと入っている英数字の並びのうち、一番長いもの
-    static func bestToken(_ r: NetworkRule) -> String? {
-        candidateTokens(r).max { $0.count < $1.count }
-    }
 
     /// 必ず URL に丸ごと入っている英数字の並び（索引に使えるもの）
     static func candidateTokens(_ r: NetworkRule) -> [String] {

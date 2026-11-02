@@ -466,8 +466,6 @@ final class BrowserStore: ObservableObject {
         hsts.removeAll()
         logs.add("HSTS の記録を消しました", level: .info, category: .security)
     }
-
-    func clearClosedTabs() { closedTabs = [] }
 }
 
 // ======================================================================
