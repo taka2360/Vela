@@ -79,6 +79,9 @@ final class BrowserStore: ObservableObject {
     let downloads = DownloadManager()
     /// ブックマークと履歴
     let library = Library()
+    /// 広告ブロック
+    let adblock = AdBlocker()
+    @Published var showAdBlock = false
     /// アドレス欄の入力（打つたびに変わるので分けてある）
     let address = AddressEditor()
     /// ブックマーク・履歴の画面
@@ -160,6 +163,11 @@ final class BrowserStore: ObservableObject {
         if defaultMode == .vnetsLegacy { compileVNetOnlyRules() }
 
         library.load(logs: logs)
+        adblock.onRuleListsChanged = { [weak self] in
+            guard let self else { return }
+            for t in self.tabs { t.applyAdBlock(for: t.url) }
+        }
+        adblock.start(logs: logs)
         downloads.log = { s in lb.add(s, level: .info, category: .download) }
         downloads.webViewForResume = { [weak self] in self?.selectedTab?.webView }
         downloads.loadExisting()

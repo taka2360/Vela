@@ -25,6 +25,8 @@ struct PageMenu: View {
                 Button { store.shareURL = tab.url } label: { Label("共有…", systemImage: "square.and.arrow.up") }
             }
             Divider()
+            AdBlockMenuItems(store: store, tab: tab, adblock: store.adblock)
+            Divider()
             if tab.mode.usesVNet {
                 Button { tab.switchMode(to: .native) } label: { Label("標準の通信で開き直す", systemImage: "network") }
             } else if store.defaultMode.usesVNet {
@@ -35,6 +37,28 @@ struct PageMenu: View {
                 .font(.system(size: 15, weight: .medium))
                 .padding(.horizontal, 6)
         }
+    }
+}
+
+/// 「ぁあ」メニューの広告ブロックの所
+struct AdBlockMenuItems: View {
+    let store: BrowserStore
+    @ObservedObject var tab: BrowserTab
+    @ObservedObject var adblock: AdBlocker
+
+    var body: some View {
+        if let host = tab.url?.host, adblock.enabled {
+            Button {
+                adblock.toggleSite(host)
+                tab.reload()      // 今のページにも効かせる
+            } label: {
+                adblock.isActive(for: host)
+                    ? Label(tab.mode.usesVNet ? "広告ブロック: \(tab.blockedCount) 件（このサイトでは止める）" : "このサイトでは広告ブロックを止める",
+                            systemImage: "shield.slash")
+                    : Label("このサイトで広告ブロックを使う", systemImage: "shield.lefthalf.filled")
+            }
+        }
+        Button { store.showAdBlock = true } label: { Label("広告ブロックの設定…", systemImage: "gearshape") }
     }
 }
 

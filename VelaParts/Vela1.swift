@@ -64,6 +64,7 @@ struct BrowserView: View {
         }
         .background(ShortcutKeys(store: store))
         .sheet(isPresented: $store.showDevPanel) { DevPanel(store: store) }
+        .sheet(isPresented: $store.showAdBlock) { AdBlockView(adblock: store.adblock) }
         .sheet(isPresented: $store.showLibrary) { LibraryView(store: store, library: store.library) }
         .sheet(isPresented: shareShown) { if let u = store.shareURL { ShareSheet(items: [u]) } }
         .fullScreenCover(isPresented: $store.showTabOverview) { TabOverview(store: store) }
@@ -239,6 +240,11 @@ struct AddressField: View {
             Text(displayText)
                 .lineLimit(1)
                 .foregroundColor(tab.url == nil ? .secondary : .primary)
+            if tab.blockedCount > 0 {
+                Label("\(tab.blockedCount)", systemImage: "shield.lefthalf.filled")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
             ModeBadge(tab: tab, ready: store.vnetReady)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -307,6 +313,7 @@ struct MoreMenu: View {
             }
             Button { store.close(tab) } label: { Label("このタブを閉じる", systemImage: "xmark.square") }
             Divider()
+            Button { store.showAdBlock = true } label: { Label("広告ブロック", systemImage: "shield.lefthalf.filled") }
             Button { store.showDevPanel = true } label: { Label("開発者パネル", systemImage: "wrench.and.screwdriver") }
         } label: {
             Image(systemName: "ellipsis.circle")
@@ -437,6 +444,8 @@ struct PageMenu: View {
                 Button { store.shareURL = tab.url } label: { Label("共有…", systemImage: "square.and.arrow.up") }
             }
             Divider()
+            AdBlockMenuItems(store: store, tab: tab, adblock: store.adblock)
+            Divider()
             if tab.mode.usesVNet {
                 Button { tab.switchMode(to: .native) } label: { Label("標準の通信で開き直す", systemImage: "network") }
             } else if store.defaultMode.usesVNet {
@@ -447,6 +456,28 @@ struct PageMenu: View {
                 .font(.system(size: 15, weight: .medium))
                 .padding(.horizontal, 6)
         }
+    }
+}
+
+/// 「ぁあ」メニューの広告ブロックの所
+struct AdBlockMenuItems: View {
+    let store: BrowserStore
+    @ObservedObject var tab: BrowserTab
+    @ObservedObject var adblock: AdBlocker
+
+    var body: some View {
+        if let host = tab.url?.host, adblock.enabled {
+            Button {
+                adblock.toggleSite(host)
+                tab.reload()      // 今のページにも効かせる
+            } label: {
+                adblock.isActive(for: host)
+                    ? Label(tab.mode.usesVNet ? "広告ブロック: \(tab.blockedCount) 件（このサイトでは止める）" : "このサイトでは広告ブロックを止める",
+                            systemImage: "shield.slash")
+                    : Label("このサイトで広告ブロックを使う", systemImage: "shield.lefthalf.filled")
+            }
+        }
+        Button { store.showAdBlock = true } label: { Label("広告ブロックの設定…", systemImage: "gearshape") }
     }
 }
 
@@ -999,4 +1030,96 @@ struct SiteTile: View {
 
     private var host: String { AddressInput.shortDisplay(URL(string: url)) }
     private var initial: String { String(host.first ?? "?").uppercased() }
+}
+
+// ======================================================================
+// MARK: - DevPanel.swift
+// ======================================================================
+
+// MARK: - 開発者パネル（簡易版。完成版はフェーズ G）
+//
+// 通信の様子・タブごとの状態・ログ。普段の画面とは分けて、「…」メニューから開く
+
+struct DevPanel: View {
+    @ObservedObject var store: BrowserStore
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("開発者パネル").font(.headline)
+                Spacer()
+                Button("ログをコピー") { UIPasteboard.general.string = store.logs.export() }
+                Button(store.hadCrash ? "前回の記録をコピー（落ちた）" : "前回の記録をコピー") {
+                    UIPasteboard.general.string = CrashLog.previous() ?? "（前回の記録はありません）"
+                }
+                .padding(.leading, 12)
+                Button("閉じる") { dismiss() }.padding(.leading, 12)
+            }
+            DevStatus(store: store)
+            DevTabList(store: store)
+            DevLogView(text: store.logText)
+        }
+        .padding()
+    }
+}
+
+struct DevStatus: View {
+    @ObservedObject var store: BrowserStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(store.takeover.description)
+            Text("新しいタブの通信: \(store.defaultMode.rawValue)")
+            Text("VNet: \(store.vnetStatus)")
+            Text("タブ \(store.tabs.count) 枚・動いている WebView \(store.liveWebViewCount) / \(BrowserStore.maxLiveWebViews)")
+            Text("Cookie（写し）\(store.cookieJar.count) 個・HSTS \(store.hsts.all().count) 件")
+            Text("広告ブロック: \(store.adblock.enabled ? "使う" : "止めている")・VNet 用のルール \(store.adblock.ruleCount) 個・止めた数 \(store.adblock.totalBlocked)")
+            Text("ネットワーク: \(store.isOnline ? "つながっている" : "つながっていない")・ダウンロード中 \(store.downloads.runningCount) 件")
+        }
+        .font(.system(size: 12, design: .monospaced))
+    }
+}
+
+struct DevTabList: View {
+    @ObservedObject var store: BrowserStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(store.tabs) { tab in
+                DevTabRow(tab: tab, selected: tab.id == store.selectedID)
+            }
+        }
+        .font(.system(size: 11, design: .monospaced))
+    }
+}
+
+struct DevTabRow: View {
+    @ObservedObject var tab: BrowserTab
+    let selected: Bool
+
+    var body: some View {
+        Text("\(selected ? "▶" : " ") #\(tab.id) [\(tab.mode.short)・\(tab.state.rawValue)\(tab.isLoading ? "・読み込み中 \(Int(tab.progress * 100))%" : "")] \(tab.url?.absoluteString ?? "（空）")")
+            .lineLimit(1)
+    }
+}
+
+struct DevLogView: View {
+    let text: String
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                Text(text)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.green)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                Color.clear.frame(height: 1).id("end")
+            }
+            .background(Color.black)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .onChange(of: text) { _ in proxy.scrollTo("end", anchor: .bottom) }
+        }
+    }
 }

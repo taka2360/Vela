@@ -50,6 +50,8 @@ final class BrowserTab: ObservableObject, Identifiable {
     @Published private(set) var snapshot: UIImage?
     /// このページが使った、VNet を通らない通信（"WebSocket" など）
     @Published private(set) var nonVNetUsage: Set<String> = []
+    /// このページで広告ブロックが止めた数（VNet のタブだけ数えられる）
+    @Published private(set) var blockedCount = 0
     /// 文字の大きさ（ページの拡大率。サイトごとに覚える）
     @Published private(set) var zoom = 1.0
     /// 最後に見た時刻（WebView を捨てる順番を決める）
@@ -72,6 +74,8 @@ final class BrowserTab: ObservableObject, Identifiable {
     private var httpsFirstFrom: URL?
     /// HTTPS-First で「http のまま開く」を選んだホスト
     private var httpAllowedHosts = Set<String>()
+    /// いま入れている広告ブロックの WebKit のルール
+    private var adRuleLists: [WKContentRuleList] = []
     /// エラーページを出した URL（履歴に入れない）
     private var errorPageURL: URL?
     /// 最後に履歴に入れた URL（後からタイトルが変わったら直す）
@@ -149,6 +153,8 @@ final class BrowserTab: ObservableObject, Identifiable {
         refresh = rc
         observe(wv)
         webView = wv
+        adRuleLists = []
+        applyAdBlock(for: pendingURL ?? url)
         log("WebView を作りました（\(mode.rawValue)）")
         return wv
     }
@@ -166,6 +172,11 @@ final class BrowserTab: ObservableObject, Identifiable {
             s.onTopLevelFailure = { [weak self] u, e in
                 let tab = self
                 Task { @MainActor in tab?.vnetFailed(u, e) }
+            }
+            s.blocker = store.adblock.box
+            s.onBlocked = { [weak self] _, _ in
+                let tab = self
+                Task { @MainActor in tab?.noteBlocked() }
             }
             s.onDownloadStarted = { [weak self] dl in
                 let tab = self
@@ -421,6 +432,25 @@ final class BrowserTab: ObservableObject, Identifiable {
 
     func didStartNavigation() {
         errorPageURL = nil
+        blockedCount = 0
+    }
+
+    // MARK: 広告ブロック
+
+    private func noteBlocked() {
+        blockedCount += 1
+        store?.adblock.noteBlocked()
+    }
+
+    /// 開くページに合わせて、広告ブロックの WebKit のルールを入れ替える（サイトごとの OFF・リストの更新）
+    func applyAdBlock(for target: URL?) {
+        guard let wv = webView, let store else { return }
+        let want = store.adblock.ruleLists(for: mode, host: target?.host)
+        if want.map({ $0.identifier }) == adRuleLists.map({ $0.identifier }) { return }
+        let content = wv.configuration.userContentController
+        for l in adRuleLists { content.remove(l) }
+        for l in want { content.add(l) }
+        adRuleLists = want
     }
 
     // MARK: 文字の大きさ・ページ内を検索
@@ -589,6 +619,7 @@ final class TabWebDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
             return .download
         }
         let main = navigationAction.targetFrame?.isMainFrame ?? true
+        if main, let u = navigationAction.request.url { tab.applyAdBlock(for: VNetURL.toReal(u) ?? u) }
         if main, let u = navigationAction.request.url, let up = tab.httpsFirstUpgrade(u) {
             webView.load(URLRequest(url: up))
             return .cancel

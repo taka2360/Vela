@@ -17,6 +17,389 @@ import Security
 #endif
 
 // ======================================================================
+// MARK: - HTTPSTakeover.swift
+// ======================================================================
+
+// MARK: - WKWebView の https・http の読み込みを、アプリが引き受けるための仕掛け
+
+/// WKWebView に「https・http も自分で引き受けます」と言えるようにする
+///
+/// 普通は https を setURLSchemeHandler に渡すと「それは WebKit が自分でやる」と止められる（アプリが落ちる）。
+/// WebKit はそれを WKWebView.handlesURLScheme で確かめているので、そこだけ「http・https は扱わない」と答えさせる。
+/// こうすると、ページのアドレスは本物の https://… のまま、読み込みは全部 VNetScheme（自作の通信）に来る。
+/// YouTube やログインのように「アドレスが https か」を確かめるページも、そのまま動く。
+///
+/// 受け入れたリスク（README と開発者パネルにも書く）:
+/// ・WebKit の中の作り（handlesURLScheme の差し替え・_willPerformRedirection:）に頼っている。実行時に確かめても、
+///   WebKit が変われば動かなくなる・落ちる可能性は消せない。App Store に出すアプリには使えない
+/// ・守り: 確かめた iOS の版（testedMajorVersions）だけで使う。差し替えた後の確認に失敗したら、元の実装に戻して標準の通信にする。
+///   設定の「VNet を使わない」で、差し替え自体をしないようにできる
+enum HTTPSTakeover {
+    enum Outcome: Equatable {
+        /// https・http を VNetScheme が引き受けられる
+        case installed
+        /// 設定で VNet を使わない
+        case disabledBySetting
+        /// 確かめていない iOS の版（設定で許せば試す）
+        case untestedOS(Int)
+        /// 差し替えられなかった・確認に失敗した（元に戻した）
+        case failed(String)
+
+        var description: String {
+            switch self {
+            case .installed: return "https の横取り: 成功"
+            case .disabledBySetting: return "https の横取り: 設定で使わない"
+            case .untestedOS(let v): return "https の横取り: 確かめていない iOS \(v) なので使わない（設定で試せます）"
+            case .failed(let why): return "https の横取り: 失敗（\(why)）。元に戻しました"
+            }
+        }
+    }
+
+    /// 動くことを確かめた iOS の版（大きい番号）
+    static let testedMajorVersions = 16...26
+
+    // 1 回目の結果。@MainActor にはしない（NSObject の override init など、隔離の扱いが iPad の Swift で揺れる所から呼ぶため）。
+    // 代わりにロックで守る。WKWebView.handlesURLScheme は Objective-C の API なので、どのスレッドから呼んでもコンパイルは通る
+    private static let lock = NSLock()
+    private static var result: Outcome?
+
+    /// 1 回だけ行う（2 回目からは 1 回目の結果）。画面のスレッドから呼ぶこと
+    static func install() -> Outcome {
+        lock.lock(); defer { lock.unlock() }
+        if let r = result { return r }
+        let r = tryInstall()
+        result = r
+        return r
+    }
+
+    private static func tryInstall() -> Outcome {
+        if VelaSettings.vnetDisabled { return .disabledBySetting }
+        let major = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+        if !testedMajorVersions.contains(major) && !VelaSettings.allowUntestedOS { return .untestedOS(major) }
+        let sel = NSSelectorFromString("handlesURLScheme:")
+        guard let m = class_getClassMethod(WKWebView.self, sel) else { return .failed("handlesURLScheme: が見つかりません") }
+        let original = method_getImplementation(m)
+        let others = ["data", "blob", "about", "vnets"]
+        let before = others.map { WKWebView.handlesURLScheme($0) }
+        swap(m, sel: sel, original: original)
+        // 差し替えが効いているか・ほかのスキームの答えが変わっていないかを確かめる。だめなら元に戻す
+        let ok = !WKWebView.handlesURLScheme("https") && !WKWebView.handlesURLScheme("http")
+            && others.map({ WKWebView.handlesURLScheme($0) }) == before
+        if !ok {
+            _ = method_setImplementation(m, original)
+            return .failed("差し替えた後の確認に失敗")
+        }
+        return .installed
+    }
+
+    private static func swap(_ m: Method, sel: Selector, original: IMP) {
+        // scheme は nil のこともありうる（Objective-C は nil を止めない）。nil を NSString として受けて触ると、
+        // 不正なメモリアクセスで落ちるので、Optional で受けて、nil は元の実装に任せる
+        typealias Orig = @convention(c) (AnyObject, Selector, NSString?) -> Bool
+        let orig = unsafeBitCast(original, to: Orig.self)
+        let block: @convention(block) (AnyObject, NSString?) -> Bool = { cls, scheme in
+            guard let scheme else { return orig(cls, sel, nil) }
+            let s = (scheme as String).lowercased()
+            if s == "http" || s == "https" { return false }
+            return orig(cls, sel, scheme)
+        }
+        _ = method_setImplementation(m, imp_implementationWithBlock(unsafeBitCast(block, to: AnyObject.self)))
+    }
+}
+
+/// 読み込みの途中の「移動（リダイレクト）」を WebKit に伝える
+///
+/// WKURLSchemeTask の公開の作りには移動を伝える方法が無い。そのままだと、移動先の中身を元のアドレスのまま見せることになり、
+/// 相対リンク・オリジン・クッキーがずれて、ページが壊れたりログインできなかったりする。
+/// WebKit の中にある _willPerformRedirection:newRequest:completionHandler:（iOS 13 から）を使って、本当の移動として伝える。
+/// 無ければ false（そのときは前のやり方: 自分で追いかけて、最後の返事だけ渡す）
+enum SchemeTaskRedirect {
+    private static let selector = NSSelectorFromString("_willPerformRedirection:newRequest:completionHandler:")
+
+    static func isAvailable(_ task: WKURLSchemeTask) -> Bool {
+        class_getInstanceMethod(object_getClass(task), selector) != nil
+    }
+
+    /// 移動を伝える。WebKit が受け入れたら done(次の要求)、やめたら done(nil)
+    static func perform(_ task: WKURLSchemeTask, response: URLResponse, request: NSURLRequest,
+                        done: @escaping (NSURLRequest?) -> Void) -> Bool {
+        guard let m = class_getInstanceMethod(object_getClass(task), selector) else { return false }
+        typealias Fn = @convention(c) (AnyObject, Selector, URLResponse, NSURLRequest, @escaping @convention(block) (NSURLRequest?) -> Void) -> Void
+        let f = unsafeBitCast(method_getImplementation(m), to: Fn.self)
+        let block: @convention(block) (NSURLRequest?) -> Void = { done($0) }
+        f(task as AnyObject, selector, response, request, block)
+        return true
+    }
+}
+
+/// 予備の作りで使う自分用のアドレス: https://… ⇄ vnets://…、http://… ⇄ vnet://…
+enum VNetURL {
+    /// https://… → vnets://…、http://… → vnet://…（vnets・vnet はそのまま）
+    static func toVNet(_ u: URL) -> URL? {
+        guard var c = URLComponents(url: u, resolvingAgainstBaseURL: true) else { return nil }
+        switch c.scheme?.lowercased() {
+        case "https": c.scheme = "vnets"
+        case "http": c.scheme = "vnet"
+        case "vnet", "vnets": break
+        default: return nil
+        }
+        return c.url
+    }
+
+    /// vnets://… → https://…、vnet://… → http://…（https・http はそのまま）
+    static func toReal(_ u: URL) -> URL? {
+        guard var c = URLComponents(url: u, resolvingAgainstBaseURL: true) else { return nil }
+        switch c.scheme?.lowercased() {
+        case "vnets": c.scheme = "https"
+        case "vnet": c.scheme = "http"
+        case "https", "http": return u
+        default: return nil
+        }
+        return c.url
+    }
+
+    /// 自分用のアドレス（vnet://・vnets://）か
+    static func isVNet(_ u: URL) -> Bool { u.scheme?.lowercased().hasPrefix("vnet") ?? false }
+}
+
+// ======================================================================
+// MARK: - PageScripts.swift
+// ======================================================================
+
+// MARK: - ページに入れる小さなスクリプトと、そこから届く知らせ
+
+enum PageScripts {
+    /// JavaScript が使う https:// のアドレスを vnets:// に直す（予備の vnets:// の作りのときだけ使う）
+    static let rewriteURLs = #"""
+    (function () {
+      const map = (u) => {
+        try {
+          if (u == null) return u;
+          const s = String(u);
+          if (/^https:\/\//i.test(s)) return 'vnets://' + s.slice(8);
+          if (/^http:\/\//i.test(s)) return 'vnet://' + s.slice(7);
+          if (s.startsWith('//')) return location.protocol + s;
+          return s;
+        } catch (e) { return u; }
+      };
+      const of = window.fetch;
+      if (of) window.fetch = function (input, init) {
+        if (typeof input === 'string' || input instanceof URL) input = map(input);
+        else if (input && input.url && /^(https?:)?\/\//i.test(input.url)) input = new Request(map(input.url), input);
+        return of.call(this, input, init);
+      };
+      const oo = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function (m, u, ...rest) { return oo.call(this, m, map(u), ...rest); };
+      const props = [[window.HTMLImageElement, 'src'], [window.HTMLScriptElement, 'src'], [window.HTMLLinkElement, 'href'],
+                     [window.HTMLIFrameElement, 'src'], [window.HTMLSourceElement, 'src'], [window.HTMLMediaElement, 'src']];
+      for (const [C, p] of props) {
+        if (!C) continue;
+        const d = Object.getOwnPropertyDescriptor(C.prototype, p);
+        if (d && d.set) Object.defineProperty(C.prototype, p, { get: d.get, set(v) { d.set.call(this, map(v)); }, configurable: true, enumerable: d.enumerable });
+      }
+      const sa = Element.prototype.setAttribute;
+      Element.prototype.setAttribute = function (n, v) {
+        const ln = String(n).toLowerCase();
+        if (ln === 'src' || ln === 'href' || ln === 'action' || ln === 'poster') v = map(v);
+        else if (ln === 'srcset' && v) v = String(v).replace(/https:\/\//gi, 'vnets://').replace(/http:\/\//gi, 'vnet://');
+        return sa.call(this, n, v);
+      };
+      const wo = window.open;
+      window.open = function (u, ...rest) { return wo.call(this, map(u), ...rest); };
+    })();
+    """#
+
+    /// 知らせの名前（window.webkit.messageHandlers.<この名前>）
+    static let cookieHandlerName = "vnetCookie"
+    /// エラーページのボタン・守りのスクリプトからの知らせ
+    static let actionHandlerName = "velaAction"
+
+    /// JavaScript が Cookie を変えたこと（document.cookie・cookieStore）を、アプリに「合図」だけ知らせる。
+    /// Cookie の中身は送らない・信じない（HttpOnly や Domain を偽れるため）。アプリは合図を受けて、WebKit の置き場（正本）を読み直す
+    static let watchCookies = #"""
+    (function () {
+      try {
+        const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.vnetCookie;
+        if (!h) return;
+        let queued = false;
+        const tell = () => {
+          if (queued) return;
+          queued = true;
+          setTimeout(() => { queued = false; try { h.postMessage({}); } catch (e) {} }, 50);
+        };
+        const d = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
+        if (d && d.set) {
+          Object.defineProperty(Document.prototype, 'cookie', {
+            get: d.get,
+            set(v) { d.set.call(this, v); tell(); },
+            configurable: true, enumerable: d.enumerable
+          });
+        }
+        const cs = window.cookieStore;
+        if (cs && cs.set) {
+          const os = cs.set.bind(cs), od = cs.delete ? cs.delete.bind(cs) : null;
+          cs.set = function (a, b) { const r = os(a, b); Promise.resolve(r).then(tell, tell); return r; };
+          if (od) cs.delete = function (a) { const r = od(a); Promise.resolve(r).then(tell, tell); return r; };
+        }
+      } catch (e) {}
+    })();
+    """#
+
+    /// LAN の保護（WebSocket）: WebSocket は VNet を通らないので、ページの中で止める。
+    /// 公開のサイトのページから、数字の LAN のアドレス・localhost・.local への WebSocket を拒否する。
+    /// 限界: ホスト名で LAN に解決されるものは分からない。スクリプトの守りは、ページに回避される可能性がある
+    static let webSocketGuard = #"""
+    (function () {
+      try {
+        const W = window.WebSocket;
+        if (!W) return;
+        const isLocal = (h) => {
+          h = String(h || '').toLowerCase().replace(/^\[|\]$/g, '');
+          return /^(10|127)\./.test(h) || /^192\.168\./.test(h) || /^169\.254\./.test(h) ||
+                 /^172\.(1[6-9]|2[0-9]|3[01])\./.test(h) || /^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./.test(h) ||
+                 h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') ||
+                 h === '::1' || /^f[cd][0-9a-f]{2}:/.test(h) || /^fe[89ab][0-9a-f]:/.test(h);
+        };
+        let pageLocal = false;
+        try { pageLocal = isLocal(window.top.location.hostname); } catch (e) { pageLocal = isLocal(location.hostname); }
+        if (pageLocal) return;
+        const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.velaAction;
+        const Guarded = function WebSocket(url, protocols) {
+          let host = '';
+          try { host = new URL(url, location.href).hostname; } catch (e) {}
+          if (isLocal(host)) {
+            try { h && h.postMessage({ action: 'blockedWebSocket', url: String(url) }); } catch (e) {}
+            throw new DOMException('Vela: 公開のサイトから LAN への WebSocket は止めました', 'SecurityError');
+          }
+          return protocols === undefined ? new W(url) : new W(url, protocols);
+        };
+        Guarded.prototype = W.prototype;
+        for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) Guarded[k] = W[k];
+        window.WebSocket = Guarded;
+      } catch (e) {}
+    })();
+    """#
+
+    /// VNet を通らない通信（WebSocket）を使ったら、アプリに 1 回だけ知らせる（アドレス欄の札に出す）
+    static let trackNonVNet = #"""
+    (function () {
+      try {
+        const W = window.WebSocket;
+        const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.velaAction;
+        if (!W || !h) return;
+        let told = false;
+        const Tracked = function WebSocket(url, protocols) {
+          if (!told) { told = true; try { h.postMessage({ action: 'usedWebSocket' }); } catch (e) {} }
+          return protocols === undefined ? new W(url) : new W(url, protocols);
+        };
+        Tracked.prototype = W.prototype;
+        for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) Tracked[k] = W[k];
+        window.WebSocket = Tracked;
+      } catch (e) {}
+    })();
+    """#
+
+    /// LAN の保護（標準の通信のタブと WebSocket 用）: WebKit のルールで、LAN でないページから数字の LAN のアドレスなどへの読み込みを止める。
+    /// トップのページが LAN のもの（ユーザーがアドレス欄で開いた機器のページなど）なら止めない。
+    /// WebKit の正規表現は「|」が使えないので、アドレスの範囲ごとに 1 行にする
+    static let localNetworkPatterns: [String] = [
+        #"^[a-z]+://10\."#, #"^[a-z]+://127\."#, #"^[a-z]+://192\.168\."#, #"^[a-z]+://169\.254\."#,
+        #"^[a-z]+://172\.1[6-9]\."#, #"^[a-z]+://172\.2[0-9]\."#, #"^[a-z]+://172\.3[01]\."#,
+        #"^[a-z]+://localhost[:/]"#, #"^[a-z]+://[a-z0-9.-]*\.local[:/]"#,
+        #"^[a-z]+://\[::1\]"#, #"^[a-z]+://\[f[cd]"#, #"^[a-z]+://\[fe[89ab]"#,
+    ]
+
+    static var localNetworkRules: String {
+        let quoted = localNetworkPatterns.map { "\"" + $0.replacingOccurrences(of: "\\", with: "\\\\") + "\"" }
+        let unless = "[" + quoted.joined(separator: ",") + "]"
+        let rules = quoted.map { #"{"trigger":{"url-filter":\#($0),"unless-top-url":\#(unless)},"action":{"type":"block"}}"# }
+        return "[" + rules.joined(separator: ",") + "]"
+    }
+}
+
+/// ページのスクリプト（PageScripts.watchCookies）からの「Cookie が変わったかも」という合図を受ける。
+/// 中身は受け取らない。合図を受けたら onSignal（WebKit の置き場を読み直す）
+final class CookieBridge: NSObject, WKScriptMessageHandler {
+    /// ログ（どのスレッドからでもよい）
+    var log: (@Sendable (String) -> Void)?
+    /// 合図を受けたとき（画面のスレッドで呼ばれる）
+    var onSignal: (() -> Void)?
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        let o = message.frameInfo.securityOrigin
+        log?("🍪 ページの JavaScript が Cookie を変えました（\(o.protocol)://\(o.host)\(o.port == 0 ? "" : ":\(o.port)")）")
+        onSignal?()
+    }
+}
+
+/// エラーページのボタン・守りのスクリプトからの知らせを受ける
+final class PageActionBridge: NSObject, WKScriptMessageHandler {
+    /// (中身, メインフレームか, 送ってきたページのオリジン)。画面のスレッドで呼ばれる
+    var onAction: (([String: Any], Bool, String) -> Void)?
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard let d = message.body as? [String: Any] else { return }
+        let o = message.frameInfo.securityOrigin
+        onAction?(d, message.frameInfo.isMainFrame, "\(o.protocol)://\(o.host)")
+    }
+}
+
+/// WebKit の Cookie の置き場（正本）と CookieJar（写し）をそろえる
+@MainActor
+final class WebCookieSync: NSObject, WKHTTPCookieStoreObserver {
+    let store: WKHTTPCookieStore
+    let jar: CookieJar
+    var log: (@Sendable (String) -> Void)?
+    private var refreshScheduled = false
+    /// WebKit の置き場に入れている途中の数（その間は写しを作り直さない。入れる前の中身で上書きしないため）
+    private var pushing = 0
+    private var refreshAfterPush = false
+
+    init(store: WKHTTPCookieStore, jar: CookieJar) {
+        self.store = store
+        self.jar = jar
+        super.init()
+        store.add(self)
+        refresh()
+    }
+
+    nonisolated func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+        Task { @MainActor [weak self] in self?.scheduleRefresh() }
+    }
+
+    /// 少し待ってから読み直す（続けて変わったときに、何度も読まないように）
+    func scheduleRefresh() {
+        if refreshScheduled { return }
+        refreshScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            let me = self
+            Task { @MainActor in
+                me?.refreshScheduled = false
+                me?.refresh()
+            }
+        }
+    }
+
+    func refresh() {
+        if pushing > 0 { refreshAfterPush = true; return }
+        let s = store, j = jar
+        Task { @MainActor in
+            let all = await s.allCookies()
+            j.replaceAll(all.compactMap { CookieRecord(httpCookie: $0) })
+        }
+    }
+
+    /// VNet が受け取った Cookie の変更を、WebKit の置き場にも入れる
+    func apply(_ changes: [CookieChange]) async {
+        pushing += 1
+        for ch in changes {
+            guard let c = ch.record.httpCookie() else { log?("🍪 WebKit に渡せない Cookie: \(ch.record.name)"); continue }
+            if ch.delete { await store.deleteCookie(c) } else { await store.setCookie(c) }
+        }
+        pushing -= 1
+        if pushing == 0 && refreshAfterPush { refreshAfterPush = false; refresh() }
+    }
+}
+
+// ======================================================================
 // MARK: - NetPolicy.swift
 // ======================================================================
 
@@ -653,322 +1036,5 @@ enum LocalNetworkPolicy {
         if let t = topClass, t.isLocal { return .allow }                          // LAN のページの部品
         if ctx.previousURL != nil { return .block("公開のサイトから LAN（\(target.rawValue)）へのリダイレクト") }
         return .block("公開のサイトから LAN（\(target.rawValue)）の部品を読み込もうとしました")
-    }
-}
-
-// ======================================================================
-// MARK: - CookieJar.swift
-// ======================================================================
-
-// MARK: - Cookie の写し（正本は WebKit の WKHTTPCookieStore）
-//
-// ・正本は WebKit の置き場だけ。ここはその写しで、VNet が要求を送るとき（vnet-guest のキュー）に、待たずに読めるようにするためのもの
-// ・WebKit の置き場が変わったら（WKHTTPCookieStoreObserver）、写しを作り直す（replaceAll）。この同期は WebCookieSync（PageScripts.swift）がやる
-// ・VNet の応答の Set-Cookie は、CookiePolicy で許されたものだけを写しに入れて、変更（CookieChange）として返す。
-//   呼んだ側が WebKit の置き場にも入れる（入れ終わってから、ページに返事を渡す）
-// ・ページの JavaScript から届く「Cookie の文字列」は、一切ここに入れない（HttpOnly や Domain を偽れるため）
-
-/// 写しの変更（WebKit の置き場にも同じことをする）
-struct CookieChange: Sendable {
-    var record: CookieRecord
-    /// true なら消す
-    var delete: Bool
-}
-
-final class CookieJar: @unchecked Sendable {
-    private let lock = NSLock()
-    private var cookies: [String: CookieRecord] = [:]
-    private var _settings = CookiePolicy.Settings()
-    /// ログ（どのスレッドからでもよい）
-    var log: (@Sendable (String) -> Void)?
-
-    init() {}
-
-    var settings: CookiePolicy.Settings {
-        get { lock.lock(); defer { lock.unlock() }; return _settings }
-        set { lock.lock(); _settings = newValue; lock.unlock() }
-    }
-
-    var count: Int { lock.lock(); defer { lock.unlock() }; return cookies.count }
-
-    func snapshot() -> [CookieRecord] {
-        lock.lock(); defer { lock.unlock() }
-        return Array(cookies.values)
-    }
-
-    /// 送る Cookie ヘッダ（送らないものがあれば理由も返す）
-    func header(for url: URL, method: String, ctx: RequestContext, now: Date = Date()) -> (header: String?, skipped: [(String, String)]) {
-        lock.lock()
-        let all = Array(cookies.values)
-        let s = _settings
-        lock.unlock()
-        let (send, skipped) = CookiePolicy.cookiesToSend(all, url: url, method: method, ctx: ctx, settings: s, now: now)
-        return (CookiePolicy.header(send), skipped)
-    }
-
-    /// 応答の Set-Cookie を受け取る。許されたものを写しに入れ、変更を返す
-    func receive(_ lines: [String], url: URL, method: String, ctx: RequestContext, now: Date = Date()) -> [CookieChange] {
-        var changes: [CookieChange] = []
-        let s = settings
-        for (i, line) in lines.enumerated() {
-            // 同じ返事の中の Cookie は、届いた順に作られたことにする（送る順番が毎回変わらないように、1 マイクロ秒ずつずらす）
-            switch SetCookieParser.parse(line, url: url, now: now.addingTimeInterval(Double(i) * 1e-6)) {
-            case .rejected(let why):
-                log?("🍪✕ 受け取らない（\(SiteUtil.host(of: url) ?? "")）: \(why)")
-            case .cookie(var rec):
-                if let why = CookiePolicy.storeDecision(rec, url: url, method: method, ctx: ctx, settings: s) {
-                    log?("🍪✕ 保存しない \(rec.name)（\(rec.domain)）: \(why)")
-                    continue
-                }
-                lock.lock()
-                if rec.isExpired(now) {
-                    let old = cookies.removeValue(forKey: rec.key)
-                    lock.unlock()
-                    changes.append(CookieChange(record: old ?? rec, delete: true))
-                    continue
-                }
-                // 置き換えるときは、最初に作られた時刻を引き継ぐ（RFC 6265 5.3 の 11.3）
-                if let old = cookies[rec.key] { rec.created = old.created }
-                cookies[rec.key] = rec
-                lock.unlock()
-                changes.append(CookieChange(record: rec, delete: false))
-            }
-        }
-        return changes
-    }
-
-    /// WebKit の置き場の中身で写しを作り直す。作られた時刻と、WebKit が覚えていない SameSite は、前の写しから引き継ぐ
-    func replaceAll(_ records: [CookieRecord], now: Date = Date()) {
-        lock.lock()
-        var next: [String: CookieRecord] = [:]
-        for var r in records where !r.isExpired(now) {
-            if let old = cookies[r.key] {
-                r.created = old.created
-                if r.sameSite == .unspecified { r.sameSite = old.sameSite }
-            }
-            next[r.key] = r
-        }
-        cookies = next
-        lock.unlock()
-    }
-
-    func removeAll() {
-        lock.lock(); cookies = [:]; lock.unlock()
-    }
-}
-
-// MARK: - HTTPCookie との変換
-
-extension CookieRecord {
-    private static let httpOnlyKey = HTTPCookiePropertyKey("HttpOnly")
-    private static let sameSiteKey = HTTPCookiePropertyKey("SameSite")
-
-    /// WebKit の置き場の HTTPCookie から作る（作られた時刻は分からないので now）
-    init?(httpCookie c: HTTPCookie, now: Date = Date()) {
-        var d = c.domain.lowercased()
-        let hostOnly = !d.hasPrefix(".")
-        while d.hasPrefix(".") { d.removeFirst() }
-        if d.isEmpty { return nil }
-        var ss = SameSite.unspecified
-        #if canImport(Darwin)
-        if let p = c.sameSitePolicy {
-            if p == .sameSiteStrict { ss = .strict } else if p == .sameSiteLax { ss = .lax } else if p.rawValue.lowercased() == "none" { ss = .none }
-        }
-        #else
-        if let p = c.properties?[CookieRecord.sameSiteKey] as? String {
-            switch p.lowercased() { case "strict": ss = .strict; case "lax": ss = .lax; case "none": ss = .none; default: break }
-        }
-        #endif
-        self.init(name: c.name, value: c.value, domain: SiteUtil.normalizeHost(d), hostOnly: hostOnly, path: c.path.isEmpty ? "/" : c.path,
-                  secure: c.isSecure, httpOnly: c.isHTTPOnly, sameSite: ss, expires: c.expiresDate, created: now)
-    }
-
-    /// WebKit の置き場に入れる HTTPCookie にする
-    func httpCookie() -> HTTPCookie? {
-        var p: [HTTPCookiePropertyKey: Any] = [.name: name, .value: value, .path: path]
-        if hostOnly {
-            // Domain 属性なし（このホストだけ）: 先頭に「.」を付けない
-            p[.domain] = domain
-        } else {
-            p[.domain] = "." + domain
-        }
-        if secure { p[.secure] = "TRUE" }
-        if let e = expires { p[.expires] = e } else { p[.discard] = "TRUE" }
-        if httpOnly { p[CookieRecord.httpOnlyKey] = "TRUE" }
-        #if canImport(Darwin)
-        switch sameSite {
-        case .strict: p[.sameSitePolicy] = HTTPCookieStringPolicy.sameSiteStrict
-        case .lax: p[.sameSitePolicy] = HTTPCookieStringPolicy.sameSiteLax
-        case .none, .unspecified: break
-        }
-        #else
-        switch sameSite {
-        case .strict: p[CookieRecord.sameSiteKey] = "strict"
-        case .lax: p[CookieRecord.sameSiteKey] = "lax"
-        case .none, .unspecified: break
-        }
-        #endif
-        return HTTPCookie(properties: p)
-    }
-}
-
-// ======================================================================
-// MARK: - HSTSStore.swift
-// ======================================================================
-
-// MARK: - HSTS（「このサイトは https だけで開く」の記録）
-//
-// 決まり（README と開発者パネルにも書く）:
-//  ・VNet が受け取った https の応答で、トップレベルかファーストパーティ（トップと同じサイト）のものからだけ登録する
-//    （サードパーティの応答・http の応答・数字のアドレスのホストは無視する。サードパーティから登録させると、追跡に使えてしまう）
-//  ・max-age で期限を決める。max-age=0 は消す。includeSubDomains に対応
-//  ・ホスト名は SiteUtil.normalizeHost でそろえる
-//  ・Application Support に保存する（期限切れは読み込むときに消す。最大 maxEntries 件。あふれたら期限の近いものから消す）
-//  ・使い道: http:// への移動とリダイレクトを https に上げる
-
-struct HSTSEntry: Codable, Equatable, Sendable {
-    var host: String
-    var expires: Date
-    var includeSubDomains: Bool
-}
-
-enum HSTSPolicy {
-    /// Strict-Transport-Security の値を読む。読めなければ nil
-    static func parse(_ header: String) -> (maxAge: Int, includeSubDomains: Bool)? {
-        var maxAge: Int?
-        var sub = false
-        var seen = Set<String>()
-        for raw in header.split(separator: ";") {
-            let d = raw.trimmingCharacters(in: .whitespaces)
-            if d.isEmpty { continue }
-            let k: String, v: String
-            if let eq = d.firstIndex(of: "=") {
-                k = d[..<eq].trimmingCharacters(in: .whitespaces).lowercased()
-                v = d[d.index(after: eq)...].trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-            } else {
-                k = d.lowercased(); v = ""
-            }
-            if !seen.insert(k).inserted { return nil }     // 同じ指示が 2 回あるものは無効（RFC 6797）
-            switch k {
-            case "max-age":
-                guard let n = Int(v), n >= 0 else { return nil }
-                maxAge = n
-            case "includesubdomains": sub = true
-            default: break
-            }
-        }
-        guard let m = maxAge else { return nil }
-        return (m, sub)
-    }
-
-    /// この応答から登録してよいか
-    static func mayRecord(url: URL, ctx: RequestContext) -> Bool {
-        guard url.scheme?.lowercased() == "https", let h = SiteUtil.host(of: url), !SiteUtil.isIPLiteral(h) else { return false }
-        if ctx.isTopLevel { return true }
-        guard let top = ctx.topURL else { return false }
-        return SiteUtil.isSameSite(top, url)
-    }
-}
-
-/// HSTS の記録（どのスレッドからでも使える）
-final class HSTSStore: @unchecked Sendable {
-    static let maxEntries = 5000
-    private let lock = NSLock()
-    private var entries: [String: HSTSEntry] = [:]
-    private let fileURL: URL?
-    private var saveScheduled = false
-    private let saveQueue = DispatchQueue(label: "vela-hsts-save")
-    /// ログ（どのスレッドからでもよい）
-    var log: (@Sendable (String) -> Void)?
-
-    /// fileURL が nil なら保存しない（テスト用）
-    init(fileURL: URL?, now: Date = Date()) {
-        self.fileURL = fileURL
-        if let f = fileURL, let d = try? Data(contentsOf: f), let list = try? JSONDecoder().decode([HSTSEntry].self, from: d) {
-            for e in list where e.expires > now { entries[e.host] = e }
-        }
-    }
-
-    /// 既定の置き場（Application Support/Vela/hsts.json）
-    static func defaultFileURL() -> URL? {
-        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
-        let dir = base.appendingPathComponent("Vela", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("hsts.json")
-    }
-
-    /// このホストを https に上げるべきか
-    func shouldUpgrade(_ host: String, now: Date = Date()) -> Bool {
-        let h = SiteUtil.normalizeHost(host)
-        if SiteUtil.isIPLiteral(h) { return false }
-        lock.lock(); defer { lock.unlock() }
-        if let e = entries[h], e.expires > now { return true }
-        // 親のドメインが includeSubDomains で登録されているか
-        var labels = h.split(separator: ".")
-        while labels.count > 1 {
-            labels.removeFirst()
-            if let e = entries[labels.joined(separator: ".")], e.includeSubDomains, e.expires > now { return true }
-        }
-        return false
-    }
-
-    /// 応答の Strict-Transport-Security を記録する（mayRecord を満たすときだけ）
-    func record(header: String, url: URL, ctx: RequestContext, now: Date = Date()) {
-        guard HSTSPolicy.mayRecord(url: url, ctx: ctx), let h = SiteUtil.host(of: url) else { return }
-        guard let (maxAge, sub) = HSTSPolicy.parse(header) else { log?("HSTS の値が読めません（\(h)）: \(header)"); return }
-        lock.lock()
-        var changed = false
-        if maxAge == 0 {
-            changed = entries.removeValue(forKey: h) != nil
-        } else {
-            let e = HSTSEntry(host: h, expires: now.addingTimeInterval(TimeInterval(maxAge)), includeSubDomains: sub)
-            let old = entries[h]
-            entries[h] = e
-            // 期限が少し延びただけなら保存しない（毎回書くと重い）
-            changed = old == nil || old!.includeSubDomains != sub || abs(old!.expires.timeIntervalSince(e.expires)) > 86400
-            if entries.count > HSTSStore.maxEntries {
-                let drop = entries.values.sorted { $0.expires < $1.expires }.prefix(entries.count - HSTSStore.maxEntries)
-                for d in drop { entries[d.host] = nil }
-            }
-        }
-        lock.unlock()
-        if changed {
-            log?(maxAge == 0 ? "HSTS を消しました: \(h)" : "HSTS を記録: \(h)（\(maxAge / 86400) 日\(sub ? "・サブドメインも" : "")）")
-            scheduleSave()
-        }
-    }
-
-    func all() -> [HSTSEntry] {
-        lock.lock(); defer { lock.unlock() }
-        return entries.values.sorted { $0.host < $1.host }
-    }
-
-    func remove(_ host: String) {
-        lock.lock(); entries[SiteUtil.normalizeHost(host)] = nil; lock.unlock()
-        scheduleSave()
-    }
-
-    func removeAll() {
-        lock.lock(); entries = [:]; lock.unlock()
-        scheduleSave()
-    }
-
-    /// まとめて 2 秒後に書く
-    private func scheduleSave() {
-        guard fileURL != nil else { return }
-        lock.lock()
-        if saveScheduled { lock.unlock(); return }
-        saveScheduled = true
-        lock.unlock()
-        saveQueue.asyncAfter(deadline: .now() + 2) { [weak self] in self?.saveNow() }
-    }
-
-    func saveNow() {
-        guard let f = fileURL else { return }
-        lock.lock()
-        saveScheduled = false
-        let list = Array(entries.values)
-        lock.unlock()
-        if let d = try? JSONEncoder().encode(list) { try? d.write(to: f, options: .atomic) }
     }
 }

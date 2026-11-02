@@ -17,6 +17,625 @@ import Security
 #endif
 
 // ======================================================================
+// MARK: - ContentBlocker.swift
+// ======================================================================
+
+// MARK: - 広告ブロックのルールを WebKit のルール（WKContentRuleList の JSON）にする
+//
+// ・通信のルール（標準の通信のタブで使う。VNet のタブは BlockEngine が自分で調べて数える）と、
+//   隠すルール（どちらのタブでも使う）を、別々の JSON にする
+// ・WebKit の例外（ignore-previous-rules）は、同じリストの前にあるルールだけを打ち消す。なので
+//   並びは「ブロック → 例外 → important のブロック」
+// ・WebKit の url-filter は正規表現の一部（| や {n} が使えない・ASCII だけ）。^ は「区切りの文字」に置き換える
+// ・1 つのリストは maxRules まで（WebKit の上限は 15 万）
+
+enum ContentBlockerCompiler {
+    static let maxRules = 140_000
+    /// 1 つの css-display-none にまとめるセレクタの数
+    static let selectorsPerRule = 200
+
+    struct Output {
+        var json: String
+        var count: Int
+        var skipped: Int
+    }
+
+    // MARK: 通信のルール
+
+    static func networkJSON(_ rules: [NetworkRule]) -> Output {
+        var blocks: [String] = [], exceptions: [String] = [], important: [String] = []
+        var skipped = 0
+        for r in rules {
+            guard let obj = networkRule(r) else { skipped += 1; continue }
+            if r.isException { exceptions.append(obj) } else if r.important { important.append(obj) } else { blocks.append(obj) }
+        }
+        var all = blocks + exceptions + important
+        if all.count > maxRules {
+            skipped += all.count - maxRules
+            // 例外と important は残して、普通のブロックを減らす
+            all = Array(blocks.prefix(max(0, maxRules - exceptions.count - important.count))) + exceptions + important
+        }
+        return Output(json: "[" + all.joined(separator: ",") + "]", count: all.count, skipped: skipped)
+    }
+
+    static func networkRule(_ r: NetworkRule) -> String? {
+        guard let filter = urlFilter(r) else { return nil }
+        var trigger = "\"url-filter\":\(quote(filter))"
+        if r.matchCase { trigger += ",\"url-filter-is-case-sensitive\":true" }
+        // WebKit のサイトの指定は ASCII だけ（日本語のドメインはリスト全体のエラーになる）
+        let inc = r.includeDomains.filter(isASCIIDomain), exc = r.excludeDomains.filter(isASCIIDomain)
+        if !r.includeDomains.isEmpty && inc.isEmpty { return nil }
+        if !inc.isEmpty {
+            trigger += ",\"if-domain\":" + list(inc.map { "*" + $0 })
+        } else if !exc.isEmpty {
+            trigger += ",\"unless-domain\":" + list(exc.map { "*" + $0 })
+        }
+        if let tp = r.thirdParty { trigger += ",\"load-type\":[\"\(tp ? "third-party" : "first-party")\"]" }
+        // 種類の指定が無いルールも、ページそのもの（document）は止めない（記事の URL に「/ads/」が入っていても開けるように）
+        let types = r.types ?? Set(ResourceType.allCases).subtracting([.document, .subdocument])
+        let wk = Set(types.map(webKitType)).sorted()
+        trigger += ",\"resource-type\":" + list(wk)
+        let action = r.isException ? "ignore-previous-rules" : "block"
+        return "{\"trigger\":{\(trigger)},\"action\":{\"type\":\"\(action)\"}}"
+    }
+
+    static func isASCIIDomain(_ d: String) -> Bool {
+        !d.isEmpty && d.unicodeScalars.allSatisfy { ($0.value >= 0x61 && $0.value <= 0x7A) || ($0.value >= 0x30 && $0.value <= 0x39) || $0 == "." || $0 == "-" }
+    }
+
+    static func webKitType(_ t: ResourceType) -> String {
+        switch t {
+        case .document, .subdocument: return "document"
+        case .script: return "script"
+        case .image: return "image"
+        case .stylesheet: return "style-sheet"
+        case .font: return "font"
+        case .media: return "media"
+        case .xhr, .websocket, .ping, .other: return "raw"
+        }
+    }
+
+    /// ABP の本体を、WebKit の url-filter（正規表現の一部）にする
+    static func urlFilter(_ r: NetworkRule) -> String? {
+        var out = ""
+        if r.hostAnchor { out = "^[a-z][a-z0-9.+-]*://([^/?#]*\\.)?" }
+        else if r.startAnchor { out = "^" }
+        for ch in r.body.unicodeScalars {
+            guard ch.isASCII else { return nil }
+            switch ch {
+            case "*": out += ".*"
+            case "^": out += "[^a-zA-Z0-9_.%-]"
+            case ".", "?", "+", "(", ")", "[", "]", "{", "}", "\\", "$", "|": out += "\\" + String(ch)
+            default: out.unicodeScalars.append(ch)
+            }
+        }
+        if r.endAnchor { out += "$" }
+        if out.isEmpty { out = ".*" }
+        return out
+    }
+
+    // MARK: 隠すルール
+
+    static func cosmeticJSON(_ rules: [CosmeticRule]) -> Output {
+        // 全部のサイトに効く例外（#@#.ad）はセレクタごと外す。サイトを指定した例外は、そのサイトを unless-domain にする
+        var removed = Set<String>()
+        var exceptDomains: [String: [String]] = [:]
+        let rules = rules.compactMap { r -> CosmeticRule? in
+            var c = r
+            c.includeDomains = r.includeDomains.filter(isASCIIDomain)
+            c.excludeDomains = r.excludeDomains.filter(isASCIIDomain)
+            return (!r.includeDomains.isEmpty && c.includeDomains.isEmpty) ? nil : c
+        }
+        for r in rules where r.isException {
+            if r.includeDomains.isEmpty { removed.insert(r.selector) }
+            else { exceptDomains[r.selector, default: []] += r.includeDomains }
+        }
+        var generic: [String] = []
+        var genericWithExceptions: [String: [String]] = [:]
+        var specific: [String: [String]] = [:]      // サイトの組 → セレクタ
+        var seen = Set<String>()
+        for r in rules where !r.isException && !removed.contains(r.selector) {
+            if r.includeDomains.isEmpty {
+                guard seen.insert(r.selector).inserted else { continue }
+                let unless = r.excludeDomains + (exceptDomains[r.selector] ?? [])
+                if unless.isEmpty { generic.append(r.selector) } else { genericWithExceptions[r.selector] = unless }
+            } else {
+                let key = r.includeDomains.sorted().joined(separator: ",")
+                specific[key, default: []].append(r.selector)
+            }
+        }
+        var out: [String] = []
+        var i = 0
+        while i < generic.count {
+            let chunk = generic[i..<min(i + selectorsPerRule, generic.count)]
+            out.append(hideRule(Array(chunk), ifDomains: nil, unlessDomains: nil))
+            i += selectorsPerRule
+        }
+        for (sel, unless) in genericWithExceptions.sorted(by: { $0.key < $1.key }) {
+            out.append(hideRule([sel], ifDomains: nil, unlessDomains: unless))
+        }
+        for (key, sels) in specific.sorted(by: { $0.key < $1.key }) {
+            let domains = key.split(separator: ",").map(String.init)
+            var j = 0
+            while j < sels.count {
+                out.append(hideRule(Array(sels[j..<min(j + selectorsPerRule, sels.count)]), ifDomains: domains, unlessDomains: nil))
+                j += selectorsPerRule
+            }
+        }
+        var skipped = 0
+        if out.count > maxRules { skipped = out.count - maxRules; out = Array(out.prefix(maxRules)) }
+        return Output(json: "[" + out.joined(separator: ",") + "]", count: out.count, skipped: skipped)
+    }
+
+    static func hideRule(_ selectors: [String], ifDomains: [String]?, unlessDomains: [String]?) -> String {
+        var trigger = "\"url-filter\":\".*\""
+        if let d = ifDomains { trigger += ",\"if-domain\":" + list(d.map { "*" + $0 }) }
+        else if let d = unlessDomains { trigger += ",\"unless-domain\":" + list(d.map { "*" + $0 }) }
+        return "{\"trigger\":{\(trigger)},\"action\":{\"type\":\"css-display-none\",\"selector\":\(quote(selectors.joined(separator: ", ")))}}"
+    }
+
+    // MARK: JSON の文字
+
+    static func quote(_ s: String) -> String {
+        var o = "\""
+        for ch in s.unicodeScalars {
+            switch ch {
+            case "\"": o += "\\\""
+            case "\\": o += "\\\\"
+            case "\n": o += "\\n"
+            case "\r": o += "\\r"
+            case "\t": o += "\\t"
+            default:
+                if ch.value < 0x20 { o += String(format: "\\u%04x", ch.value) } else { o.unicodeScalars.append(ch) }
+            }
+        }
+        return o + "\""
+    }
+
+    static func list(_ items: [String]) -> String { "[" + items.map(quote).joined(separator: ",") + "]" }
+
+    /// ルールの中身から作る、変わったかどうかの印（FNV-1a 64 bit。コンパイル済みのリストの名前に使う）
+    static func hash(_ s: String) -> String {
+        var h: UInt64 = 0xcbf29ce484222325
+        for b in s.utf8 { h ^= UInt64(b); h = h &* 0x100000001b3 }
+        return String(h, radix: 16)
+    }
+}
+
+// ======================================================================
+// MARK: - Persistence.swift
+// ======================================================================
+
+// MARK: - データのファイル（Application Support/Vela/ の JSON）
+//
+// タブ・ブックマーク・履歴などを Codable の JSON で置く。書き込みはまとめて（delay 秒後に 1 回）、裏のキューで、
+// いったん別の名前に書いてから置き換える（.atomic。書いている途中で落ちても前のものが残る）
+
+final class JSONFile<Value: Codable>: @unchecked Sendable {
+    let url: URL
+    private let lock = NSLock()
+    private let queue: DispatchQueue
+    private let delay: TimeInterval
+    private var pending: Value?
+    private var scheduled = false
+    /// 読み書きの失敗（開発者向けのログに出す）
+    var log: (@Sendable (String) -> Void)?
+
+    /// name: ファイルの名前（例: "tabs.json"）。directory を省くと Application Support/Vela/
+    init(name: String, directory: URL? = nil, delay: TimeInterval = 1.0) {
+        let dir = directory ?? JSONFile.defaultDirectory()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        url = dir.appendingPathComponent(name)
+        self.delay = delay
+        queue = DispatchQueue(label: "vela-json-\(name)")
+    }
+
+    static func defaultDirectory() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("Vela", isDirectory: true)
+    }
+
+    /// 読む（無い・壊れているなら nil。壊れていたファイルは .broken に名前を変えて残す）
+    func load() -> Value? {
+        guard let d = try? Data(contentsOf: url) else { return nil }
+        do {
+            return try JSONDecoder().decode(Value.self, from: d)
+        } catch {
+            log?("⚠️ \(url.lastPathComponent) を読めません（\(error)）。.broken として残します")
+            let broken = url.appendingPathExtension("broken")
+            try? FileManager.default.removeItem(at: broken)
+            try? FileManager.default.moveItem(at: url, to: broken)
+            return nil
+        }
+    }
+
+    /// 保存する（delay 秒の間に何度呼んでも、書くのは最後の 1 回）
+    func save(_ v: Value) {
+        lock.lock()
+        pending = v
+        if scheduled { lock.unlock(); return }
+        scheduled = true
+        lock.unlock()
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in self?.flush() }
+    }
+
+    /// 待っている分をすぐ書く（アプリが裏に回るときなど）。書き終わるまで待つ
+    func saveNow(_ v: Value? = nil) {
+        if let v { lock.lock(); pending = v; lock.unlock() }
+        queue.sync { self.flush() }
+    }
+
+    private func flush() {
+        lock.lock()
+        let v = pending
+        pending = nil
+        scheduled = false
+        lock.unlock()
+        guard let v else { return }
+        do {
+            let d = try JSONEncoder().encode(v)
+            try d.write(to: url, options: .atomic)
+        } catch {
+            log?("⚠️ \(url.lastPathComponent) を書けません（\(error)）")
+        }
+    }
+}
+
+// MARK: - 設定（UserDefaults に置く）
+//
+// 通信まわりの設定は、アプリを起動し直したときに効く（WebView や通信の作りを、起動のときに決めるため）
+
+enum VelaSettings {
+    private static var d: UserDefaults { .standard }
+
+    private static func bool(_ key: String, _ def: Bool) -> Bool {
+        d.object(forKey: key) == nil ? def : d.bool(forKey: key)
+    }
+
+    // MARK: 通信（VNet）
+
+    /// VNet を使わず、標準の通信（WebKit 内蔵）だけで読む
+    static var vnetDisabled: Bool {
+        get { bool("vnet.disabled", false) } set { d.set(newValue, forKey: "vnet.disabled") }
+    }
+    /// 確かめていない iOS の版でも、https の横取り（非公開 API）を試す
+    static var allowUntestedOS: Bool {
+        get { bool("vnet.allowUntestedOS", false) } set { d.set(newValue, forKey: "vnet.allowUntestedOS") }
+    }
+    /// 開発者向け: 横取りできないとき、標準の通信ではなく予備の vnets:// の作りを使う（安全ではない。CSP などを外すため）
+    static var legacyVNetsFallback: Bool {
+        get { bool("vnet.legacyVNets", false) } set { d.set(newValue, forKey: "vnet.legacyVNets") }
+    }
+
+    // MARK: 使い勝手
+
+    /// 検索エンジン
+    static var searchEngine: SearchEngine {
+        get { SearchEngine(rawValue: d.string(forKey: "search.engine") ?? "") ?? .google }
+        set { d.set(newValue.rawValue, forKey: "search.engine") }
+    }
+    /// HTTPS-First: ページを開く http:// を、まず https で試す（だめなら「http のまま開く」を出す）
+    static var httpsFirst: Bool {
+        get { bool("nav.httpsFirst", true) } set { d.set(newValue, forKey: "nav.httpsFirst") }
+    }
+    /// VNet でページを読めなかったら（TLS・つながらない など）、標準の通信に自動で切り替える
+    static var autoFallbackToNative: Bool {
+        get { bool("vnet.autoFallback", false) } set { d.set(newValue, forKey: "vnet.autoFallback") }
+    }
+    /// Mac の Safari の Web インスペクタからつなげるようにする（iOS 16.4 から）
+    static var webInspector: Bool {
+        get { bool("dev.webInspector", false) } set { d.set(newValue, forKey: "dev.webInspector") }
+    }
+
+    /// サイト（ホスト）ごとの文字の大きさ（100% のものは持たない）
+    static func zoom(for host: String?) -> Double {
+        guard let h = host?.lowercased(), let z = (d.dictionary(forKey: "zoom.sites") as? [String: Double])?[h] else { return 1.0 }
+        return z
+    }
+    static func setZoom(_ z: Double, for host: String?) {
+        guard let h = host?.lowercased(), !h.isEmpty else { return }
+        var m = (d.dictionary(forKey: "zoom.sites") as? [String: Double]) ?? [:]
+        m[h] = abs(z - 1.0) < 0.001 ? nil : z
+        if m.count > 500 { m = [h: z] }      // 増えすぎたら覚え直す（めったに起きない）
+        d.set(m, forKey: "zoom.sites")
+    }
+
+    // MARK: プライバシー・守り
+
+    /// サードパーティ Cookie をブロックする
+    static var blockThirdPartyCookies: Bool {
+        get { bool("cookies.blockThirdParty", true) } set { d.set(newValue, forKey: "cookies.blockThirdParty") }
+    }
+    /// SameSite が無い Cookie を Lax として扱う
+    static var cookiesLaxByDefault: Bool {
+        get { bool("cookies.laxByDefault", true) } set { d.set(newValue, forKey: "cookies.laxByDefault") }
+    }
+    /// LAN の保護（公開のサイトから LAN の機器へ届かせない）
+    static var localNetworkProtection: Bool {
+        get { bool("lan.protection", true) } set { d.set(newValue, forKey: "lan.protection") }
+    }
+
+    /// 今の設定から作る Cookie の決まり
+    static var cookiePolicy: CookiePolicy.Settings {
+        var s = CookiePolicy.Settings()
+        s.blockThirdParty = blockThirdPartyCookies
+        s.laxByDefault = cookiesLaxByDefault
+        return s
+    }
+}
+
+// ======================================================================
+// MARK: - DevLog.swift
+// ======================================================================
+
+// MARK: - 開発者向けのログ（どのスレッドからでも書ける）
+//
+// 1 行ずつ「時刻・重さ・種類・タブ・本文」を持って、最新 maxEntries 件まで覚える（古いものから消す）。
+// 今までの log?("…") の文字列も、そのまま add で入れられる（先頭の記号から種類と重さを決める）。
+// 画面へは、必要なときに entries(after:) で差分だけ取り出す（毎回全部を作り直すと重い）
+
+enum LogLevel: Int, Comparable, Sendable, CaseIterable {
+    case debug, info, warning, error
+    static func < (a: LogLevel, b: LogLevel) -> Bool { a.rawValue < b.rawValue }
+    var mark: String {
+        switch self { case .debug: return "·"; case .info: return " "; case .warning: return "⚠"; case .error: return "✕" }
+    }
+}
+
+enum LogCategory: String, Sendable, CaseIterable {
+    case app = "アプリ"
+    case vnet = "VNet"
+    case net = "通信"
+    case nav = "移動"
+    case cookie = "Cookie"
+    case security = "守り"
+    case block = "ブロック"
+    case download = "ダウンロード"
+    case js = "JS"
+}
+
+struct LogEntry: Sendable, Identifiable {
+    let id: Int
+    let time: Date
+    let level: LogLevel
+    let category: LogCategory
+    /// どのタブのものか（タブに関係ないものは nil）
+    let tab: Int?
+    let message: String
+
+    private static let timeFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "HH:mm:ss.SSS"
+        return f
+    }()
+
+    var line: String {
+        "\(LogEntry.timeFormat.string(from: time)) \(level.mark) [\(category.rawValue)\(tab.map { "#\($0)" } ?? "")] \(message)"
+    }
+}
+
+final class DevLog: @unchecked Sendable {
+    static let maxEntries = 5000
+    private let lock = NSLock()
+    private var ring: [LogEntry] = []
+    private var start = 0           // ring の中で一番古いものの位置（いっぱいになってから使う）
+    private var nextID = 1
+    private var dirty = false
+    /// ログを書いた回数（重さごと。開発者パネル用）
+    private var counts: [LogLevel: Int] = [:]
+
+    init() {}
+
+    /// 今までの文字列のログ。先頭の記号などから種類と重さを決める
+    func add(_ message: String, tab: Int? = nil) {
+        let (level, category) = DevLog.classify(message)
+        add(message, level: level, category: category, tab: tab)
+    }
+
+    func add(_ message: String, level: LogLevel, category: LogCategory, tab: Int? = nil) {
+        lock.lock()
+        let e = LogEntry(id: nextID, time: Date(), level: level, category: category, tab: tab, message: message)
+        nextID += 1
+        if ring.count < DevLog.maxEntries {
+            ring.append(e)
+        } else {
+            ring[start] = e
+            start = (start + 1) % DevLog.maxEntries
+        }
+        counts[level, default: 0] += 1
+        dirty = true
+        lock.unlock()
+        // 落ちたときのために、すぐファイルにも書く（CrashLog.start の前は何もしない）
+        CrashLog.writeLine(e.line)
+    }
+
+    /// 古い順に全部
+    func all() -> [LogEntry] {
+        lock.lock(); defer { lock.unlock() }
+        return Array(ring[start...] + ring[..<start])
+    }
+
+    /// id より新しいもの（古い順）。画面は最後に見た id を覚えておいて、差分だけもらう
+    func entries(after id: Int) -> [LogEntry] {
+        all().filter { $0.id > id }
+    }
+
+    func count(_ level: LogLevel) -> Int { lock.lock(); defer { lock.unlock() }; return counts[level] ?? 0 }
+
+    /// 変わっていれば、最新 lines 行を 1 つの文字列にして返す（今の簡易のログ表示用）
+    func take(lines: Int = 200) -> String? {
+        lock.lock()
+        if !dirty { lock.unlock(); return nil }
+        dirty = false
+        lock.unlock()
+        return all().suffix(lines).map { $0.message }.joined(separator: "\n")
+    }
+
+    /// 書き出し用（共有・コピー）
+    func export(minLevel: LogLevel = .debug) -> String {
+        all().filter { $0.level >= minLevel }.map { $0.line }.joined(separator: "\n")
+    }
+
+    func clear() {
+        lock.lock(); ring = []; start = 0; dirty = true; lock.unlock()
+    }
+
+    /// 文字列から種類と重さを決める（今までのログの書き方に合わせる）
+    static func classify(_ m: String) -> (LogLevel, LogCategory) {
+        let level: LogLevel = m.hasPrefix("✕") || m.contains("失敗") ? .error
+            : m.hasPrefix("⚠") ? .warning : .info
+        let category: LogCategory
+        if m.hasPrefix("🍪") { category = .cookie }
+        else if m.hasPrefix("🚫") { category = .block }
+        else if m.hasPrefix("🛡") || m.hasPrefix("🔒") || m.contains("HSTS") || m.contains("横取り") { category = .security }
+        else if m.hasPrefix("✓") || m.hasPrefix("✕") || m.hasPrefix("↪") || m.hasPrefix("――") { category = .net }
+        else if m.hasPrefix("→") || m.hasPrefix("←") || m.contains("TLS") || m.contains("DHCP") || m.contains("カード")
+                    || m.contains("[ネット]") || m.contains("TCP") { category = .vnet }
+        else { category = .app }
+        return (level, category)
+    }
+}
+
+// ======================================================================
+// MARK: - CrashLog.swift
+// ======================================================================
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+// MARK: - 落ちたときの記録（次に起動したときに、開発者パネルで見る）
+//
+// ・ログを 1 行ずつ、すぐファイルに書く（落ちる直前まで残るように。メモリのログは落ちると消える）
+// ・Objective-C の例外（WebKit などが投げる）は、名前・理由・呼び出しの順をファイルに書く
+// ・致命的なシグナル（Swift の強制終了・不正なメモリアクセスなど）は、番号・落ちたスレッド・呼び出しの順を書く
+//   （シグナルの中ではほとんど何もできないので、用意しておいた文字と backtrace_symbols_fd で、ファイルに直接書くだけ）
+// ・起動するたびに、前回の記録を crash-previous.txt に移す。前回が落ちて終わっていたら、ログに知らせる
+
+/// シグナルの中から使うので、ファイルの番号は global に置く（Swift の static は初めて触るときに準備が走るので、シグナルの中では使わない）
+private var crashFD: Int32 = -1
+private let signalMessages: [Int32: [UInt8]] = {
+    var m: [Int32: [UInt8]] = [:]
+    for (s, name) in [(SIGABRT, "SIGABRT"), (SIGSEGV, "SIGSEGV"), (SIGBUS, "SIGBUS"), (SIGILL, "SIGILL"), (SIGTRAP, "SIGTRAP"), (SIGFPE, "SIGFPE")] {
+        m[s] = Array("\n【シグナル】\(name)（\(s)）でアプリが止まりました\n".utf8)
+    }
+    return m
+}()
+/// 呼び出しの順を入れる場所（シグナルの中では作れないので、先に用意する）
+private let backtraceCapacity: Int32 = 64
+private let backtraceBuffer = UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: 64)
+private let mainThreadText = Array("落ちたスレッド: 画面のスレッド（main）\n呼び出しの順:\n".utf8)
+private let otherThreadText = Array("落ちたスレッド: 裏のスレッド（main 以外）\n呼び出しの順:\n".utf8)
+
+// backtrace・backtrace_symbols_fd（C の execinfo.h）。iPad の Swift Playgrounds では Darwin から見えなかった
+// （「cannot find 'backtrace' in scope」）ので、C の関数の名前で直接つなぐ。iOS・Linux の libc のどちらにもある
+@_silgen_name("backtrace")
+private func cBacktrace(_ buffer: UnsafeMutablePointer<UnsafeMutableRawPointer?>, _ size: Int32) -> Int32
+@_silgen_name("backtrace_symbols_fd")
+private func cBacktraceSymbolsFD(_ buffer: UnsafePointer<UnsafeMutableRawPointer?>, _ size: Int32, _ fd: Int32)
+
+/// 致命的なシグナルの受け口。シグナルの中なので、用意しておいたものを write で書くだけにする
+private func crashSignalHandler(_ sig: Int32) {
+    if crashFD >= 0 {
+        if let m = signalMessages[sig] { _ = m.withUnsafeBytes { write(crashFD, $0.baseAddress, $0.count) } }
+        #if canImport(Darwin)
+        let isMain = pthread_main_np() != 0
+        #else
+        let isMain = false
+        #endif
+        let t = isMain ? mainThreadText : otherThreadText
+        _ = t.withUnsafeBytes { write(crashFD, $0.baseAddress, $0.count) }
+        let n = cBacktrace(backtraceBuffer, backtraceCapacity)
+        cBacktraceSymbolsFD(backtraceBuffer, n, crashFD)
+    }
+    signal(sig, SIG_DFL)
+    raise(sig)
+}
+
+enum CrashLog {
+    private static let lock = NSLock()
+    private static var written = 0
+    static let maxBytes = 2 << 20
+    static let exceptionMark = "【例外】"
+    static let signalMark = "【シグナル】"
+
+    static var folder: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? FileManager.default.temporaryDirectory
+        let dir = base.appendingPathComponent("Vela", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+    static var currentURL: URL { folder.appendingPathComponent("crash-current.txt") }
+    static var previousURL: URL { folder.appendingPathComponent("crash-previous.txt") }
+
+    /// 起動したときに 1 回。前回の記録を移して、新しいファイルを開き、例外とシグナルの受け口を入れる
+    static func start() {
+        lock.lock(); defer { lock.unlock() }
+        if crashFD >= 0 { return }
+        let fm = FileManager.default
+        try? fm.removeItem(at: previousURL)
+        if fm.fileExists(atPath: currentURL.path) { try? fm.moveItem(at: currentURL, to: previousURL) }
+        crashFD = open(currentURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        _ = (signalMessages, mainThreadText, otherThreadText, backtraceBuffer)     // シグナルの中で準備が走らないよう、先に作っておく
+        #if canImport(Darwin)
+        NSSetUncaughtExceptionHandler { e in CrashLog.recordException(e) }
+        #endif
+        _ = cBacktrace(backtraceBuffer, 1)     // 初めて呼ぶときの準備を、シグナルの中ではなくここで済ませておく
+        for s in [SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE] {
+            signal(s, crashSignalHandler)
+        }
+        // ここはもう lock を持っているので、writeLine ではなく writeLineLocked（NSLock は 2 回取ると止まる）
+        writeLineLocked("―― 起動 \(Date()) ――")
+    }
+
+    /// 1 行書く（DevLog から全部の行が来る）
+    static func writeLine(_ s: String) {
+        lock.lock(); defer { lock.unlock() }
+        writeLineLocked(s)
+    }
+
+    /// lock を持っているときに呼ぶ
+    private static func writeLineLocked(_ s: String) {
+        guard crashFD >= 0 else { return }
+        let bytes = Array((s + "\n").utf8)
+        if written + bytes.count > maxBytes {
+            // 大きくなりすぎたら最初から（落ちる直前の分があればよい）
+            _ = ftruncate(crashFD, 0)
+            _ = lseek(crashFD, 0, SEEK_SET)
+            written = 0
+        }
+        _ = bytes.withUnsafeBytes { write(crashFD, $0.baseAddress, $0.count) }
+        written += bytes.count
+    }
+
+    #if canImport(Darwin)
+    static func recordException(_ e: NSException) {
+        var s = "\n\(exceptionMark)\(e.name.rawValue): \(e.reason ?? "（理由なし）")\n"
+        s += e.callStackSymbols.prefix(40).joined(separator: "\n")
+        writeLine(s)
+    }
+    #endif
+
+    /// 前回の記録（最後の lines 行）。無ければ nil
+    static func previous(lines: Int = 300) -> String? {
+        guard let d = try? Data(contentsOf: previousURL), !d.isEmpty else { return nil }
+        let text = String(decoding: d, as: UTF8.self)
+        return text.split(separator: "\n", omittingEmptySubsequences: false).suffix(lines).joined(separator: "\n")
+    }
+
+    /// 前回は落ちて終わったか（例外かシグナルの記録がある）。あれば、その行
+    static func previousCrashSummary() -> String? {
+        guard let p = previous(lines: 2000) else { return nil }
+        let lines = p.split(separator: "\n")
+        return lines.last { $0.contains(exceptionMark) || $0.contains(signalMark) }.map(String.init)
+    }
+}
+
+// ======================================================================
 // MARK: - VNetScheme.swift
 // ======================================================================
 
@@ -55,6 +674,10 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     /// VNet が自分でファイルに書くダウンロードを始めたとき（画面のスレッドで呼ぶ）。
     /// WebKit の WKDownload は使わない（VNetScheme が引き受けた読み込みを WebKit がダウンロードに変えると、アプリが落ちたため）
     var onDownloadStarted: ((VNetDownload) -> Void)?
+    /// 広告ブロックの判定（nil なら調べない）。ページ本体は止めず、サブリソースだけを調べる
+    var blocker: BlockEngineBox?
+    /// 広告ブロックで止めたとき（画面のスレッドで呼ぶ）
+    var onBlocked: ((URL, String) -> Void)?
     /// ダウンロードに変えた要求（WebKit の要求は 204 で終わらせ、中身はファイルに書く）
     private var downloadsInFlight: [Int: VNetDownload] = [:]
 
@@ -129,6 +752,16 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         }
         let body = VNetScheme.body(of: task.request)
         let ctx = context(for: task.request, real: real)
+        // 広告ブロック（サブリソースだけ）。止めたものは通信しない
+        if !ctx.isTopLevel, let blocker {
+            let types = BlockEngine.guessTypes(url: real, accept: task.request.value(forHTTPHeaderField: "Accept"), isTopLevel: false)
+            if let d = blocker.match(url: real, types: types, sourceHost: ctx.initiator?.host ?? ctx.topURL?.host, topHost: ctx.topURL?.host) {
+                log?("🚫 広告ブロック: \(real.absoluteString)（\(d.rule)）")
+                onBlocked?(real, d.rule)
+                task.didFailWithError(NSError(domain: "VelaAdBlock", code: 1, userInfo: [NSLocalizedDescriptionKey: "広告ブロックで止めました"]))
+                return
+            }
+        }
         let id = nextID
         nextID += 1
         // 終わった要求の分は、ときどきまとめて消す（増え続けないように）
@@ -695,388 +1328,5 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         task.didReceive(resp)
         task.didReceive(body)
         task.didFinish()
-    }
-}
-
-// ======================================================================
-// MARK: - HTTPSTakeover.swift
-// ======================================================================
-
-// MARK: - WKWebView の https・http の読み込みを、アプリが引き受けるための仕掛け
-
-/// WKWebView に「https・http も自分で引き受けます」と言えるようにする
-///
-/// 普通は https を setURLSchemeHandler に渡すと「それは WebKit が自分でやる」と止められる（アプリが落ちる）。
-/// WebKit はそれを WKWebView.handlesURLScheme で確かめているので、そこだけ「http・https は扱わない」と答えさせる。
-/// こうすると、ページのアドレスは本物の https://… のまま、読み込みは全部 VNetScheme（自作の通信）に来る。
-/// YouTube やログインのように「アドレスが https か」を確かめるページも、そのまま動く。
-///
-/// 受け入れたリスク（README と開発者パネルにも書く）:
-/// ・WebKit の中の作り（handlesURLScheme の差し替え・_willPerformRedirection:）に頼っている。実行時に確かめても、
-///   WebKit が変われば動かなくなる・落ちる可能性は消せない。App Store に出すアプリには使えない
-/// ・守り: 確かめた iOS の版（testedMajorVersions）だけで使う。差し替えた後の確認に失敗したら、元の実装に戻して標準の通信にする。
-///   設定の「VNet を使わない」で、差し替え自体をしないようにできる
-enum HTTPSTakeover {
-    enum Outcome: Equatable {
-        /// https・http を VNetScheme が引き受けられる
-        case installed
-        /// 設定で VNet を使わない
-        case disabledBySetting
-        /// 確かめていない iOS の版（設定で許せば試す）
-        case untestedOS(Int)
-        /// 差し替えられなかった・確認に失敗した（元に戻した）
-        case failed(String)
-
-        var description: String {
-            switch self {
-            case .installed: return "https の横取り: 成功"
-            case .disabledBySetting: return "https の横取り: 設定で使わない"
-            case .untestedOS(let v): return "https の横取り: 確かめていない iOS \(v) なので使わない（設定で試せます）"
-            case .failed(let why): return "https の横取り: 失敗（\(why)）。元に戻しました"
-            }
-        }
-    }
-
-    /// 動くことを確かめた iOS の版（大きい番号）
-    static let testedMajorVersions = 16...26
-
-    // 1 回目の結果。@MainActor にはしない（NSObject の override init など、隔離の扱いが iPad の Swift で揺れる所から呼ぶため）。
-    // 代わりにロックで守る。WKWebView.handlesURLScheme は Objective-C の API なので、どのスレッドから呼んでもコンパイルは通る
-    private static let lock = NSLock()
-    private static var result: Outcome?
-
-    /// 1 回だけ行う（2 回目からは 1 回目の結果）。画面のスレッドから呼ぶこと
-    static func install() -> Outcome {
-        lock.lock(); defer { lock.unlock() }
-        if let r = result { return r }
-        let r = tryInstall()
-        result = r
-        return r
-    }
-
-    private static func tryInstall() -> Outcome {
-        if VelaSettings.vnetDisabled { return .disabledBySetting }
-        let major = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
-        if !testedMajorVersions.contains(major) && !VelaSettings.allowUntestedOS { return .untestedOS(major) }
-        let sel = NSSelectorFromString("handlesURLScheme:")
-        guard let m = class_getClassMethod(WKWebView.self, sel) else { return .failed("handlesURLScheme: が見つかりません") }
-        let original = method_getImplementation(m)
-        let others = ["data", "blob", "about", "vnets"]
-        let before = others.map { WKWebView.handlesURLScheme($0) }
-        swap(m, sel: sel, original: original)
-        // 差し替えが効いているか・ほかのスキームの答えが変わっていないかを確かめる。だめなら元に戻す
-        let ok = !WKWebView.handlesURLScheme("https") && !WKWebView.handlesURLScheme("http")
-            && others.map({ WKWebView.handlesURLScheme($0) }) == before
-        if !ok {
-            _ = method_setImplementation(m, original)
-            return .failed("差し替えた後の確認に失敗")
-        }
-        return .installed
-    }
-
-    private static func swap(_ m: Method, sel: Selector, original: IMP) {
-        // scheme は nil のこともありうる（Objective-C は nil を止めない）。nil を NSString として受けて触ると、
-        // 不正なメモリアクセスで落ちるので、Optional で受けて、nil は元の実装に任せる
-        typealias Orig = @convention(c) (AnyObject, Selector, NSString?) -> Bool
-        let orig = unsafeBitCast(original, to: Orig.self)
-        let block: @convention(block) (AnyObject, NSString?) -> Bool = { cls, scheme in
-            guard let scheme else { return orig(cls, sel, nil) }
-            let s = (scheme as String).lowercased()
-            if s == "http" || s == "https" { return false }
-            return orig(cls, sel, scheme)
-        }
-        _ = method_setImplementation(m, imp_implementationWithBlock(unsafeBitCast(block, to: AnyObject.self)))
-    }
-}
-
-/// 読み込みの途中の「移動（リダイレクト）」を WebKit に伝える
-///
-/// WKURLSchemeTask の公開の作りには移動を伝える方法が無い。そのままだと、移動先の中身を元のアドレスのまま見せることになり、
-/// 相対リンク・オリジン・クッキーがずれて、ページが壊れたりログインできなかったりする。
-/// WebKit の中にある _willPerformRedirection:newRequest:completionHandler:（iOS 13 から）を使って、本当の移動として伝える。
-/// 無ければ false（そのときは前のやり方: 自分で追いかけて、最後の返事だけ渡す）
-enum SchemeTaskRedirect {
-    private static let selector = NSSelectorFromString("_willPerformRedirection:newRequest:completionHandler:")
-
-    static func isAvailable(_ task: WKURLSchemeTask) -> Bool {
-        class_getInstanceMethod(object_getClass(task), selector) != nil
-    }
-
-    /// 移動を伝える。WebKit が受け入れたら done(次の要求)、やめたら done(nil)
-    static func perform(_ task: WKURLSchemeTask, response: URLResponse, request: NSURLRequest,
-                        done: @escaping (NSURLRequest?) -> Void) -> Bool {
-        guard let m = class_getInstanceMethod(object_getClass(task), selector) else { return false }
-        typealias Fn = @convention(c) (AnyObject, Selector, URLResponse, NSURLRequest, @escaping @convention(block) (NSURLRequest?) -> Void) -> Void
-        let f = unsafeBitCast(method_getImplementation(m), to: Fn.self)
-        let block: @convention(block) (NSURLRequest?) -> Void = { done($0) }
-        f(task as AnyObject, selector, response, request, block)
-        return true
-    }
-}
-
-/// 予備の作りで使う自分用のアドレス: https://… ⇄ vnets://…、http://… ⇄ vnet://…
-enum VNetURL {
-    /// https://… → vnets://…、http://… → vnet://…（vnets・vnet はそのまま）
-    static func toVNet(_ u: URL) -> URL? {
-        guard var c = URLComponents(url: u, resolvingAgainstBaseURL: true) else { return nil }
-        switch c.scheme?.lowercased() {
-        case "https": c.scheme = "vnets"
-        case "http": c.scheme = "vnet"
-        case "vnet", "vnets": break
-        default: return nil
-        }
-        return c.url
-    }
-
-    /// vnets://… → https://…、vnet://… → http://…（https・http はそのまま）
-    static func toReal(_ u: URL) -> URL? {
-        guard var c = URLComponents(url: u, resolvingAgainstBaseURL: true) else { return nil }
-        switch c.scheme?.lowercased() {
-        case "vnets": c.scheme = "https"
-        case "vnet": c.scheme = "http"
-        case "https", "http": return u
-        default: return nil
-        }
-        return c.url
-    }
-
-    /// 自分用のアドレス（vnet://・vnets://）か
-    static func isVNet(_ u: URL) -> Bool { u.scheme?.lowercased().hasPrefix("vnet") ?? false }
-}
-
-// ======================================================================
-// MARK: - PageScripts.swift
-// ======================================================================
-
-// MARK: - ページに入れる小さなスクリプトと、そこから届く知らせ
-
-enum PageScripts {
-    /// JavaScript が使う https:// のアドレスを vnets:// に直す（予備の vnets:// の作りのときだけ使う）
-    static let rewriteURLs = #"""
-    (function () {
-      const map = (u) => {
-        try {
-          if (u == null) return u;
-          const s = String(u);
-          if (/^https:\/\//i.test(s)) return 'vnets://' + s.slice(8);
-          if (/^http:\/\//i.test(s)) return 'vnet://' + s.slice(7);
-          if (s.startsWith('//')) return location.protocol + s;
-          return s;
-        } catch (e) { return u; }
-      };
-      const of = window.fetch;
-      if (of) window.fetch = function (input, init) {
-        if (typeof input === 'string' || input instanceof URL) input = map(input);
-        else if (input && input.url && /^(https?:)?\/\//i.test(input.url)) input = new Request(map(input.url), input);
-        return of.call(this, input, init);
-      };
-      const oo = XMLHttpRequest.prototype.open;
-      XMLHttpRequest.prototype.open = function (m, u, ...rest) { return oo.call(this, m, map(u), ...rest); };
-      const props = [[window.HTMLImageElement, 'src'], [window.HTMLScriptElement, 'src'], [window.HTMLLinkElement, 'href'],
-                     [window.HTMLIFrameElement, 'src'], [window.HTMLSourceElement, 'src'], [window.HTMLMediaElement, 'src']];
-      for (const [C, p] of props) {
-        if (!C) continue;
-        const d = Object.getOwnPropertyDescriptor(C.prototype, p);
-        if (d && d.set) Object.defineProperty(C.prototype, p, { get: d.get, set(v) { d.set.call(this, map(v)); }, configurable: true, enumerable: d.enumerable });
-      }
-      const sa = Element.prototype.setAttribute;
-      Element.prototype.setAttribute = function (n, v) {
-        const ln = String(n).toLowerCase();
-        if (ln === 'src' || ln === 'href' || ln === 'action' || ln === 'poster') v = map(v);
-        else if (ln === 'srcset' && v) v = String(v).replace(/https:\/\//gi, 'vnets://').replace(/http:\/\//gi, 'vnet://');
-        return sa.call(this, n, v);
-      };
-      const wo = window.open;
-      window.open = function (u, ...rest) { return wo.call(this, map(u), ...rest); };
-    })();
-    """#
-
-    /// 知らせの名前（window.webkit.messageHandlers.<この名前>）
-    static let cookieHandlerName = "vnetCookie"
-    /// エラーページのボタン・守りのスクリプトからの知らせ
-    static let actionHandlerName = "velaAction"
-
-    /// JavaScript が Cookie を変えたこと（document.cookie・cookieStore）を、アプリに「合図」だけ知らせる。
-    /// Cookie の中身は送らない・信じない（HttpOnly や Domain を偽れるため）。アプリは合図を受けて、WebKit の置き場（正本）を読み直す
-    static let watchCookies = #"""
-    (function () {
-      try {
-        const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.vnetCookie;
-        if (!h) return;
-        let queued = false;
-        const tell = () => {
-          if (queued) return;
-          queued = true;
-          setTimeout(() => { queued = false; try { h.postMessage({}); } catch (e) {} }, 50);
-        };
-        const d = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
-        if (d && d.set) {
-          Object.defineProperty(Document.prototype, 'cookie', {
-            get: d.get,
-            set(v) { d.set.call(this, v); tell(); },
-            configurable: true, enumerable: d.enumerable
-          });
-        }
-        const cs = window.cookieStore;
-        if (cs && cs.set) {
-          const os = cs.set.bind(cs), od = cs.delete ? cs.delete.bind(cs) : null;
-          cs.set = function (a, b) { const r = os(a, b); Promise.resolve(r).then(tell, tell); return r; };
-          if (od) cs.delete = function (a) { const r = od(a); Promise.resolve(r).then(tell, tell); return r; };
-        }
-      } catch (e) {}
-    })();
-    """#
-
-    /// LAN の保護（WebSocket）: WebSocket は VNet を通らないので、ページの中で止める。
-    /// 公開のサイトのページから、数字の LAN のアドレス・localhost・.local への WebSocket を拒否する。
-    /// 限界: ホスト名で LAN に解決されるものは分からない。スクリプトの守りは、ページに回避される可能性がある
-    static let webSocketGuard = #"""
-    (function () {
-      try {
-        const W = window.WebSocket;
-        if (!W) return;
-        const isLocal = (h) => {
-          h = String(h || '').toLowerCase().replace(/^\[|\]$/g, '');
-          return /^(10|127)\./.test(h) || /^192\.168\./.test(h) || /^169\.254\./.test(h) ||
-                 /^172\.(1[6-9]|2[0-9]|3[01])\./.test(h) || /^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./.test(h) ||
-                 h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') ||
-                 h === '::1' || /^f[cd][0-9a-f]{2}:/.test(h) || /^fe[89ab][0-9a-f]:/.test(h);
-        };
-        let pageLocal = false;
-        try { pageLocal = isLocal(window.top.location.hostname); } catch (e) { pageLocal = isLocal(location.hostname); }
-        if (pageLocal) return;
-        const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.velaAction;
-        const Guarded = function WebSocket(url, protocols) {
-          let host = '';
-          try { host = new URL(url, location.href).hostname; } catch (e) {}
-          if (isLocal(host)) {
-            try { h && h.postMessage({ action: 'blockedWebSocket', url: String(url) }); } catch (e) {}
-            throw new DOMException('Vela: 公開のサイトから LAN への WebSocket は止めました', 'SecurityError');
-          }
-          return protocols === undefined ? new W(url) : new W(url, protocols);
-        };
-        Guarded.prototype = W.prototype;
-        for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) Guarded[k] = W[k];
-        window.WebSocket = Guarded;
-      } catch (e) {}
-    })();
-    """#
-
-    /// VNet を通らない通信（WebSocket）を使ったら、アプリに 1 回だけ知らせる（アドレス欄の札に出す）
-    static let trackNonVNet = #"""
-    (function () {
-      try {
-        const W = window.WebSocket;
-        const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.velaAction;
-        if (!W || !h) return;
-        let told = false;
-        const Tracked = function WebSocket(url, protocols) {
-          if (!told) { told = true; try { h.postMessage({ action: 'usedWebSocket' }); } catch (e) {} }
-          return protocols === undefined ? new W(url) : new W(url, protocols);
-        };
-        Tracked.prototype = W.prototype;
-        for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) Tracked[k] = W[k];
-        window.WebSocket = Tracked;
-      } catch (e) {}
-    })();
-    """#
-
-    /// LAN の保護（標準の通信のタブと WebSocket 用）: WebKit のルールで、LAN でないページから数字の LAN のアドレスなどへの読み込みを止める。
-    /// トップのページが LAN のもの（ユーザーがアドレス欄で開いた機器のページなど）なら止めない。
-    /// WebKit の正規表現は「|」が使えないので、アドレスの範囲ごとに 1 行にする
-    static let localNetworkPatterns: [String] = [
-        #"^[a-z]+://10\."#, #"^[a-z]+://127\."#, #"^[a-z]+://192\.168\."#, #"^[a-z]+://169\.254\."#,
-        #"^[a-z]+://172\.1[6-9]\."#, #"^[a-z]+://172\.2[0-9]\."#, #"^[a-z]+://172\.3[01]\."#,
-        #"^[a-z]+://localhost[:/]"#, #"^[a-z]+://[a-z0-9.-]*\.local[:/]"#,
-        #"^[a-z]+://\[::1\]"#, #"^[a-z]+://\[f[cd]"#, #"^[a-z]+://\[fe[89ab]"#,
-    ]
-
-    static var localNetworkRules: String {
-        let quoted = localNetworkPatterns.map { "\"" + $0.replacingOccurrences(of: "\\", with: "\\\\") + "\"" }
-        let unless = "[" + quoted.joined(separator: ",") + "]"
-        let rules = quoted.map { #"{"trigger":{"url-filter":\#($0),"unless-top-url":\#(unless)},"action":{"type":"block"}}"# }
-        return "[" + rules.joined(separator: ",") + "]"
-    }
-}
-
-/// ページのスクリプト（PageScripts.watchCookies）からの「Cookie が変わったかも」という合図を受ける。
-/// 中身は受け取らない。合図を受けたら onSignal（WebKit の置き場を読み直す）
-final class CookieBridge: NSObject, WKScriptMessageHandler {
-    /// ログ（どのスレッドからでもよい）
-    var log: (@Sendable (String) -> Void)?
-    /// 合図を受けたとき（画面のスレッドで呼ばれる）
-    var onSignal: (() -> Void)?
-    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        let o = message.frameInfo.securityOrigin
-        log?("🍪 ページの JavaScript が Cookie を変えました（\(o.protocol)://\(o.host)\(o.port == 0 ? "" : ":\(o.port)")）")
-        onSignal?()
-    }
-}
-
-/// エラーページのボタン・守りのスクリプトからの知らせを受ける
-final class PageActionBridge: NSObject, WKScriptMessageHandler {
-    /// (中身, メインフレームか, 送ってきたページのオリジン)。画面のスレッドで呼ばれる
-    var onAction: (([String: Any], Bool, String) -> Void)?
-    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard let d = message.body as? [String: Any] else { return }
-        let o = message.frameInfo.securityOrigin
-        onAction?(d, message.frameInfo.isMainFrame, "\(o.protocol)://\(o.host)")
-    }
-}
-
-/// WebKit の Cookie の置き場（正本）と CookieJar（写し）をそろえる
-@MainActor
-final class WebCookieSync: NSObject, WKHTTPCookieStoreObserver {
-    let store: WKHTTPCookieStore
-    let jar: CookieJar
-    var log: (@Sendable (String) -> Void)?
-    private var refreshScheduled = false
-    /// WebKit の置き場に入れている途中の数（その間は写しを作り直さない。入れる前の中身で上書きしないため）
-    private var pushing = 0
-    private var refreshAfterPush = false
-
-    init(store: WKHTTPCookieStore, jar: CookieJar) {
-        self.store = store
-        self.jar = jar
-        super.init()
-        store.add(self)
-        refresh()
-    }
-
-    nonisolated func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
-        Task { @MainActor [weak self] in self?.scheduleRefresh() }
-    }
-
-    /// 少し待ってから読み直す（続けて変わったときに、何度も読まないように）
-    func scheduleRefresh() {
-        if refreshScheduled { return }
-        refreshScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            let me = self
-            Task { @MainActor in
-                me?.refreshScheduled = false
-                me?.refresh()
-            }
-        }
-    }
-
-    func refresh() {
-        if pushing > 0 { refreshAfterPush = true; return }
-        let s = store, j = jar
-        Task { @MainActor in
-            let all = await s.allCookies()
-            j.replaceAll(all.compactMap { CookieRecord(httpCookie: $0) })
-        }
-    }
-
-    /// VNet が受け取った Cookie の変更を、WebKit の置き場にも入れる
-    func apply(_ changes: [CookieChange]) async {
-        pushing += 1
-        for ch in changes {
-            guard let c = ch.record.httpCookie() else { log?("🍪 WebKit に渡せない Cookie: \(ch.record.name)"); continue }
-            if ch.delete { await store.deleteCookie(c) } else { await store.setCookie(c) }
-        }
-        pushing -= 1
-        if pushing == 0 && refreshAfterPush { refreshAfterPush = false; refresh() }
     }
 }

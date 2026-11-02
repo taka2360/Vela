@@ -150,11 +150,12 @@ open class WKContentRuleList: NSObject {
 }
 
 open class WKContentRuleListStore: NSObject {
-    open class func `default`() -> WKContentRuleListStore { WKContentRuleListStore() }
+    open class func `default`() -> WKContentRuleListStore! { WKContentRuleListStore() }
     open func compileContentRuleList(forIdentifier identifier: String?, encodedContentRuleList: String?,
                                      completionHandler: @escaping (WKContentRuleList?, Error?) -> Void) {}
     open func lookUpContentRuleList(forIdentifier identifier: String?, completionHandler: @escaping (WKContentRuleList?, Error?) -> Void) {}
     open func removeContentRuleList(forIdentifier identifier: String?, completionHandler: @escaping (Error?) -> Void) {}
+    open func getAvailableContentRuleListIdentifiers(_ completionHandler: @escaping ([String]?) -> Void) {}
 }
 
 open class WKUserContentController: NSObject {

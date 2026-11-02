@@ -21,3 +21,6 @@ ErrorPages.swift
 DownloadFiles.swift
 CrashLog.swift
 LibraryModel.swift
+ABPFilter.swift
+BlockEngine.swift
+ContentBlocker.swift

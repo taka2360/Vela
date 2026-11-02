@@ -20,14 +20,15 @@ Android エミュレータと同じ「仮想 LAN カード（virtio-net）」と
 1. 新しい「App」を作る
 2. 最初からある ContentView.swift と MyApp.swift を消す（または中身をこのフォルダのものに入れ替える）
 3. このフォルダの .swift ファイルを全部入れる
-   画面: MyApp / BrowserView / BrowserControls / TabViews / LibraryView / DevPanel / Downloads / DownloadFiles / BrowserStore / BrowserTab / Library / LibraryModel / AddressInput / ErrorPages / Persistence / DevLog / CrashLog
+   画面: MyApp / BrowserView / BrowserControls / TabViews / LibraryView / DevPanel / AdBlockView / Downloads / DownloadFiles / BrowserStore / BrowserTab / Library / LibraryModel / AddressInput / ErrorPages / Persistence / DevLog / CrashLog
    VNet と WebKit: VNetScheme / HTTPSTakeover / PageScripts
    守り: NetPolicy / CookieJar / HSTSStore
+   広告ブロック: FilterLists / ABPFilter / BlockEngine / ContentBlocker
    http: HTTPClient / HTTPResponseParser / HTTPSupport / TLSClient
    TCP/IP: GuestStack / GuestTCP / DNSMessage / Packet
    カード: VNetMachine / VNetCore / VNetDriver
    ルーター: UserNet / UserNetApple
-   （全部で 36 ファイル。まとめたものを使うなら VelaParts フォルダの Vela1〜10.swift の 10 個だけを入れる）
+   （全部で 41 ファイル。まとめたものを使うなら VelaParts フォルダの Vela1〜10.swift の 10 個だけを入れる）
    ※ 1 つにまとめた VelaAll.swift は大きすぎて、Playgrounds が「Timed out waiting for a thunk to build after 30.0 seconds」
      で止まることがあります（1 つのファイルを作るのに 30 秒を超える）。そのときは VelaParts の 10 個を使ってください
 4. 実行して、アドレスに https://example.com/ などを入れて「開く」
@@ -50,6 +51,7 @@ Android エミュレータと同じ「仮想 LAN カード（virtio-net）」と
 ・ブックマークと履歴: ツールバーの本のボタン・「…」メニュー・⌘⌥B / ⌘Y。新しいタブにはブックマークとよく見るサイトが出ます。アドレス欄に打つと候補が出ます
 ・アドレス欄の左の「ぁあ」: 文字の大きさ（サイトごとに覚える）・ページ内を検索・ブックマーク・共有・通信の切り替え
 ・キーボード: ⌘L アドレス欄 / ⌘T・⌘W タブを開く・閉じる / ⌘⇧T 閉じたタブ / ⌘⇧[ ] ・⌃Tab タブの移動 / ⌘1〜9 / ⌘F 検索 / ⌘D ブックマーク / ⌘+ ⌘- ⌘0 文字の大きさ / ⌘R / ⌘. / ⌘[ ] 戻る・進む / ⌘⌥I 開発者パネル
+・広告ブロック: EasyList・EasyPrivacy・AdGuard Japanese（4 日ごとに自動で更新。URL で足せる）。VNet のタブは Vela が通信を 1 つずつ調べて止め、数を出します。標準の通信のタブは WebKit のルールで止めます。「ぁあ」でサイトごとに止められます。設定は「…」→ 広告ブロック
 
 VNet の対応範囲
   VNet が読むもの: ページ本体と部品の http / https（HTTP/1.1）、fetch・XMLHttpRequest、リダイレクト

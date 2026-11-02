@@ -17,6 +17,323 @@ import Security
 #endif
 
 // ======================================================================
+// MARK: - CookieJar.swift
+// ======================================================================
+
+// MARK: - Cookie の写し（正本は WebKit の WKHTTPCookieStore）
+//
+// ・正本は WebKit の置き場だけ。ここはその写しで、VNet が要求を送るとき（vnet-guest のキュー）に、待たずに読めるようにするためのもの
+// ・WebKit の置き場が変わったら（WKHTTPCookieStoreObserver）、写しを作り直す（replaceAll）。この同期は WebCookieSync（PageScripts.swift）がやる
+// ・VNet の応答の Set-Cookie は、CookiePolicy で許されたものだけを写しに入れて、変更（CookieChange）として返す。
+//   呼んだ側が WebKit の置き場にも入れる（入れ終わってから、ページに返事を渡す）
+// ・ページの JavaScript から届く「Cookie の文字列」は、一切ここに入れない（HttpOnly や Domain を偽れるため）
+
+/// 写しの変更（WebKit の置き場にも同じことをする）
+struct CookieChange: Sendable {
+    var record: CookieRecord
+    /// true なら消す
+    var delete: Bool
+}
+
+final class CookieJar: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cookies: [String: CookieRecord] = [:]
+    private var _settings = CookiePolicy.Settings()
+    /// ログ（どのスレッドからでもよい）
+    var log: (@Sendable (String) -> Void)?
+
+    init() {}
+
+    var settings: CookiePolicy.Settings {
+        get { lock.lock(); defer { lock.unlock() }; return _settings }
+        set { lock.lock(); _settings = newValue; lock.unlock() }
+    }
+
+    var count: Int { lock.lock(); defer { lock.unlock() }; return cookies.count }
+
+    func snapshot() -> [CookieRecord] {
+        lock.lock(); defer { lock.unlock() }
+        return Array(cookies.values)
+    }
+
+    /// 送る Cookie ヘッダ（送らないものがあれば理由も返す）
+    func header(for url: URL, method: String, ctx: RequestContext, now: Date = Date()) -> (header: String?, skipped: [(String, String)]) {
+        lock.lock()
+        let all = Array(cookies.values)
+        let s = _settings
+        lock.unlock()
+        let (send, skipped) = CookiePolicy.cookiesToSend(all, url: url, method: method, ctx: ctx, settings: s, now: now)
+        return (CookiePolicy.header(send), skipped)
+    }
+
+    /// 応答の Set-Cookie を受け取る。許されたものを写しに入れ、変更を返す
+    func receive(_ lines: [String], url: URL, method: String, ctx: RequestContext, now: Date = Date()) -> [CookieChange] {
+        var changes: [CookieChange] = []
+        let s = settings
+        for (i, line) in lines.enumerated() {
+            // 同じ返事の中の Cookie は、届いた順に作られたことにする（送る順番が毎回変わらないように、1 マイクロ秒ずつずらす）
+            switch SetCookieParser.parse(line, url: url, now: now.addingTimeInterval(Double(i) * 1e-6)) {
+            case .rejected(let why):
+                log?("🍪✕ 受け取らない（\(SiteUtil.host(of: url) ?? "")）: \(why)")
+            case .cookie(var rec):
+                if let why = CookiePolicy.storeDecision(rec, url: url, method: method, ctx: ctx, settings: s) {
+                    log?("🍪✕ 保存しない \(rec.name)（\(rec.domain)）: \(why)")
+                    continue
+                }
+                lock.lock()
+                if rec.isExpired(now) {
+                    let old = cookies.removeValue(forKey: rec.key)
+                    lock.unlock()
+                    changes.append(CookieChange(record: old ?? rec, delete: true))
+                    continue
+                }
+                // 置き換えるときは、最初に作られた時刻を引き継ぐ（RFC 6265 5.3 の 11.3）
+                if let old = cookies[rec.key] { rec.created = old.created }
+                cookies[rec.key] = rec
+                lock.unlock()
+                changes.append(CookieChange(record: rec, delete: false))
+            }
+        }
+        return changes
+    }
+
+    /// WebKit の置き場の中身で写しを作り直す。作られた時刻と、WebKit が覚えていない SameSite は、前の写しから引き継ぐ
+    func replaceAll(_ records: [CookieRecord], now: Date = Date()) {
+        lock.lock()
+        var next: [String: CookieRecord] = [:]
+        for var r in records where !r.isExpired(now) {
+            if let old = cookies[r.key] {
+                r.created = old.created
+                if r.sameSite == .unspecified { r.sameSite = old.sameSite }
+            }
+            next[r.key] = r
+        }
+        cookies = next
+        lock.unlock()
+    }
+
+    func removeAll() {
+        lock.lock(); cookies = [:]; lock.unlock()
+    }
+}
+
+// MARK: - HTTPCookie との変換
+
+extension CookieRecord {
+    private static let httpOnlyKey = HTTPCookiePropertyKey("HttpOnly")
+    private static let sameSiteKey = HTTPCookiePropertyKey("SameSite")
+
+    /// WebKit の置き場の HTTPCookie から作る（作られた時刻は分からないので now）
+    init?(httpCookie c: HTTPCookie, now: Date = Date()) {
+        var d = c.domain.lowercased()
+        let hostOnly = !d.hasPrefix(".")
+        while d.hasPrefix(".") { d.removeFirst() }
+        if d.isEmpty { return nil }
+        var ss = SameSite.unspecified
+        #if canImport(Darwin)
+        if let p = c.sameSitePolicy {
+            if p == .sameSiteStrict { ss = .strict } else if p == .sameSiteLax { ss = .lax } else if p.rawValue.lowercased() == "none" { ss = .none }
+        }
+        #else
+        if let p = c.properties?[CookieRecord.sameSiteKey] as? String {
+            switch p.lowercased() { case "strict": ss = .strict; case "lax": ss = .lax; case "none": ss = .none; default: break }
+        }
+        #endif
+        self.init(name: c.name, value: c.value, domain: SiteUtil.normalizeHost(d), hostOnly: hostOnly, path: c.path.isEmpty ? "/" : c.path,
+                  secure: c.isSecure, httpOnly: c.isHTTPOnly, sameSite: ss, expires: c.expiresDate, created: now)
+    }
+
+    /// WebKit の置き場に入れる HTTPCookie にする
+    func httpCookie() -> HTTPCookie? {
+        var p: [HTTPCookiePropertyKey: Any] = [.name: name, .value: value, .path: path]
+        if hostOnly {
+            // Domain 属性なし（このホストだけ）: 先頭に「.」を付けない
+            p[.domain] = domain
+        } else {
+            p[.domain] = "." + domain
+        }
+        if secure { p[.secure] = "TRUE" }
+        if let e = expires { p[.expires] = e } else { p[.discard] = "TRUE" }
+        if httpOnly { p[CookieRecord.httpOnlyKey] = "TRUE" }
+        #if canImport(Darwin)
+        switch sameSite {
+        case .strict: p[.sameSitePolicy] = HTTPCookieStringPolicy.sameSiteStrict
+        case .lax: p[.sameSitePolicy] = HTTPCookieStringPolicy.sameSiteLax
+        case .none, .unspecified: break
+        }
+        #else
+        switch sameSite {
+        case .strict: p[CookieRecord.sameSiteKey] = "strict"
+        case .lax: p[CookieRecord.sameSiteKey] = "lax"
+        case .none, .unspecified: break
+        }
+        #endif
+        return HTTPCookie(properties: p)
+    }
+}
+
+// ======================================================================
+// MARK: - HSTSStore.swift
+// ======================================================================
+
+// MARK: - HSTS（「このサイトは https だけで開く」の記録）
+//
+// 決まり（README と開発者パネルにも書く）:
+//  ・VNet が受け取った https の応答で、トップレベルかファーストパーティ（トップと同じサイト）のものからだけ登録する
+//    （サードパーティの応答・http の応答・数字のアドレスのホストは無視する。サードパーティから登録させると、追跡に使えてしまう）
+//  ・max-age で期限を決める。max-age=0 は消す。includeSubDomains に対応
+//  ・ホスト名は SiteUtil.normalizeHost でそろえる
+//  ・Application Support に保存する（期限切れは読み込むときに消す。最大 maxEntries 件。あふれたら期限の近いものから消す）
+//  ・使い道: http:// への移動とリダイレクトを https に上げる
+
+struct HSTSEntry: Codable, Equatable, Sendable {
+    var host: String
+    var expires: Date
+    var includeSubDomains: Bool
+}
+
+enum HSTSPolicy {
+    /// Strict-Transport-Security の値を読む。読めなければ nil
+    static func parse(_ header: String) -> (maxAge: Int, includeSubDomains: Bool)? {
+        var maxAge: Int?
+        var sub = false
+        var seen = Set<String>()
+        for raw in header.split(separator: ";") {
+            let d = raw.trimmingCharacters(in: .whitespaces)
+            if d.isEmpty { continue }
+            let k: String, v: String
+            if let eq = d.firstIndex(of: "=") {
+                k = d[..<eq].trimmingCharacters(in: .whitespaces).lowercased()
+                v = d[d.index(after: eq)...].trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            } else {
+                k = d.lowercased(); v = ""
+            }
+            if !seen.insert(k).inserted { return nil }     // 同じ指示が 2 回あるものは無効（RFC 6797）
+            switch k {
+            case "max-age":
+                guard let n = Int(v), n >= 0 else { return nil }
+                maxAge = n
+            case "includesubdomains": sub = true
+            default: break
+            }
+        }
+        guard let m = maxAge else { return nil }
+        return (m, sub)
+    }
+
+    /// この応答から登録してよいか
+    static func mayRecord(url: URL, ctx: RequestContext) -> Bool {
+        guard url.scheme?.lowercased() == "https", let h = SiteUtil.host(of: url), !SiteUtil.isIPLiteral(h) else { return false }
+        if ctx.isTopLevel { return true }
+        guard let top = ctx.topURL else { return false }
+        return SiteUtil.isSameSite(top, url)
+    }
+}
+
+/// HSTS の記録（どのスレッドからでも使える）
+final class HSTSStore: @unchecked Sendable {
+    static let maxEntries = 5000
+    private let lock = NSLock()
+    private var entries: [String: HSTSEntry] = [:]
+    private let fileURL: URL?
+    private var saveScheduled = false
+    private let saveQueue = DispatchQueue(label: "vela-hsts-save")
+    /// ログ（どのスレッドからでもよい）
+    var log: (@Sendable (String) -> Void)?
+
+    /// fileURL が nil なら保存しない（テスト用）
+    init(fileURL: URL?, now: Date = Date()) {
+        self.fileURL = fileURL
+        if let f = fileURL, let d = try? Data(contentsOf: f), let list = try? JSONDecoder().decode([HSTSEntry].self, from: d) {
+            for e in list where e.expires > now { entries[e.host] = e }
+        }
+    }
+
+    /// 既定の置き場（Application Support/Vela/hsts.json）
+    static func defaultFileURL() -> URL? {
+        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+        let dir = base.appendingPathComponent("Vela", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("hsts.json")
+    }
+
+    /// このホストを https に上げるべきか
+    func shouldUpgrade(_ host: String, now: Date = Date()) -> Bool {
+        let h = SiteUtil.normalizeHost(host)
+        if SiteUtil.isIPLiteral(h) { return false }
+        lock.lock(); defer { lock.unlock() }
+        if let e = entries[h], e.expires > now { return true }
+        // 親のドメインが includeSubDomains で登録されているか
+        var labels = h.split(separator: ".")
+        while labels.count > 1 {
+            labels.removeFirst()
+            if let e = entries[labels.joined(separator: ".")], e.includeSubDomains, e.expires > now { return true }
+        }
+        return false
+    }
+
+    /// 応答の Strict-Transport-Security を記録する（mayRecord を満たすときだけ）
+    func record(header: String, url: URL, ctx: RequestContext, now: Date = Date()) {
+        guard HSTSPolicy.mayRecord(url: url, ctx: ctx), let h = SiteUtil.host(of: url) else { return }
+        guard let (maxAge, sub) = HSTSPolicy.parse(header) else { log?("HSTS の値が読めません（\(h)）: \(header)"); return }
+        lock.lock()
+        var changed = false
+        if maxAge == 0 {
+            changed = entries.removeValue(forKey: h) != nil
+        } else {
+            let e = HSTSEntry(host: h, expires: now.addingTimeInterval(TimeInterval(maxAge)), includeSubDomains: sub)
+            let old = entries[h]
+            entries[h] = e
+            // 期限が少し延びただけなら保存しない（毎回書くと重い）
+            changed = old == nil || old!.includeSubDomains != sub || abs(old!.expires.timeIntervalSince(e.expires)) > 86400
+            if entries.count > HSTSStore.maxEntries {
+                let drop = entries.values.sorted { $0.expires < $1.expires }.prefix(entries.count - HSTSStore.maxEntries)
+                for d in drop { entries[d.host] = nil }
+            }
+        }
+        lock.unlock()
+        if changed {
+            log?(maxAge == 0 ? "HSTS を消しました: \(h)" : "HSTS を記録: \(h)（\(maxAge / 86400) 日\(sub ? "・サブドメインも" : "")）")
+            scheduleSave()
+        }
+    }
+
+    func all() -> [HSTSEntry] {
+        lock.lock(); defer { lock.unlock() }
+        return entries.values.sorted { $0.host < $1.host }
+    }
+
+    func remove(_ host: String) {
+        lock.lock(); entries[SiteUtil.normalizeHost(host)] = nil; lock.unlock()
+        scheduleSave()
+    }
+
+    func removeAll() {
+        lock.lock(); entries = [:]; lock.unlock()
+        scheduleSave()
+    }
+
+    /// まとめて 2 秒後に書く
+    private func scheduleSave() {
+        guard fileURL != nil else { return }
+        lock.lock()
+        if saveScheduled { lock.unlock(); return }
+        saveScheduled = true
+        lock.unlock()
+        saveQueue.asyncAfter(deadline: .now() + 2) { [weak self] in self?.saveNow() }
+    }
+
+    func saveNow() {
+        guard let f = fileURL else { return }
+        lock.lock()
+        saveScheduled = false
+        let list = Array(entries.values)
+        lock.unlock()
+        if let d = try? JSONEncoder().encode(list) { try? d.write(to: f, options: .atomic) }
+    }
+}
+
+// ======================================================================
 // MARK: - HTTPClient.swift
 // ======================================================================
 
@@ -729,257 +1046,5 @@ final class HTTPPool: @unchecked Sendable {
         }
         headers.removeAll(named: ["transfer-encoding"])
         return .success(HTTPResult(status: p.status, headers: headers, body: body, url: url, cookieChanges: changes))
-    }
-}
-
-// ======================================================================
-// MARK: - HTTPResponseParser.swift
-// ======================================================================
-
-// MARK: - http の返事を少しずつ読む
-//
-// ヘッダ → 中身。中身の終わりは「長さ指定（Content-Length）」「chunked」「閉じるまで」のどれか。
-// 100 Continue などの途中の返事は読み飛ばす。
-//
-// 外から来るデータなので、おかしなものは「壊れている（malformed）」「大きすぎる（tooLarge）」として止める（落ちない・貯めすぎない）:
-//  ・Content-Length は 0 以上の整数だけ。違う値が重複していたら拒否（同じ値の重複は 1 つにまとめる）
-//  ・Transfer-Encoding と Content-Length が両方あったら拒否（中身の境目があいまいになり、取り違えの元になるため）
-//  ・chunked: サイズは 16 進の数字だけ。チャンクの後ろは必ず CRLF。行・トレーラーの長さに上限
-//  ・ヘッダの合計・1 行・行数に上限。中身は limits.maxBody まで
-// 止めた接続は使い回さない（呼ぶ側の HTTPConn が閉じる）
-//
-// 流す形（ストリーミング）: ヘッダを読んだところで decideStreaming が true を返したら、中身は貯めずに
-// 届いた分ずつ onChunk に渡す（大きいファイル・動画でメモリを使わない）。そのときは maxBody の上限はかけない
-
-final class ResponseParser {
-    struct Limits {
-        var maxHeaderBytes = 64 * 1024
-        var maxHeaderLine = 8 * 1024
-        var maxHeaderCount = 100
-        var maxBody = 32 << 20
-        var maxChunkLine = 1024
-        var maxTrailerBytes = 8 * 1024
-        init() {}
-    }
-
-    enum Failure: Equatable {
-        case malformed(String)
-        case tooLarge(String)
-        var description: String {
-            switch self {
-            case .malformed(let s): return "返事が壊れています（\(s)）"
-            case .tooLarge(let s): return "返事が大きすぎます（\(s)）"
-            }
-        }
-    }
-
-    let isHead: Bool
-    let limits: Limits
-    private(set) var status = 0
-    private(set) var headers: [(String, String)] = []
-    private(set) var body = [UInt8]()
-    private(set) var complete = false
-    private(set) var keepAlive = true
-    /// 届いたバイト数（何も届かずに切れたかを見るため）
-    private(set) var received = 0
-    /// おかしな返事だった（nil なら問題なし）
-    private(set) var failure: Failure?
-    /// 中身が増えたとき（増えたバイト数）。アプリ全体の貯めている量を数えるのに使う（流す形のときは呼ばない）
-    var onBodyGrow: ((Int) -> Void)?
-    /// ヘッダを読み終えたとき（100 Continue などを除く）。true を返すと、中身を流す形にする
-    var decideStreaming: (() -> Bool)?
-    /// 流す形のときの中身（届いた分ずつ）
-    var onChunk: ((Data) -> Void)?
-    /// 流す形にしたか
-    private(set) var streaming = false
-    /// 受け取った中身のバイト数（流す形でも数える）
-    private(set) var bodyCount = 0
-
-    private var head = [UInt8]()
-    private var headDone = false
-    private enum Mode { case length(Int), chunked, untilClose }
-    private var mode = Mode.untilClose
-    private enum Chunk { case size, data(Int), cr, lf, trailer }
-    private var chunk = Chunk.size
-    private var line = [UInt8]()
-    private var trailerBytes = 0
-
-    init(isHead: Bool, limits: Limits = Limits()) {
-        self.isHead = isHead
-        self.limits = limits
-    }
-
-    func feed(_ d: Data) {
-        received += d.count
-        var bytes = [UInt8](d)
-        while !complete && failure == nil && !bytes.isEmpty {
-            if headDone {
-                bytes = consumeBody(bytes)
-                continue
-            }
-            head.append(contentsOf: bytes)
-            guard let end = findHeadEnd() else {
-                if head.count > limits.maxHeaderBytes { fail(.tooLarge("ヘッダが \(limits.maxHeaderBytes / 1024)KB を超えています")) }
-                return
-            }
-            if end > limits.maxHeaderBytes { fail(.tooLarge("ヘッダが \(limits.maxHeaderBytes / 1024)KB を超えています")); return }
-            bytes = Array(head[(end + 4)...])
-            let headBytes = Array(head[0..<end])
-            head = []
-            parseHead(headBytes)
-            if failure != nil { return }
-            if status >= 100 && status < 200 { headDone = false }     // 100 Continue など: 次のヘッダを読む
-        }
-    }
-
-    /// 相手が閉じた: 「閉じるまで」の形なら、ここで終わり
-    func closed() -> Bool {
-        if complete { return true }
-        if failure != nil { return false }
-        if headDone, case .untilClose = mode { complete = true; keepAlive = false; return true }
-        return false
-    }
-
-    private func fail(_ f: Failure) {
-        if failure == nil { failure = f }
-        keepAlive = false
-    }
-
-    private func findHeadEnd() -> Int? {
-        if head.count < 4 { return nil }
-        for i in 0...(head.count - 4) where head[i] == 13 && head[i + 1] == 10 && head[i + 2] == 13 && head[i + 3] == 10 { return i }
-        return nil
-    }
-
-    private func appendBody<C: Collection>(_ b: C) where C.Element == UInt8 {
-        if b.isEmpty { return }
-        if streaming {
-            bodyCount += b.count
-            onChunk?(Data(b))
-            return
-        }
-        if body.count + b.count > limits.maxBody {
-            fail(.tooLarge("中身が \(limits.maxBody >> 20)MB を超えています"))
-            return
-        }
-        body.append(contentsOf: b)
-        bodyCount += b.count
-        onBodyGrow?(b.count)
-    }
-
-    private func parseHead(_ headBytes: [UInt8]) {
-        headDone = true
-        var lines = String(decoding: headBytes, as: UTF8.self).components(separatedBy: "\r\n")
-        let first = lines.removeFirst()
-        // 状態の行: "HTTP/1.1 200 OK"
-        let parts = first.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: false)
-        guard parts.count >= 2, parts[0].hasPrefix("HTTP/1."), parts[1].count == 3, let st = Int(parts[1]), (100...599).contains(st) else {
-            fail(.malformed("状態の行が読めません: \(first.prefix(60))")); return
-        }
-        status = st
-        if lines.count > limits.maxHeaderCount { fail(.tooLarge("ヘッダが \(limits.maxHeaderCount) 行を超えています")); return }
-        var hs: [(String, String)] = []
-        for l in lines {
-            if l.utf8.count > limits.maxHeaderLine { fail(.tooLarge("ヘッダの 1 行が \(limits.maxHeaderLine / 1024)KB を超えています")); return }
-            if l.isEmpty { continue }
-            guard let c = l.firstIndex(of: ":") else {
-                if l.first == " " || l.first == "\t" { fail(.malformed("折り返したヘッダ（obs-fold）")); return }
-                continue
-            }
-            let name = String(l[..<c])
-            if name.isEmpty || name.contains(" ") || name.contains("\t") { fail(.malformed("ヘッダの名前が不正: \(name.prefix(40))")); return }
-            hs.append((name, String(l[l.index(after: c)...]).trimmingCharacters(in: .whitespaces)))
-        }
-        headers = hs
-        let conn = headers.value(for: "Connection")?.lowercased() ?? ""
-        keepAlive = first.hasPrefix("HTTP/1.0") ? conn.contains("keep-alive") : !conn.contains("close")
-        if status >= 100 && status < 200 { return }
-
-        // 中身の長さの決め方
-        let te = headers.values(for: "Transfer-Encoding")
-        let cls = headers.values(for: "Content-Length")
-        if !te.isEmpty && !cls.isEmpty { fail(.malformed("Transfer-Encoding と Content-Length が両方あります")); return }
-        var length: Int?
-        if !cls.isEmpty {
-            var values = Set<String>()
-            for v in cls { for p in v.split(separator: ",", omittingEmptySubsequences: false) { values.insert(p.trimmingCharacters(in: .whitespaces)) } }
-            guard values.count == 1, let v = values.first, !v.isEmpty, v.count <= 18, v.allSatisfy({ $0.isASCII && $0.isNumber }), let n = Int(v) else {
-                fail(.malformed("Content-Length が不正: \(cls.joined(separator: " / ").prefix(60))")); return
-            }
-            length = n
-        }
-        if isHead || status == 204 || status == 304 { complete = true; return }
-        streaming = decideStreaming?() ?? false
-        if !te.isEmpty {
-            let codings = te.joined(separator: ",").lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-            if codings.last == "chunked" { mode = .chunked }
-            else { mode = .untilClose; keepAlive = false }          // chunked で終わらないなら、閉じるまで（RFC 9112 6.3）
-        } else if let n = length {
-            if n > limits.maxBody && !streaming { fail(.tooLarge("Content-Length が \(limits.maxBody >> 20)MB を超えています（\(n)）")); return }
-            mode = .length(n)
-            if n == 0 { complete = true }
-        } else {
-            mode = .untilClose; keepAlive = false
-        }
-    }
-
-    /// 中身を読む。余り（次の返事の分。普通は無い）を返す
-    private func consumeBody(_ b: [UInt8]) -> [UInt8] {
-        switch mode {
-        case .untilClose:
-            appendBody(b)
-            return []
-        case .length(let n):
-            let take = min(max(n - bodyCount, 0), b.count)
-            appendBody(b[0..<take])
-            if bodyCount >= n { complete = true }
-            return Array(b[take...])
-        case .chunked:
-            var i = 0
-            while i < b.count && !complete && failure == nil {
-                switch chunk {
-                case .size, .trailer:
-                    let c = b[i]; i += 1
-                    if c != 10 {
-                        line.append(c)
-                        if case .trailer = chunk {
-                            trailerBytes += 1
-                            if trailerBytes > limits.maxTrailerBytes { fail(.tooLarge("トレーラーが \(limits.maxTrailerBytes / 1024)KB を超えています")) }
-                        } else if line.count > limits.maxChunkLine {
-                            fail(.malformed("チャンクのサイズの行が長すぎます"))
-                        }
-                        continue
-                    }
-                    if line.last == 13 { line.removeLast() }
-                    let text = String(decoding: line, as: UTF8.self)
-                    line = []
-                    if case .trailer = chunk {
-                        if text.isEmpty { complete = true }
-                    } else {
-                        let sizeText = (text.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? "")
-                            .trimmingCharacters(in: CharacterSet(charactersIn: " \t"))
-                        guard !sizeText.isEmpty, sizeText.count <= 16, sizeText.allSatisfy({ $0.isHexDigit }), let n = Int(sizeText, radix: 16) else {
-                            fail(.malformed("チャンクのサイズが不正: \(sizeText.prefix(20))")); break
-                        }
-                        if !streaming && n > limits.maxBody - body.count { fail(.tooLarge("チャンクが大きすぎます（\(n)）")); break }
-                        chunk = n == 0 ? .trailer : .data(n)
-                    }
-                case .data(let remain):
-                    let take = min(remain, b.count - i)
-                    appendBody(b[i..<(i + take)])
-                    i += take
-                    chunk = remain - take == 0 ? .cr : .data(remain - take)
-                case .cr:                                     // 中身のあとの \r\n（必ずこの 2 バイト）
-                    guard b[i] == 13 else { fail(.malformed("チャンクの後ろが CRLF ではありません")); break }
-                    i += 1
-                    chunk = .lf
-                case .lf:
-                    guard b[i] == 10 else { fail(.malformed("チャンクの後ろが CRLF ではありません")); break }
-                    i += 1
-                    chunk = .size
-                }
-            }
-            return Array(b[min(i, b.count)...])
-        }
     }
 }

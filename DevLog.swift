@@ -119,6 +119,7 @@ final class DevLog: @unchecked Sendable {
             : m.hasPrefix("⚠") ? .warning : .info
         let category: LogCategory
         if m.hasPrefix("🍪") { category = .cookie }
+        else if m.hasPrefix("🚫") { category = .block }
         else if m.hasPrefix("🛡") || m.hasPrefix("🔒") || m.contains("HSTS") || m.contains("横取り") { category = .security }
         else if m.hasPrefix("✓") || m.hasPrefix("✕") || m.hasPrefix("↪") || m.hasPrefix("――") { category = .net }
         else if m.hasPrefix("→") || m.hasPrefix("←") || m.contains("TLS") || m.contains("DHCP") || m.contains("カード")

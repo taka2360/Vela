@@ -17,93 +17,129 @@ import Security
 #endif
 
 // ======================================================================
-// MARK: - DevPanel.swift
+// MARK: - AdBlockView.swift
 // ======================================================================
 
-// MARK: - 開発者パネル（簡易版。完成版はフェーズ G）
-//
-// 通信の様子・タブごとの状態・ログ。普段の画面とは分けて、「…」メニューから開く
+// MARK: - 広告ブロックの設定（「…」メニューから）
 
-struct DevPanel: View {
-    @ObservedObject var store: BrowserStore
+struct AdBlockView: View {
+    @ObservedObject var adblock: AdBlocker
     @Environment(\.dismiss) private var dismiss
+    @State private var customURL = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(spacing: 0) {
             HStack {
-                Text("開発者パネル").font(.headline)
+                Text("広告ブロック").font(.headline)
                 Spacer()
-                Button("ログをコピー") { UIPasteboard.general.string = store.logs.export() }
-                Button(store.hadCrash ? "前回の記録をコピー（落ちた）" : "前回の記録をコピー") {
-                    UIPasteboard.general.string = CrashLog.previous() ?? "（前回の記録はありません）"
+                Button("完了") { dismiss() }
+            }
+            .padding()
+            List {
+                Section {
+                    Toggle("広告とトラッカーをブロックする", isOn: enabledBinding)
+                    AdBlockStatusRow(adblock: adblock)
                 }
-                .padding(.leading, 12)
-                Button("閉じる") { dismiss() }.padding(.leading, 12)
+                Section {
+                    ForEach(adblock.lists) { l in
+                        FilterListRow(adblock: adblock, list: l)
+                    }
+                    .onDelete { idx in
+                        let ids = idx.map { adblock.lists[$0] }.filter { !$0.builtIn }.map { $0.id }
+                        for id in ids { adblock.removeList(id) }
+                    }
+                    HStack {
+                        TextField("リストの URL を足す（https://…）", text: $customURL)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                            .keyboardType(.URL)
+                        Button("追加") {
+                            adblock.addCustom(customURL)
+                            customURL = ""
+                        }
+                        .disabled(customURL.isEmpty || adblock.busy)
+                    }
+                } header: {
+                    Text("リスト（4 日ごとに自動で更新）")
+                }
+                if !adblock.disabledSites.isEmpty {
+                    Section {
+                        ForEach(adblock.disabledSites.sorted(), id: \.self) { h in Text(h) }
+                            .onDelete { idx in
+                                let sites = adblock.disabledSites.sorted()
+                                for i in idx { adblock.removeDisabledSite(sites[i]) }
+                            }
+                    } header: {
+                        Text("広告ブロックを止めているサイト")
+                    }
+                }
+                Section {
+                    Text(AdBlockView.notes).font(.system(size: 12)).foregroundStyle(.secondary)
+                } header: {
+                    Text("しくみと制限")
+                }
             }
-            DevStatus(store: store)
-            DevTabList(store: store)
-            DevLogView(text: store.logText)
+            .listStyle(.insetGrouped)
         }
-        .padding()
+    }
+
+    private var enabledBinding: Binding<Bool> {
+        Binding(get: { adblock.enabled }, set: { adblock.setEnabled($0) })
+    }
+
+    static let notes = """
+    ・VNet のタブ: 通信は Vela が 1 つずつ調べて止めます（止めた数をアドレス欄に出し、開発者パネルのログに記録します）。広告の枠を隠すのは WebKit のルールです。
+    ・標準の通信のタブ: 通信も枠を隠すのも WebKit のルールで止めます（止めた数は数えられません）。
+    ・ページそのもの（アドレス欄で開くページ）は止めません。
+    ・対応しない書き方（スクリプトを使うもの・正規表現・$redirect など）は読み飛ばします。リストの行の「対応外」がその数です。
+    ・リストのダウンロードは標準の通信で行います。起動してすぐの数秒は、リストを読み終わるまでブロックが効きません。
+    """
+}
+
+struct AdBlockStatusRow: View {
+    @ObservedObject var adblock: AdBlocker
+
+    var body: some View {
+        HStack {
+            if adblock.busy { ProgressView().padding(.trailing, 4) }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(adblock.status).font(.system(size: 13))
+                Text("起動してから止めた数（VNet）: \(adblock.totalBlocked)").font(.system(size: 12)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("今すぐ更新") { Task { await adblock.update(manual: true) } }
+                .disabled(adblock.busy)
+        }
     }
 }
 
-struct DevStatus: View {
-    @ObservedObject var store: BrowserStore
+struct FilterListRow: View {
+    let adblock: AdBlocker
+    let list: FilterListInfo
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(store.takeover.description)
-            Text("新しいタブの通信: \(store.defaultMode.rawValue)")
-            Text("VNet: \(store.vnetStatus)")
-            Text("タブ \(store.tabs.count) 枚・動いている WebView \(store.liveWebViewCount) / \(BrowserStore.maxLiveWebViews)")
-            Text("Cookie（写し）\(store.cookieJar.count) 個・HSTS \(store.hsts.all().count) 件")
-            Text("ネットワーク: \(store.isOnline ? "つながっている" : "つながっていない")・ダウンロード中 \(store.downloads.runningCount) 件")
-        }
-        .font(.system(size: 12, design: .monospaced))
-    }
-}
-
-struct DevTabList: View {
-    @ObservedObject var store: BrowserStore
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            ForEach(store.tabs) { tab in
-                DevTabRow(tab: tab, selected: tab.id == store.selectedID)
+        Toggle(isOn: Binding(get: { list.enabled }, set: { adblock.setListEnabled(list.id, $0) })) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(list.name)
+                Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
+                if let e = list.lastError {
+                    Text(e).font(.system(size: 11)).foregroundColor(.red)
+                }
             }
         }
-        .font(.system(size: 11, design: .monospaced))
     }
-}
 
-struct DevTabRow: View {
-    @ObservedObject var tab: BrowserTab
-    let selected: Bool
-
-    var body: some View {
-        Text("\(selected ? "▶" : " ") #\(tab.id) [\(tab.mode.short)・\(tab.state.rawValue)\(tab.isLoading ? "・読み込み中 \(Int(tab.progress * 100))%" : "")] \(tab.url?.absoluteString ?? "（空）")")
-            .lineLimit(1)
-    }
-}
-
-struct DevLogView: View {
-    let text: String
-
-    var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                Text(text)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(.green)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-                Color.clear.frame(height: 1).id("end")
-            }
-            .background(Color.black)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            .onChange(of: text) { _ in proxy.scrollTo("end", anchor: .bottom) }
+    private var detail: String {
+        let date: String
+        if let d = list.lastUpdated {
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "ja_JP")
+            f.dateFormat = "M/d HH:mm"
+            date = f.string(from: d)
+        } else {
+            date = "まだ"
         }
+        return "通信 \(list.networkRules)・隠す \(list.cosmeticRules)・対応外 \(list.unsupported)・更新 \(date)"
     }
 }
 
@@ -747,6 +783,9 @@ final class BrowserStore: ObservableObject {
     let downloads = DownloadManager()
     /// ブックマークと履歴
     let library = Library()
+    /// 広告ブロック
+    let adblock = AdBlocker()
+    @Published var showAdBlock = false
     /// アドレス欄の入力（打つたびに変わるので分けてある）
     let address = AddressEditor()
     /// ブックマーク・履歴の画面
@@ -828,6 +867,11 @@ final class BrowserStore: ObservableObject {
         if defaultMode == .vnetsLegacy { compileVNetOnlyRules() }
 
         library.load(logs: logs)
+        adblock.onRuleListsChanged = { [weak self] in
+            guard let self else { return }
+            for t in self.tabs { t.applyAdBlock(for: t.url) }
+        }
+        adblock.start(logs: logs)
         downloads.log = { s in lb.add(s, level: .info, category: .download) }
         downloads.webViewForResume = { [weak self] in self?.selectedTab?.webView }
         downloads.loadExisting()

@@ -35,6 +35,10 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     /// VNet が自分でファイルに書くダウンロードを始めたとき（画面のスレッドで呼ぶ）。
     /// WebKit の WKDownload は使わない（VNetScheme が引き受けた読み込みを WebKit がダウンロードに変えると、アプリが落ちたため）
     var onDownloadStarted: ((VNetDownload) -> Void)?
+    /// 広告ブロックの判定（nil なら調べない）。ページ本体は止めず、サブリソースだけを調べる
+    var blocker: BlockEngineBox?
+    /// 広告ブロックで止めたとき（画面のスレッドで呼ぶ）
+    var onBlocked: ((URL, String) -> Void)?
     /// ダウンロードに変えた要求（WebKit の要求は 204 で終わらせ、中身はファイルに書く）
     private var downloadsInFlight: [Int: VNetDownload] = [:]
 
@@ -109,6 +113,16 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         }
         let body = VNetScheme.body(of: task.request)
         let ctx = context(for: task.request, real: real)
+        // 広告ブロック（サブリソースだけ）。止めたものは通信しない
+        if !ctx.isTopLevel, let blocker {
+            let types = BlockEngine.guessTypes(url: real, accept: task.request.value(forHTTPHeaderField: "Accept"), isTopLevel: false)
+            if let d = blocker.match(url: real, types: types, sourceHost: ctx.initiator?.host ?? ctx.topURL?.host, topHost: ctx.topURL?.host) {
+                log?("🚫 広告ブロック: \(real.absoluteString)（\(d.rule)）")
+                onBlocked?(real, d.rule)
+                task.didFailWithError(NSError(domain: "VelaAdBlock", code: 1, userInfo: [NSLocalizedDescriptionKey: "広告ブロックで止めました"]))
+                return
+            }
+        }
         let id = nextID
         nextID += 1
         // 終わった要求の分は、ときどきまとめて消す（増え続けないように）

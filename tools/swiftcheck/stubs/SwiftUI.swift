@@ -328,6 +328,9 @@ public extension Section where Parent: View, Content: View, Footer == EmptyView 
     init(@ViewBuilder content: () -> Content, @ViewBuilder header: () -> Parent) {}
     init(header: Parent, @ViewBuilder content: () -> Content) {}
 }
+public extension Section where Parent == EmptyView, Content: View, Footer == EmptyView {
+    init(@ViewBuilder content: () -> Content) {}
+}
 public extension Section where Parent == Text, Content: View, Footer == EmptyView {
     @_disfavoredOverload init<S: StringProtocol>(_ title: S, @ViewBuilder content: () -> Content) {}
 }
