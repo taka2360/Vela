@@ -137,7 +137,7 @@ struct DevHSTSPage: View {
             }
             List {
                 ForEach(store.hsts.all().sorted { $0.host < $1.host }, id: \.host) { e in
-                    DevLine("\(e.host)\(e.includeSubDomains ? "（サブドメインも）" : "")  期限 \(e.expires)")
+                    DevLine("\(e.host)\(e.includeSubDomains ? "（サブドメインも）" : "")  期限 \(DevDate.dateTime(e.expires))")
                 }
                 .onDelete { idx in
                     let hosts = store.hsts.all().sorted { $0.host < $1.host }.map { $0.host }
