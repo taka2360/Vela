@@ -322,8 +322,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
             pending[id] = nil
             if !h.cookieChanges.isEmpty { pushCookies?(h.cookieChanges) {} }
             // ページはそのまま（204 No Content は「移動しない」）
-            if let resp = HTTPURLResponse(url: p.shownURL, statusCode: 204, httpVersion: "HTTP/1.1",
-                                          headerFields: ["Content-Type": "text/plain", "Content-Length": "0"]) {
+            if let resp = VNetScheme.response(url: p.shownURL, status: 204, headers: ["Content-Type": "text/plain", "Content-Length": "0"]) {
                 p.task.didReceive(resp)
                 p.task.didFinish()
             }
@@ -422,7 +421,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         let type = VNetScheme.contentType(headers: h.headers, real: h.url)
         let length = h.header("Content-Length").flatMap { Int($0) }
         let headers = VNetScheme.responseHeaders(type: type, length: length, vnetsMode: false, extra: h.headers)
-        guard let resp = HTTPURLResponse(url: shown, statusCode: h.status, httpVersion: "HTTP/1.1", headerFields: headers) else {
+        guard let resp = VNetScheme.response(url: shown, status: h.status, headers: headers) else {
             pending[id] = nil
             p.task.didFailWithError(URLError(.badServerResponse))
             return
@@ -514,7 +513,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         nr.httpBody = next.body
         nr.mainDocumentURL = p.request.mainDocumentURL == p.shownURL ? nextShown : p.request.mainDocumentURL
         let body = next.body
-        guard let resp = HTTPURLResponse(url: p.shownURL, statusCode: status, httpVersion: "HTTP/1.1", headerFields: h),
+        guard let resp = VNetScheme.response(url: p.shownURL, status: status, headers: h),
               SchemeTaskRedirect.perform(p.task, response: resp, request: nr, done: { [weak self] newReq in
                   let me = self
                   DispatchQueue.main.async { me?.afterRedirect(id, newReq, body: body) }
@@ -744,9 +743,14 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         return h
     }
 
+    /// WebKit に渡す返事の見出し（いつも HTTP/1.1 として渡す）
+    static func response(url: URL, status: Int, headers: [String: String]) -> HTTPURLResponse? {
+        HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)
+    }
+
     private func respond(_ task: WKURLSchemeTask, url: URL, status: Int, type: String, body: Data, vnetsMode: Bool, extra: [(String, String)] = []) {
         let h = VNetScheme.responseHeaders(type: type, length: body.count, vnetsMode: vnetsMode, extra: extra)
-        let resp = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: h)!
+        let resp = VNetScheme.response(url: url, status: status, headers: h)!
         task.didReceive(resp)
         task.didReceive(body)
         task.didFinish()
@@ -1133,79 +1137,5 @@ final class WebCookieSync: NSObject, WKHTTPCookieStoreObserver {
         }
         pushing -= 1
         if pushing == 0 && refreshAfterPush { refreshAfterPush = false; refresh() }
-    }
-}
-
-// ======================================================================
-// MARK: - NetPolicy.swift
-// ======================================================================
-
-// MARK: - 通信の決まり（セキュリティの判定）
-//
-// 画面や WebKit に頼らない「判定だけ」の部品。Linux のテスト（tools/tests）でも動かす。
-//  SiteUtil           … ホスト名の正規化・「サイト」「オリジン」の判定
-//  RequestContext     … 要求の文脈（トップのページ・トップレベルの移動か・リダイレクトの経路 など）
-//  CookiePolicy       … Cookie を送るか・保存するか（SameSite・サードパーティ・送る順番）
-//  SetCookieParser    … Set-Cookie の 1 行を CookieRecord にする（属性の検査も）
-//  RedirectPolicy     … 3xx から次の要求を作る（ここ以外では作らない）
-//  CORSPassthrough    … サーバーの CORS ヘッダをそのまま通す（Vela が許可を作らない）
-//  LocalNetworkPolicy … Vela 独自のローカルネットワーク（LAN）への接続の制御（Chrome の PNA / LNA とは別物）
-//
-// ファイル: SiteUtil.swift（SiteUtil・IPAddressText）、Cookies.swift（CookieRecord・SetCookieParser・HTTPDate・CookiePolicy）、
-//           RedirectPolicy.swift、LocalNetworkPolicy.swift（IPClass・LocalNetworkPolicy）。このファイルは RequestContext と CORSPassthrough
-
-// MARK: - 要求の文脈
-
-/// 要求がどんな場面で出たか。Cookie・リダイレクト・LAN の判定に使う
-struct RequestContext: Sendable {
-    /// トップのページの URL（WebKit の mainDocumentURL）
-    var topURL: URL?
-    /// トップレベルの移動（ページそのものを開く要求）か
-    var isTopLevel = false
-    /// 要求を出したページ（Referer）。トップレベルの移動で、どこから来たかを見るのに使う
-    var initiator: URL?
-    /// リダイレクトの経路で、一度でもクロスサイトになったか（なったら、そのあとはずっとクロスサイト扱い）
-    var crossSiteChain = false
-    /// Cookie を送受信してよいか（URLRequest.httpShouldHandleCookies。Fetch の credentials: omit と同じものではない）
-    var cookiesAllowed = true
-    /// ユーザーがアドレス欄・ブックマークなどから開いた移動か（ページのリンクや JavaScript ではない）
-    var userInitiated = false
-    /// リダイレクトのとき、1 つ前の URL
-    var previousURL: URL?
-    /// どのタブの要求か（ログ用）
-    var tabID = 0
-
-    init(topURL: URL? = nil, isTopLevel: Bool = false, initiator: URL? = nil) {
-        self.topURL = topURL
-        self.isTopLevel = isTopLevel
-        self.initiator = initiator
-    }
-
-    /// リダイレクトで次の URL に進んだときの文脈
-    func redirected(from: URL, to next: URL) -> RequestContext {
-        var c = self
-        if !SiteUtil.isSameSite(from, next) { c.crossSiteChain = true }
-        c.previousURL = from
-        // トップレベルの移動なら、トップのページは移動先になる
-        if isTopLevel { c.topURL = next }
-        return c
-    }
-}
-
-// MARK: - CORS
-
-/// サーバーの Access-Control-* をそのまま通す。Vela が自分で許可を作ることはしない
-enum CORSPassthrough {
-    /// vnetsMode: 予備の vnets:// 方式（開発者向け）。そのときだけ、許可されたオリジンの https:// を vnets:// に読み替える
-    static func headers(_ server: [(String, String)], vnetsMode: Bool) -> [(String, String)] {
-        server.compactMap { k, v in
-            let lk = k.lowercased()
-            guard lk.hasPrefix("access-control-") else { return nil }
-            if vnetsMode && lk == "access-control-allow-origin" {
-                if v.lowercased().hasPrefix("https://") { return (k, "vnets://" + v.dropFirst(8)) }
-                if v.lowercased().hasPrefix("http://") { return (k, "vnet://" + v.dropFirst(7)) }
-            }
-            return (k, v)
-        }
     }
 }

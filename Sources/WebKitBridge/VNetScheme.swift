@@ -302,8 +302,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
             pending[id] = nil
             if !h.cookieChanges.isEmpty { pushCookies?(h.cookieChanges) {} }
             // ページはそのまま（204 No Content は「移動しない」）
-            if let resp = HTTPURLResponse(url: p.shownURL, statusCode: 204, httpVersion: "HTTP/1.1",
-                                          headerFields: ["Content-Type": "text/plain", "Content-Length": "0"]) {
+            if let resp = VNetScheme.response(url: p.shownURL, status: 204, headers: ["Content-Type": "text/plain", "Content-Length": "0"]) {
                 p.task.didReceive(resp)
                 p.task.didFinish()
             }
@@ -402,7 +401,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         let type = VNetScheme.contentType(headers: h.headers, real: h.url)
         let length = h.header("Content-Length").flatMap { Int($0) }
         let headers = VNetScheme.responseHeaders(type: type, length: length, vnetsMode: false, extra: h.headers)
-        guard let resp = HTTPURLResponse(url: shown, statusCode: h.status, httpVersion: "HTTP/1.1", headerFields: headers) else {
+        guard let resp = VNetScheme.response(url: shown, status: h.status, headers: headers) else {
             pending[id] = nil
             p.task.didFailWithError(URLError(.badServerResponse))
             return
@@ -494,7 +493,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         nr.httpBody = next.body
         nr.mainDocumentURL = p.request.mainDocumentURL == p.shownURL ? nextShown : p.request.mainDocumentURL
         let body = next.body
-        guard let resp = HTTPURLResponse(url: p.shownURL, statusCode: status, httpVersion: "HTTP/1.1", headerFields: h),
+        guard let resp = VNetScheme.response(url: p.shownURL, status: status, headers: h),
               SchemeTaskRedirect.perform(p.task, response: resp, request: nr, done: { [weak self] newReq in
                   let me = self
                   DispatchQueue.main.async { me?.afterRedirect(id, newReq, body: body) }
@@ -724,9 +723,14 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         return h
     }
 
+    /// WebKit に渡す返事の見出し（いつも HTTP/1.1 として渡す）
+    static func response(url: URL, status: Int, headers: [String: String]) -> HTTPURLResponse? {
+        HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)
+    }
+
     private func respond(_ task: WKURLSchemeTask, url: URL, status: Int, type: String, body: Data, vnetsMode: Bool, extra: [(String, String)] = []) {
         let h = VNetScheme.responseHeaders(type: type, length: body.count, vnetsMode: vnetsMode, extra: extra)
-        let resp = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: h)!
+        let resp = VNetScheme.response(url: url, status: status, headers: h)!
         task.didReceive(resp)
         task.didReceive(body)
         task.didFinish()
