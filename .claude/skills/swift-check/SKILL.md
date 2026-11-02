@@ -9,8 +9,8 @@ description: Vela の .swift が iPad の Swift Playgrounds（Swift 5.8）でコ
    ```powershell
    powershell -NoProfile -ExecutionPolicy Bypass -File tools\swiftcheck\swiftcheck.ps1 $ARGUMENTS
    ```
-   引数なし = ルートの .swift 全部（*All.swift 以外）。ファイルやフォルダを渡すとそれだけ。
-   `VelaAll.swift` を直した・作り直したときは、それも別に調べる。
+   引数なし = `Sources/` の .swift 全部（サブフォルダも。*All.swift 以外）。ファイルやフォルダを渡すとそれだけ。
+   `python tools/merge_swift.py` で作り直したときは、`Playgrounds\VelaParts` も別に調べる。
 2. 最後の行の `結果: OK / NG` を見る。
 3. NG のとき:
    - 「==== エラー ====」を 1 件ずつ読み、ソースを直して、もう一度実行する

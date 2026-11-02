@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""このフォルダの .swift ファイルを 1 つにまとめる（Swift Playgrounds 用）。
+"""Sources/ の .swift ファイル（サブフォルダも含む）を 1 つにまとめる（Swift Playgrounds 用）。
 
-使い方:
-  python merge_swift.py                  # → VelaAll.swift（@main 付き。Playgrounds の「App」用）
-                                         #   と VelaParts/Vela1〜10.swift（同じ中身を 10 つに分けたもの）
-  python merge_swift.py --parts 8        # 分ける数を変える（0 なら分けたものは作らない）
-  python merge_swift.py -o out.swift     # 出力先を変える
-  python merge_swift.py --playground     # @main を外し、PlaygroundSupport のライブビューで動かす版
+使い方（プロジェクトのルートで）:
+  python tools/merge_swift.py              # → Playgrounds/VelaAll.swift（@main 付き。Playgrounds の「App」用）
+                                           #   と Playgrounds/VelaParts/Vela1〜10.swift（同じ中身を 10 個に分けたもの）
+  python tools/merge_swift.py --parts 8    # 分ける数を変える（0 なら分けたものは作らない）
+  python tools/merge_swift.py -o out.swift # 出力先を変える（Playgrounds/ からの相対）
+  python tools/merge_swift.py --playground # @main を外し、PlaygroundSupport のライブビューで動かす版
                                          # （Xcode / Playgrounds の「.playground」ページ用）
 
 やること:
@@ -84,8 +84,10 @@ def main():
         except Exception:
             pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("-d", "--dir", default=Path(__file__).resolve().parent, type=Path, help="入力フォルダ")
-    ap.add_argument("-o", "--output", default="VelaAll.swift", help="出力ファイル名")
+    project = Path(__file__).resolve().parent.parent
+    ap.add_argument("-d", "--dir", default=project / "Sources", type=Path, help="入力フォルダ（サブフォルダも読む）")
+    ap.add_argument("--out-dir", default=project / "Playgrounds", type=Path, help="出力フォルダ")
+    ap.add_argument("-o", "--output", default="VelaAll.swift", help="出力ファイル名（出力フォルダからの相対）")
     ap.add_argument("--parts", type=int, default=10,
                     help="VelaParts/ に、同じ中身をこの数のファイルに分けたものも作る（0 で作らない）。"
                          "Playgrounds は 1 つのファイルが大きいと、作るのが 30 秒を超えて止まる（thunk の時間切れ）ため")
@@ -96,14 +98,17 @@ def main():
     src_dir: Path = args.dir
     out_path = Path(args.output)
     if not out_path.is_absolute():
-        out_path = src_dir / out_path
+        out_path = args.out_dir / out_path
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     files = {}
-    for p in src_dir.glob("*.swift"):
+    for p in sorted(src_dir.rglob("*.swift")):
         if p.resolve() == out_path.resolve():
             continue
         if p.read_text(encoding="utf-8-sig").startswith(GENERATED_MARK):
             continue  # 前にまとめたファイルは入れない
+        if p.stem in files:
+            sys.exit(f"同じ名前のファイルが 2 つあります: {files[p.stem]} と {p}")
         files[p.stem] = p
     if not files:
         sys.exit(f"{src_dir} に .swift ファイルがありません")
@@ -162,7 +167,7 @@ def main():
     print(f"→ {out_path}（{len(bodies)} ブロック, {out.count(chr(10))} 行）")
 
     if args.parts > 0 and not args.playground:
-        write_parts(src_dir / "VelaParts", headers, bodies, names, args.parts)
+        write_parts(out_path.parent / "VelaParts", headers, bodies, names, args.parts)
 
 
 def write_parts(folder: Path, headers, bodies, names, n):

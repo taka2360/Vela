@@ -2,12 +2,12 @@
 # Swift 5.8 で、iPad の Swift Playgrounds（App）に入れる .swift がコンパイルエラーにならないか調べる（WSL 上で動かす）
 #
 # 使い方:
-#   check.sh                    # このプロジェクトのフォルダの .swift を全部（*All.swift は除く）、1 つの App としてまとめて調べる
-#   check.sh <フォルダ>          # そのフォルダの .swift を全部（*All.swift は除く）
-#   check.sh a.swift b.swift    # 指定したファイルだけ（例: check.sh VelaAll.swift でまとめた版を調べる）
+#   check.sh                    # Sources/ の .swift を全部（サブフォルダも。*All.swift は除く）、1 つの App としてまとめて調べる
+#   check.sh <フォルダ>          # そのフォルダの .swift を全部（サブフォルダも。*All.swift は除く）
+#   check.sh a.swift b.swift    # 指定したファイルだけ（例: check.sh Playgrounds/VelaAll.swift でまとめた版を調べる）
 #   オプション: --keep-warnings  Linux の Foundation 由来の Sendable 警告も隠さずに出す
 #               --timing         型チェックに時間のかかる関数・式を警告で出す（既定 150ms。環境変数 TIMING_MS で変更）
-#               --timing         型チェックに 150ms 以上かかる関数・式を警告で出す（Playgrounds が遅い・時間切れのとき）
+#
 #
 # しくみ:
 #   Linux には SwiftUI・WebKit・UIKit・Network・Security・Compression・ObjectiveC が無いので、
@@ -45,11 +45,11 @@ fi
 
 # ---- 調べるファイルを集める ----
 FILES=()
-if [ ${#ARGS[@]} -eq 0 ]; then ARGS=("$PROJECT"); fi
+if [ ${#ARGS[@]} -eq 0 ]; then ARGS=("$PROJECT/Sources"); fi
 for a in "${ARGS[@]}"; do
     if [ -d "$a" ]; then
         while IFS= read -r f; do FILES+=("$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"); done \
-            < <(find "$a" -maxdepth 1 -name '*.swift' ! -name '*All.swift' | sort)
+            < <(find "$a" -name '*.swift' ! -name '*All.swift' | sort)
     elif [ -f "$a" ]; then
         FILES+=("$(cd "$(dirname "$a")" && pwd)/$(basename "$a")")
     else
