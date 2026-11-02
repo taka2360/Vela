@@ -1,5 +1,5 @@
 // このファイルは merge_swift.py で自動生成したものです（直接編集しないでください）
-// 元ファイル: MyApp.swift, BrowserView.swift, BrowserControls.swift, TabViews.swift, LibraryView.swift, DevPanel.swift, DevPanelPages.swift, SettingsView.swift, AdBlockView.swift, Downloads.swift, DownloadFiles.swift, BrowserStore.swift, BrowserTab.swift, Library.swift, LibraryModel.swift, AddressInput.swift, ErrorPages.swift, NetLog.swift, FilterLists.swift, ABPFilter.swift, BlockEngine.swift, ContentBlocker.swift, Persistence.swift, DevLog.swift, CrashLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, SiteUtil.swift, Cookies.swift, RedirectPolicy.swift, LocalNetworkPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
+// 元ファイル: MyApp.swift, BrowserView.swift, BrowserControls.swift, TabViews.swift, LibraryView.swift, DevPanel.swift, DevPanelPages.swift, SettingsView.swift, AdBlockView.swift, Downloads.swift, DownloadFiles.swift, BrowserModels.swift, BrowserStore.swift, BrowserTab.swift, TabWebDelegate.swift, Library.swift, LibraryModel.swift, AddressInput.swift, ErrorPages.swift, NetLog.swift, FilterLists.swift, ABPFilter.swift, BlockEngine.swift, ContentBlocker.swift, Persistence.swift, DevLog.swift, CrashLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, SiteUtil.swift, Cookies.swift, RedirectPolicy.swift, LocalNetworkPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
 
 import SwiftUI
 import WebKit
@@ -2348,15 +2348,10 @@ final class VNetDownload: @unchecked Sendable {
 }
 
 // ======================================================================
-// MARK: - BrowserStore.swift
+// MARK: - BrowserModels.swift
 // ======================================================================
 
-// MARK: - アプリ全体（タブ・共有の部品・保存）
-//
-// ・タブ 1 枚 = BrowserTab（WKWebView は必要なときだけ作る。動いている WebView は maxLiveWebViews 枚まで）
-// ・通信（VNetMachine）・Cookie の写し・HSTS・ログ・LAN の保護のルールは、全部のタブで 1 つを共有する
-// ・タブの並び（と各タブの戻る/進むの履歴）を session.json に保存して、次に起動したときに戻す
-// ・メモリが足りなくなったら（メモリ警告）、見ていないタブの WebView を捨てる（スナップショットと履歴は残す）
+// MARK: - アプリ全体で使う小さな型（通信の作り・JS のダイアログ・保存するタブ・セッション）
 
 /// 通信の作り（タブごと）
 enum NetMode: String, Codable {
@@ -2404,6 +2399,17 @@ struct SessionData: Codable {
     var tabs: [SavedTab]
     var selected: Int?
 }
+
+// ======================================================================
+// MARK: - BrowserStore.swift
+// ======================================================================
+
+// MARK: - アプリ全体（タブ・共有の部品・保存）
+//
+// ・タブ 1 枚 = BrowserTab（WKWebView は必要なときだけ作る。動いている WebView は maxLiveWebViews 枚まで）
+// ・通信（VNetMachine）・Cookie の写し・HSTS・ログ・LAN の保護のルールは、全部のタブで 1 つを共有する
+// ・タブの並び（と各タブの戻る/進むの履歴）を session.json に保存して、次に起動したときに戻す
+// ・メモリが足りなくなったら（メモリ警告）、見ていないタブの WebView を捨てる（スナップショットと履歴は残す）
 
 @MainActor
 final class BrowserStore: ObservableObject {
@@ -3431,6 +3437,10 @@ final class BrowserTab: ObservableObject, Identifiable {
         }
     }
 }
+
+// ======================================================================
+// MARK: - TabWebDelegate.swift
+// ======================================================================
 
 // MARK: - WebKit のデリゲート（タブ 1 枚に 1 つ）
 

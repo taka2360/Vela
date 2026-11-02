@@ -18,6 +18,7 @@ Sources/VirtioNet/VNetCore.swift
 Sources/VirtioNet/VNetDriver.swift
 Sources/Router/UserNet.swift
 Sources/VirtioNet/VNetMachine.swift
+Sources/Browser/BrowserModels.swift
 Sources/Browser/DevLog.swift
 Sources/Browser/Persistence.swift
 Sources/Browser/AddressInput.swift
