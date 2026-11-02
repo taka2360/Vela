@@ -1,5 +1,81 @@
 import Foundation
 
+// MARK: - データのファイル（Application Support/Vela/ の JSON）
+//
+// タブ・ブックマーク・履歴などを Codable の JSON で置く。書き込みはまとめて（delay 秒後に 1 回）、裏のキューで、
+// いったん別の名前に書いてから置き換える（.atomic。書いている途中で落ちても前のものが残る）
+
+final class JSONFile<Value: Codable>: @unchecked Sendable {
+    let url: URL
+    private let lock = NSLock()
+    private let queue: DispatchQueue
+    private let delay: TimeInterval
+    private var pending: Value?
+    private var scheduled = false
+    /// 読み書きの失敗（開発者向けのログに出す）
+    var log: (@Sendable (String) -> Void)?
+
+    /// name: ファイルの名前（例: "tabs.json"）。directory を省くと Application Support/Vela/
+    init(name: String, directory: URL? = nil, delay: TimeInterval = 1.0) {
+        let dir = directory ?? JSONFile.defaultDirectory()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        url = dir.appendingPathComponent(name)
+        self.delay = delay
+        queue = DispatchQueue(label: "vela-json-\(name)")
+    }
+
+    static func defaultDirectory() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("Vela", isDirectory: true)
+    }
+
+    /// 読む（無い・壊れているなら nil。壊れていたファイルは .broken に名前を変えて残す）
+    func load() -> Value? {
+        guard let d = try? Data(contentsOf: url) else { return nil }
+        do {
+            return try JSONDecoder().decode(Value.self, from: d)
+        } catch {
+            log?("⚠️ \(url.lastPathComponent) を読めません（\(error)）。.broken として残します")
+            let broken = url.appendingPathExtension("broken")
+            try? FileManager.default.removeItem(at: broken)
+            try? FileManager.default.moveItem(at: url, to: broken)
+            return nil
+        }
+    }
+
+    /// 保存する（delay 秒の間に何度呼んでも、書くのは最後の 1 回）
+    func save(_ v: Value) {
+        lock.lock()
+        pending = v
+        if scheduled { lock.unlock(); return }
+        scheduled = true
+        lock.unlock()
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in self?.flush() }
+    }
+
+    /// 待っている分をすぐ書く（アプリが裏に回るときなど）。書き終わるまで待つ
+    func saveNow(_ v: Value? = nil) {
+        if let v { lock.lock(); pending = v; lock.unlock() }
+        queue.sync { self.flush() }
+    }
+
+    private func flush() {
+        lock.lock()
+        let v = pending
+        pending = nil
+        scheduled = false
+        lock.unlock()
+        guard let v else { return }
+        do {
+            let d = try JSONEncoder().encode(v)
+            try d.write(to: url, options: .atomic)
+        } catch {
+            log?("⚠️ \(url.lastPathComponent) を書けません（\(error)）")
+        }
+    }
+}
+
 // MARK: - 設定（UserDefaults に置く）
 //
 // 通信まわりの設定は、アプリを起動し直したときに効く（WebView や通信の作りを、起動のときに決めるため）

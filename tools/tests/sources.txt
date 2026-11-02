@@ -3,3 +3,16 @@ NetPolicy.swift
 HSTSStore.swift
 CookieJar.swift
 HTTPSupport.swift
+HTTPResponseParser.swift
+HTTPClient.swift
+TLSClient.swift
+Packet.swift
+DNSMessage.swift
+GuestStack.swift
+GuestTCP.swift
+VNetCore.swift
+VNetDriver.swift
+UserNet.swift
+VNetMachine.swift
+DevLog.swift
+Persistence.swift

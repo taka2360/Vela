@@ -49,6 +49,10 @@ final class UserNet: @unchecked Sendable {
     private var tcps: [TCPKey: TCPConn] = [:]
     private var udps: [UDPKey: UDPFlow] = [:]
     private var timer: DispatchSourceTimer?
+    /// 名前を IPv4 にする方法（テストでは偽物に差し替える）。どのスレッドから呼ばれてもよいこと
+    var resolver: @Sendable (String) -> [[UInt8]]? = { UserNet.resolveIPv4($0) }
+    /// ゲストへの送り直しの回数（queue の上で数える。読むときは queue の上で）
+    private(set) var retransmits = 0
 
     init(factory: UserNetSocketFactory) {
         self.factory = factory
@@ -211,8 +215,9 @@ final class UserNet: @unchecked Sendable {
             return
         }
         let queue = self.queue
+        let resolver = self.resolver
         DispatchQueue.global(qos: .userInitiated).async {
-            let addrs = UserNet.resolveIPv4(question.name)
+            let addrs = resolver(question.name)
             let r = DNSMessage.reply(to: q, questionEnd: question.end, rcode: addrs == nil ? 3 : 0, answers: addrs ?? [])
             queue.async { [weak self] in self?.sendDNS(r, sport: sport) }
         }
@@ -349,9 +354,12 @@ final class UserNet: @unchecked Sendable {
         // データ
         var needAck = false
         if !payload.isEmpty {
-            if h.seq == c.rcvNxt {
-                c.sock?.send(Data(payload))
-                c.rcvNxt &+= UInt32(payload.count)
+            // 送り直しで前の分と重なっていたら、新しい所だけ外へ送る（先の分は捨てて、送り直してもらう）
+            let before = Int32(bitPattern: c.rcvNxt &- h.seq)
+            if before >= 0 && Int(before) < payload.count {
+                let rest = payload.dropFirst(Int(before))
+                c.sock?.send(Data(rest))
+                c.rcvNxt &+= UInt32(rest.count)
             }
             needAck = true
         }
@@ -465,9 +473,16 @@ final class UserNet: @unchecked Sendable {
                 if c.retries > 6 { remove(c); continue }
                 sendSYNACK(c)
                 c.lastProgress = now
+            } else if c.state == .established && c.sndNxt == c.sndUna && c.window == 0 && c.pending > 0
+                        && now.timeIntervalSince(c.lastProgress) > 1 {
+                // ゲストの窓が 0 のまま（送っている途中のものは無い）: 1 バイトだけ送って、窓が開いたかを探る（持続タイマー）
+                c.window = 1
+                c.lastProgress = now
+                pump(c)
             } else if c.state == .established && c.sndNxt != c.sndUna && now.timeIntervalSince(c.lastProgress) > 1 {
-                // 受け取りの返事が来ない: 先頭から送り直す
-                c.retries += 1
+                // 受け取りの返事が来ない: 先頭から送り直す（窓が 0 で探っているだけのときは、回数に数えない）
+                if c.window > 1 { c.retries += 1 }
+                retransmits += 1
                 if c.retries > 10 {
                     sendRST(c, seq: c.sndNxt)
                     remove(c); continue

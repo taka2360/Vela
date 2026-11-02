@@ -55,6 +55,8 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         var webKitRedirects: Bool
         /// 要求の文脈（Cookie・LAN・HSTS の判定）
         var context: RequestContext
+        /// 取り消しの印（WebKit がやめたら、裏の通信も止める）
+        let token = RequestToken()
         /// 予備の vnets:// の作りの要求か
         var vnetsMode: Bool { VNetURL.isVNet(shownURL) }
     }
@@ -73,8 +75,12 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     }
 
     func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {
-        pending[ObjectIdentifier(task)] = nil
+        // 裏の通信も止める（待ち行列から外す・読んでいる途中の接続は切る）
+        pending.removeValue(forKey: ObjectIdentifier(task))?.token.cancel()
     }
+
+    /// 読み込み中の要求の数（開発者向け）
+    var pendingCount: Int { pending.count }
 
     private func start(_ task: WKURLSchemeTask) {
         guard let shown = task.request.url, let real = VNetURL.toReal(shown), let machine else {
@@ -111,6 +117,8 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     }
 
     private func fetch(_ id: ObjectIdentifier, _ req: HTTPRequest, followRedirects: Bool, machine: VNetMachine) {
+        var req = req
+        req.token = pending[id]?.token
         machine.send(req, followRedirects: followRedirects) { [weak self] result in
             let me = self   // weak の self は var なので、並行で動く閉包からは直接さわれない。let に受け直す
             DispatchQueue.main.async { me?.finish(id, result) }

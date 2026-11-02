@@ -6,6 +6,8 @@
 #   check.sh <フォルダ>          # そのフォルダの .swift を全部（*All.swift は除く）
 #   check.sh a.swift b.swift    # 指定したファイルだけ（例: check.sh VelaAll.swift でまとめた版を調べる）
 #   オプション: --keep-warnings  Linux の Foundation 由来の Sendable 警告も隠さずに出す
+#               --timing         型チェックに時間のかかる関数・式を警告で出す（既定 150ms。環境変数 TIMING_MS で変更）
+#               --timing         型チェックに 150ms 以上かかる関数・式を警告で出す（Playgrounds が遅い・時間切れのとき）
 #
 # しくみ:
 #   Linux には SwiftUI・WebKit・UIKit・Network・Security・Compression・ObjectiveC が無いので、
@@ -24,10 +26,12 @@ CACHE=$HOME/.cache/vnet-swiftcheck
 MODS=$CACHE/modules
 
 KEEP_WARN=0
+TIMING=0
 ARGS=()
 for a in "$@"; do
     case "$a" in
         --keep-warnings) KEEP_WARN=1 ;;
+        --timing) TIMING=1 ;;
         -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
         *) ARGS+=("$a") ;;
     esac
@@ -81,6 +85,8 @@ for f in "${FILES[@]}"; do
 done
 
 FLAGS=(-typecheck -swift-version 5 -module-name App -I "$MODS" -continue-building-after-errors)
+# --timing: 型チェックに時間のかかる関数・式を警告で出す（Playgrounds の「thunk の作成が 30 秒で時間切れ」の原因探し）
+if [ $TIMING -eq 1 ]; then FLAGS+=(-Xfrontend -warn-long-function-bodies=${TIMING_MS:-150} -Xfrontend -warn-long-expression-type-checking=${TIMING_MS:-150}); fi
 # @main があるなら「App」の作り（トップレベルのコードを許さない）。無いなら 1 ファイル目をメインとして読む
 if [ $MAIN -eq 1 ] || [ ${#COPIES[@]} -gt 1 ]; then FLAGS+=(-parse-as-library); fi
 

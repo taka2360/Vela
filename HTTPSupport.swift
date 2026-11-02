@@ -41,71 +41,93 @@ enum ContentDecoding {
         #endif
     }
 
-    /// Content-Encoding に従って戻す。知らない形・戻せないときは nil
-    static func decode(_ d: Data, encoding: String) -> Data? {
+    enum Failure: Error, Equatable {
+        /// 知らない縮め方（この環境で戻せないものも）
+        case unsupported(String)
+        /// 壊れている・途中で切れている
+        case corrupt(String)
+        /// 戻した大きさが上限を超えた（圧縮爆弾など）
+        case tooLarge(Int)
+
+        var description: String {
+            switch self {
+            case .unsupported(let e): return "戻せない縮め方です（\(e)）"
+            case .corrupt(let e): return "縮めた中身（\(e)）が壊れています"
+            case .tooLarge(let n): return "戻した中身が \(n >> 20)MB を超えます"
+            }
+        }
+    }
+
+    /// Content-Encoding に従って戻す。戻した大きさは maxOutput まで
+    static func decode(_ d: Data, encoding: String, maxOutput: Int = 32 << 20) -> Result<Data, Failure> {
         // "gzip, br" のように重ねてあるときは、後ろから戻す
         var out = d
         for e in encoding.lowercased().split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }).reversed() {
+            let r: Result<Data, Failure>
             switch e {
             case "", "identity": continue
-            case "gzip", "x-gzip": guard let g = gunzip(out) else { return nil }; out = g
-            case "deflate": guard let g = inflateZlib(out) else { return nil }; out = g
-            case "br": guard let g = brotli(out) else { return nil }; out = g
-            default: return nil
+            case "gzip", "x-gzip": r = gunzip(out, maxOutput: maxOutput)
+            case "deflate": r = inflateZlib(out, maxOutput: maxOutput)
+            case "br": r = brotli(out, maxOutput: maxOutput)
+            default: return .failure(.unsupported(e))
+            }
+            switch r {
+            case .success(let g): out = g
+            case .failure(let f): return .failure(f)
             }
         }
-        return out
+        return .success(out)
     }
 
     /// gzip: 前（10 バイト〜）と後ろ（8 バイト）を外して、生の deflate として戻す
-    static func gunzip(_ d: Data) -> Data? {
+    static func gunzip(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
         let b = [UInt8](d)
-        guard b.count >= 18, b[0] == 0x1F, b[1] == 0x8B, b[2] == 8 else { return nil }
+        guard b.count >= 18, b[0] == 0x1F, b[1] == 0x8B, b[2] == 8 else { return .failure(.corrupt("gzip の頭が違います")) }
         let flags = b[3]
         var p = 10
-        if flags & 4 != 0 { guard p + 2 <= b.count else { return nil }; p += 2 + (Int(b[p]) | Int(b[p + 1]) << 8) }   // FEXTRA
+        if flags & 4 != 0 { guard p + 2 <= b.count else { return .failure(.corrupt("gzip")) }; p += 2 + (Int(b[p]) | Int(b[p + 1]) << 8) }   // FEXTRA
         if flags & 8 != 0 { while p < b.count && b[p] != 0 { p += 1 }; p += 1 }                                      // FNAME
         if flags & 16 != 0 { while p < b.count && b[p] != 0 { p += 1 }; p += 1 }                                     // FCOMMENT
         if flags & 2 != 0 { p += 2 }                                                                                  // FHCRC
-        guard p < b.count else { return nil }
-        return inflateRaw(b[p...])
+        guard p < b.count else { return .failure(.corrupt("gzip")) }
+        return inflateRaw(b[p...], name: "gzip", maxOutput: maxOutput)
     }
 
     /// deflate: 本当は zlib の包み（2 バイト＋後ろ 4 バイト）付き。包みの無い生の deflate を送るサーバーもあるので両方受ける
-    static func inflateZlib(_ d: Data) -> Data? {
+    static func inflateZlib(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
         let b = [UInt8](d)
-        if b.count >= 2 && b[0] & 0x0F == 8 && (Int(b[0]) << 8 | Int(b[1])) % 31 == 0 { return inflateRaw(b[2...]) }
-        return inflateRaw(b[...])
+        if b.count >= 2 && b[0] & 0x0F == 8 && (Int(b[0]) << 8 | Int(b[1])) % 31 == 0 { return inflateRaw(b[2...], name: "deflate", maxOutput: maxOutput) }
+        return inflateRaw(b[...], name: "deflate", maxOutput: maxOutput)
     }
 
-    static func inflateRaw(_ b: ArraySlice<UInt8>) -> Data? {
+    static func inflateRaw(_ b: ArraySlice<UInt8>, name: String, maxOutput: Int) -> Result<Data, Failure> {
         #if canImport(Compression)
-        return stream(b, COMPRESSION_ZLIB)      // Apple の ZLIB は「生の deflate」
+        return stream(b, COMPRESSION_ZLIB, name: name, maxOutput: maxOutput)      // Apple の ZLIB は「生の deflate」
         #else
-        return nil
+        return .failure(.unsupported(name))
         #endif
     }
 
-    static func brotli(_ d: Data) -> Data? {
+    static func brotli(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
         #if canImport(Compression)
-        if #available(iOS 15.0, macOS 12.0, *) { return stream([UInt8](d)[...], COMPRESSION_BROTLI) }
+        if #available(iOS 15.0, macOS 12.0, *) { return stream([UInt8](d)[...], COMPRESSION_BROTLI, name: "br", maxOutput: maxOutput) }
         #endif
-        return nil
+        return .failure(.unsupported("br"))
     }
 
     #if canImport(Compression)
-    /// 元の大きさが分からなくても戻せるよう、少しずつ戻す
-    private static func stream(_ src: ArraySlice<UInt8>, _ algorithm: compression_algorithm) -> Data? {
-        if src.isEmpty { return Data() }
+    /// 元の大きさが分からなくても戻せるよう、少しずつ戻す。最後まで戻せなかったら壊れている扱い
+    private static func stream(_ src: ArraySlice<UInt8>, _ algorithm: compression_algorithm, name: String, maxOutput: Int) -> Result<Data, Failure> {
+        if src.isEmpty { return .success(Data()) }
         let chunk = 1 << 16
         let out = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
         defer { out.deallocate() }
         var s = compression_stream(dst_ptr: out, dst_size: 0, src_ptr: UnsafePointer(out), src_size: 0, state: nil)
-        guard compression_stream_init(&s, COMPRESSION_STREAM_DECODE, algorithm) == COMPRESSION_STATUS_OK else { return nil }
+        guard compression_stream_init(&s, COMPRESSION_STREAM_DECODE, algorithm) == COMPRESSION_STATUS_OK else { return .failure(.unsupported(name)) }
         defer { compression_stream_destroy(&s) }
         var result = Data()
-        return src.withUnsafeBufferPointer { sb -> Data? in
-            guard let base = sb.baseAddress else { return nil }
+        return src.withUnsafeBufferPointer { sb -> Result<Data, Failure> in
+            guard let base = sb.baseAddress else { return .failure(.corrupt(name)) }
             s.src_ptr = base
             s.src_size = sb.count
             while true {
@@ -113,11 +135,11 @@ enum ContentDecoding {
                 s.dst_size = chunk
                 let st = compression_stream_process(&s, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
                 let produced = chunk - s.dst_size
+                if result.count + produced > maxOutput { return .failure(.tooLarge(maxOutput)) }
                 if produced > 0 { result.append(out, count: produced) }
-                if st == COMPRESSION_STATUS_END { return result }
-                // 壊れている・途中で切れている: 戻せた所までを使う（何も戻せなければ失敗）
-                if st != COMPRESSION_STATUS_OK || (produced == 0 && s.src_size == 0) { return result.isEmpty ? nil : result }
-                if result.count > 256 << 20 { return nil }
+                if st == COMPRESSION_STATUS_END { return .success(result) }
+                if st != COMPRESSION_STATUS_OK { return .failure(.corrupt(name)) }
+                if produced == 0 && s.src_size == 0 { return .failure(.corrupt("\(name)・途中で切れています")) }
             }
         }
     }

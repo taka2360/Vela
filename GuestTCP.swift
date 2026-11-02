@@ -27,6 +27,13 @@ final class GuestTCP: @unchecked Sendable {
     private let mss = 1460
     private var lastProgress = Date()
     private var retries = 0
+    /// 順番を飛ばして届いたデータ（番号 → 中身）。間が届いたら続けて渡す（落ちたフレームの分だけ送り直してもらえば済む）
+    private var ooo: [UInt32: [UInt8]] = [:]
+    private var oooBytes = 0
+    static let reorderLimit = 256 * 1024
+    /// 相手の窓が 0 になってからの時刻（窓を探る「持続タイマー」用）
+    private var zeroWindowSince: Date?
+    static let maxZeroWindow: TimeInterval = 60
 
     init(stack: GuestStack, lport: UInt16, rip: [UInt8], rport: UInt16, handler: Handler) {
         self.stack = stack; self.lport = lport; self.rip = rip; self.rport = rport; self.handler = handler
@@ -104,6 +111,7 @@ final class GuestTCP: @unchecked Sendable {
     /// 届いたセグメント
     func input(_ h: TCPHeader, payload: ArraySlice<UInt8>) {
         peerWindow = Int(h.window)
+        if peerWindow > 0 { zeroWindowSince = nil } else if zeroWindowSince == nil { zeroWindowSince = Date() }
         if h.flags.contains(.rst) {
             stack.trace?("← TCP RST \(rip.ipString):\(rport)")
             finish(state == .synSent ? "つながりませんでした" : "相手に切られました")
@@ -136,10 +144,8 @@ final class GuestTCP: @unchecked Sendable {
         }
         var needAck = false
         if !payload.isEmpty {
-            if h.seq == rcvNxt {
-                rcvNxt &+= UInt32(payload.count)
-                handler.data(Data(payload))
-            }
+            deliver(seq: h.seq, Array(payload))
+            if state == .closed { return }
             needAck = true
         }
         if h.flags.contains(.fin) && h.seq &+ UInt32(payload.count) == rcvNxt && !gotFIN {
@@ -156,9 +162,54 @@ final class GuestTCP: @unchecked Sendable {
         }
     }
 
-    /// 時間で見る（送り直し）
+    /// 届いた中身を、番号の順に渡す。重なっている所は外し、先の分は取っておく
+    private func deliver(seq start: UInt32, _ bytes: [UInt8]) {
+        var seq = start
+        var data = bytes
+        let before = Int32(bitPattern: rcvNxt &- seq)       // > 0: rcvNxt より前から始まる（送り直しの重なり）
+        if before > 0 {
+            if Int(before) >= data.count { return }         // 全部受け取り済み
+            data.removeFirst(Int(before))
+            seq = rcvNxt
+        }
+        if seq != rcvNxt {
+            // 先の分: 窓の中で、置き場に余裕があれば取っておく
+            let ahead = Int(Int32(bitPattern: seq &- rcvNxt))
+            if ahead > 0 && ahead < GuestTCP.reorderLimit && oooBytes + data.count <= GuestTCP.reorderLimit && ooo[seq] == nil {
+                ooo[seq] = data
+                oooBytes += data.count
+                stack.reordered += 1
+            }
+            return
+        }
+        rcvNxt &+= UInt32(data.count)
+        handler.data(Data(data))
+        // 取っておいた先の分が続いていれば渡す
+        while state != .closed, let (k, v) = ooo.first(where: { Int32(bitPattern: rcvNxt &- $0.key) >= 0 }) {
+            ooo[k] = nil
+            oooBytes -= v.count
+            let skip = Int(Int32(bitPattern: rcvNxt &- k))
+            if skip < v.count {
+                let rest = v[skip...]
+                rcvNxt &+= UInt32(rest.count)
+                handler.data(Data(rest))
+            }
+        }
+    }
+
+    /// 時間で見る（送り直し・窓を探る）
     func tick(_ now: Date) {
         if now.timeIntervalSince(lastProgress) < 1 { return }
+        // 相手の窓が 0: 送り直しの回数に数えずに、1 バイトだけ送って窓が開いたかを探る（持続タイマー）。長く開かなければ切る
+        if state == .established && peerWindow == 0 && !sendBuf.isEmpty {
+            if let z = zeroWindowSince, now.timeIntervalSince(z) > GuestTCP.maxZeroWindow { abort(); return }
+            sndNxt = sndUna
+            finSent = false
+            send([.ack, .psh], payload: ArraySlice(sendBuf.prefix(1)))
+            sndNxt = sndUna &+ 1
+            lastProgress = now
+            return
+        }
         if state == .synSent {
             retries += 1
             if retries > 8 { finish("つながりませんでした（時間切れ）"); return }
@@ -168,6 +219,7 @@ final class GuestTCP: @unchecked Sendable {
             retries += 1
             if retries > 12 { abort(); return }
             // 受け取りの返事が来ない: 先頭から送り直す
+            stack.retransmits += 1
             sndNxt = sndUna
             finSent = false
             lastProgress = now

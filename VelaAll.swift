@@ -1,5 +1,5 @@
 // このファイルは merge_swift.py で自動生成したものです（直接編集しないでください）
-// 元ファイル: MyApp.swift, BrowserView.swift, BrowserModel.swift, Persistence.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
+// 元ファイル: MyApp.swift, BrowserView.swift, BrowserModel.swift, Persistence.swift, DevLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
 
 import SwiftUI
 import WebKit
@@ -103,30 +103,6 @@ struct BrowserView: View {
 // ・JavaScript が作るアドレス（fetch・XMLHttpRequest・img.src など）も、ページに入れた小さなスクリプトで書き換える
 // ・それでも直接読もうとするものは止める（実験なので、混ざらないように）
 
-/// ログをためておく（どのスレッドからでも足せる。画面には 0.3 秒ごとにまとめて出す。毎回出すと重い）
-final class LogBuffer: @unchecked Sendable {
-    private let lock = NSLock()
-    private var lines: [String] = []
-    private var dirty = false
-    let maxLines = 200
-
-    func add(_ s: String) {
-        lock.lock()
-        lines.append(s)
-        if lines.count > maxLines { lines.removeFirst(lines.count - maxLines) }
-        dirty = true
-        lock.unlock()
-    }
-
-    /// 変わっていれば全部を 1 つの文字列にして返す
-    func take() -> String? {
-        lock.lock(); defer { lock.unlock() }
-        if !dirty { return nil }
-        dirty = false
-        return lines.joined(separator: "\n")
-    }
-}
-
 /// 通信の作り
 enum NetMode: String {
     /// https・http をそのまま VNetScheme が引き受ける（アドレスは本物の https://…）
@@ -159,7 +135,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
     private let cookies = CookieBridge()
     private let actions = PageActionBridge()
     private var cookieSync: WebCookieSync?
-    private let logs = LogBuffer()
+    /// 開発者向けのログ（どのスレッドからでも書ける。画面には 0.3 秒ごとにまとめて出す）
+    let logs = DevLog()
     private var timer: Timer?
     private var logTimer: Timer?
 
@@ -298,8 +275,13 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
 
     private func refreshStatus() {
         guard mode.usesVNet else { status = "通信: \(mode.rawValue)"; return }
-        let ip = machine.stack.ready ? "IP \(machine.stack.ip.ipString)" : "IP をもらっています…"
-        status = "\(mode.rawValue)・\(ip)・\(machine.stats())"
+        let name = mode.rawValue
+        machine.stats { [weak self] s in
+            let model = self
+            let ip = s.ready ? "IP \(s.ip)" : "IP をもらっています…"
+            let text = "\(name)・\(ip)・\(s.summary)"
+            Task { @MainActor in model?.status = text }
+        }
     }
 
     /// エラーページのボタン・守りのスクリプトからの知らせ
@@ -369,6 +351,82 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
 // MARK: - Persistence.swift
 // ======================================================================
 
+// MARK: - データのファイル（Application Support/Vela/ の JSON）
+//
+// タブ・ブックマーク・履歴などを Codable の JSON で置く。書き込みはまとめて（delay 秒後に 1 回）、裏のキューで、
+// いったん別の名前に書いてから置き換える（.atomic。書いている途中で落ちても前のものが残る）
+
+final class JSONFile<Value: Codable>: @unchecked Sendable {
+    let url: URL
+    private let lock = NSLock()
+    private let queue: DispatchQueue
+    private let delay: TimeInterval
+    private var pending: Value?
+    private var scheduled = false
+    /// 読み書きの失敗（開発者向けのログに出す）
+    var log: (@Sendable (String) -> Void)?
+
+    /// name: ファイルの名前（例: "tabs.json"）。directory を省くと Application Support/Vela/
+    init(name: String, directory: URL? = nil, delay: TimeInterval = 1.0) {
+        let dir = directory ?? JSONFile.defaultDirectory()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        url = dir.appendingPathComponent(name)
+        self.delay = delay
+        queue = DispatchQueue(label: "vela-json-\(name)")
+    }
+
+    static func defaultDirectory() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("Vela", isDirectory: true)
+    }
+
+    /// 読む（無い・壊れているなら nil。壊れていたファイルは .broken に名前を変えて残す）
+    func load() -> Value? {
+        guard let d = try? Data(contentsOf: url) else { return nil }
+        do {
+            return try JSONDecoder().decode(Value.self, from: d)
+        } catch {
+            log?("⚠️ \(url.lastPathComponent) を読めません（\(error)）。.broken として残します")
+            let broken = url.appendingPathExtension("broken")
+            try? FileManager.default.removeItem(at: broken)
+            try? FileManager.default.moveItem(at: url, to: broken)
+            return nil
+        }
+    }
+
+    /// 保存する（delay 秒の間に何度呼んでも、書くのは最後の 1 回）
+    func save(_ v: Value) {
+        lock.lock()
+        pending = v
+        if scheduled { lock.unlock(); return }
+        scheduled = true
+        lock.unlock()
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in self?.flush() }
+    }
+
+    /// 待っている分をすぐ書く（アプリが裏に回るときなど）。書き終わるまで待つ
+    func saveNow(_ v: Value? = nil) {
+        if let v { lock.lock(); pending = v; lock.unlock() }
+        queue.sync { self.flush() }
+    }
+
+    private func flush() {
+        lock.lock()
+        let v = pending
+        pending = nil
+        scheduled = false
+        lock.unlock()
+        guard let v else { return }
+        do {
+            let d = try JSONEncoder().encode(v)
+            try d.write(to: url, options: .atomic)
+        } catch {
+            log?("⚠️ \(url.lastPathComponent) を書けません（\(error)）")
+        }
+    }
+}
+
 // MARK: - 設定（UserDefaults に置く）
 //
 // 通信まわりの設定は、アプリを起動し直したときに効く（WebView や通信の作りを、起動のときに決めるため）
@@ -416,6 +474,136 @@ enum VelaSettings {
         s.blockThirdParty = blockThirdPartyCookies
         s.laxByDefault = cookiesLaxByDefault
         return s
+    }
+}
+
+// ======================================================================
+// MARK: - DevLog.swift
+// ======================================================================
+
+// MARK: - 開発者向けのログ（どのスレッドからでも書ける）
+//
+// 1 行ずつ「時刻・重さ・種類・タブ・本文」を持って、最新 maxEntries 件まで覚える（古いものから消す）。
+// 今までの log?("…") の文字列も、そのまま add で入れられる（先頭の記号から種類と重さを決める）。
+// 画面へは、必要なときに entries(after:) で差分だけ取り出す（毎回全部を作り直すと重い）
+
+enum LogLevel: Int, Comparable, Sendable, CaseIterable {
+    case debug, info, warning, error
+    static func < (a: LogLevel, b: LogLevel) -> Bool { a.rawValue < b.rawValue }
+    var mark: String {
+        switch self { case .debug: return "·"; case .info: return " "; case .warning: return "⚠"; case .error: return "✕" }
+    }
+}
+
+enum LogCategory: String, Sendable, CaseIterable {
+    case app = "アプリ"
+    case vnet = "VNet"
+    case net = "通信"
+    case nav = "移動"
+    case cookie = "Cookie"
+    case security = "守り"
+    case block = "ブロック"
+    case download = "ダウンロード"
+    case js = "JS"
+}
+
+struct LogEntry: Sendable, Identifiable {
+    let id: Int
+    let time: Date
+    let level: LogLevel
+    let category: LogCategory
+    /// どのタブのものか（タブに関係ないものは nil）
+    let tab: Int?
+    let message: String
+
+    private static let timeFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "HH:mm:ss.SSS"
+        return f
+    }()
+
+    var line: String {
+        "\(LogEntry.timeFormat.string(from: time)) \(level.mark) [\(category.rawValue)\(tab.map { "#\($0)" } ?? "")] \(message)"
+    }
+}
+
+final class DevLog: @unchecked Sendable {
+    static let maxEntries = 5000
+    private let lock = NSLock()
+    private var ring: [LogEntry] = []
+    private var start = 0           // ring の中で一番古いものの位置（いっぱいになってから使う）
+    private var nextID = 1
+    private var dirty = false
+    /// ログを書いた回数（重さごと。開発者パネル用）
+    private var counts: [LogLevel: Int] = [:]
+
+    init() {}
+
+    /// 今までの文字列のログ。先頭の記号などから種類と重さを決める
+    func add(_ message: String, tab: Int? = nil) {
+        let (level, category) = DevLog.classify(message)
+        add(message, level: level, category: category, tab: tab)
+    }
+
+    func add(_ message: String, level: LogLevel, category: LogCategory, tab: Int? = nil) {
+        lock.lock()
+        let e = LogEntry(id: nextID, time: Date(), level: level, category: category, tab: tab, message: message)
+        nextID += 1
+        if ring.count < DevLog.maxEntries {
+            ring.append(e)
+        } else {
+            ring[start] = e
+            start = (start + 1) % DevLog.maxEntries
+        }
+        counts[level, default: 0] += 1
+        dirty = true
+        lock.unlock()
+    }
+
+    /// 古い順に全部
+    func all() -> [LogEntry] {
+        lock.lock(); defer { lock.unlock() }
+        return Array(ring[start...] + ring[..<start])
+    }
+
+    /// id より新しいもの（古い順）。画面は最後に見た id を覚えておいて、差分だけもらう
+    func entries(after id: Int) -> [LogEntry] {
+        all().filter { $0.id > id }
+    }
+
+    func count(_ level: LogLevel) -> Int { lock.lock(); defer { lock.unlock() }; return counts[level] ?? 0 }
+
+    /// 変わっていれば、最新 lines 行を 1 つの文字列にして返す（今の簡易のログ表示用）
+    func take(lines: Int = 200) -> String? {
+        lock.lock()
+        if !dirty { lock.unlock(); return nil }
+        dirty = false
+        lock.unlock()
+        return all().suffix(lines).map { $0.message }.joined(separator: "\n")
+    }
+
+    /// 書き出し用（共有・コピー）
+    func export(minLevel: LogLevel = .debug) -> String {
+        all().filter { $0.level >= minLevel }.map { $0.line }.joined(separator: "\n")
+    }
+
+    func clear() {
+        lock.lock(); ring = []; start = 0; dirty = true; lock.unlock()
+    }
+
+    /// 文字列から種類と重さを決める（今までのログの書き方に合わせる）
+    static func classify(_ m: String) -> (LogLevel, LogCategory) {
+        let level: LogLevel = m.hasPrefix("✕") || m.contains("失敗") ? .error
+            : m.hasPrefix("⚠") ? .warning : .info
+        let category: LogCategory
+        if m.hasPrefix("🍪") { category = .cookie }
+        else if m.hasPrefix("🛡") || m.hasPrefix("🔒") || m.contains("HSTS") || m.contains("横取り") { category = .security }
+        else if m.hasPrefix("✓") || m.hasPrefix("✕") || m.hasPrefix("↪") || m.hasPrefix("――") { category = .net }
+        else if m.hasPrefix("→") || m.hasPrefix("←") || m.contains("TLS") || m.contains("DHCP") || m.contains("カード")
+                    || m.contains("[ネット]") || m.contains("TCP") { category = .vnet }
+        else { category = .app }
+        return (level, category)
     }
 }
 
@@ -478,6 +666,8 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         var webKitRedirects: Bool
         /// 要求の文脈（Cookie・LAN・HSTS の判定）
         var context: RequestContext
+        /// 取り消しの印（WebKit がやめたら、裏の通信も止める）
+        let token = RequestToken()
         /// 予備の vnets:// の作りの要求か
         var vnetsMode: Bool { VNetURL.isVNet(shownURL) }
     }
@@ -496,8 +686,12 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     }
 
     func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {
-        pending[ObjectIdentifier(task)] = nil
+        // 裏の通信も止める（待ち行列から外す・読んでいる途中の接続は切る）
+        pending.removeValue(forKey: ObjectIdentifier(task))?.token.cancel()
     }
+
+    /// 読み込み中の要求の数（開発者向け）
+    var pendingCount: Int { pending.count }
 
     private func start(_ task: WKURLSchemeTask) {
         guard let shown = task.request.url, let real = VNetURL.toReal(shown), let machine else {
@@ -534,6 +728,8 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     }
 
     private func fetch(_ id: ObjectIdentifier, _ req: HTTPRequest, followRedirects: Bool, machine: VNetMachine) {
+        var req = req
+        req.token = pending[id]?.token
         machine.send(req, followRedirects: followRedirects) { [weak self] result in
             let me = self   // weak の self は var なので、並行で動く閉包からは直接さわれない。let に受け直す
             DispatchQueue.main.async { me?.finish(id, result) }
@@ -2220,6 +2416,8 @@ struct HTTPRequest: Sendable {
     var body: Data?
     /// どんな場面の要求か（Cookie・リダイレクト・LAN の判定に使う）
     var context = RequestContext()
+    /// 取り消しの印（WebKit が読み込みをやめたら cancel される）
+    var token: RequestToken?
 }
 
 struct HTTPResult: Sendable {
@@ -2242,6 +2440,8 @@ struct FetchError: Error, Sendable, CustomStringConvertible {
         case blocked
         /// ページが LAN へ移動しようとした。ユーザーが許可すれば開ける
         case localNetworkConsent
+        /// 要求が多すぎて受け付けられない（待ち行列がいっぱい）
+        case busy
     }
     let description: String
     var kind: Kind
@@ -2301,16 +2501,30 @@ final class HTTPConn: @unchecked Sendable {
             closed: { [weak self] err in self?.tls?.tcpClosed(err) }))
     }
 
-    /// 要求を 1 つ送る（返事を読み終わったら done）
-    func send(_ bytes: Data, isHead: Bool, done: @escaping Completion) {
+    /// 要求を 1 つ送る（返事を読み終わったら done）。何回目の要求か（取り消しに使う番号）を返す
+    /// onGrow: 返事の中身が増えたとき（増えたバイト数）
+    @discardableResult
+    func send(_ bytes: Data, isHead: Bool, limits: ResponseParser.Limits = ResponseParser.Limits(),
+              onGrow: ((Int) -> Void)? = nil, done: @escaping Completion) -> Int {
         uses += 1
-        if !alive { done(.failure(FetchError("接続が閉じています", kind: .reset)), false, true); return }
-        parser = ResponseParser(isHead: isHead)
+        serial += 1
+        if !alive { done(.failure(FetchError("接続が閉じています", kind: .reset)), false, true); return serial }
+        let p = ResponseParser(isHead: isHead, limits: limits)
+        p.onBodyGrow = onGrow
+        parser = p
         onDone = done
         lastActivity = Date()
-        serial += 1
         watch(serial)
         if ready { write(bytes) } else { queued = bytes }
+        return serial
+    }
+
+    /// 読んでいる途中の要求を取り消す（その要求の番号のときだけ）。接続は切って、使い回さない
+    func cancel(serial s: Int) {
+        guard s == serial, onDone != nil else { return }
+        alive = false
+        finishCurrent(.failure(HTTPPool.cancelled), reusable: false)
+        tcp?.abort()
     }
 
     /// 時間切れの見張り（5 秒ごと）。返事を待っている間に長く何も届かなければ切る
@@ -2342,6 +2556,15 @@ final class HTTPConn: @unchecked Sendable {
         lastActivity = Date()
         guard let p = parser else { return }
         p.feed(d)
+        if let f = p.failure {
+            // おかしな返事: その要求は失敗にして、接続は切る（続きのバイトの区切りが信用できないため）
+            alive = false
+            let kind: FetchError.Kind
+            if case .tooLarge = f { kind = .tooLarge } else { kind = .malformed }
+            finishCurrent(.failure(FetchError(f.description, kind: kind)), reusable: false)
+            tcp?.abort()
+            return
+        }
         if p.complete { finishCurrent(.success(p), reusable: p.keepAlive && alive) }
     }
 
@@ -2368,23 +2591,91 @@ final class HTTPConn: @unchecked Sendable {
     }
 }
 
+// MARK: - 取り消し
+
+/// 要求の取り消しの印。WebKit が読み込みをやめたら（VNetScheme.stop）cancel() する。
+/// HTTPPool は、待っている要求は列から外し、読んでいる途中の接続は切る（使い回さない）
+final class RequestToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var handlers: [() -> Void] = []
+
+    init() {}
+
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+
+    /// 取り消す（何度呼んでもよい）。登録された処理は、呼んだスレッドで 1 回ずつ動く
+    func cancel() {
+        lock.lock()
+        if cancelled { lock.unlock(); return }
+        cancelled = true
+        let hs = handlers
+        handlers = []
+        lock.unlock()
+        for h in hs { h() }
+    }
+
+    /// 取り消されたときの処理を登録する（もう取り消されていれば、すぐ動く）
+    func onCancel(_ h: @escaping () -> Void) {
+        lock.lock()
+        if cancelled { lock.unlock(); h(); return }
+        handlers.append(h)
+        lock.unlock()
+    }
+}
+
 // MARK: - 接続の置き場と、要求の受付
+
+/// 資源の上限（メモリ・接続の数・待ち行列）
+struct PoolLimits: Sendable {
+    /// 同じ相手への同時の接続（ブラウザと同じ）
+    var maxPerHost = 6
+    /// 全部の相手への接続の合計（使っていないものも含む）
+    var maxTotalConnections = 32
+    /// 待っている要求の合計（これを超えたら失敗にする）
+    var maxWaiting = 256
+    /// 1 つの返事の中身の上限（縮めたものを戻した後も同じ）
+    var maxBodyPerRequest = 32 << 20
+    /// 読んでいる途中の返事の中身の合計。超えている間は、新しい要求を待たせる
+    var maxBufferedTotal = 128 << 20
+    init() {}
+}
+
+/// 開発者向けの数字（queue の上で作ったスナップショット）
+struct PoolStats: Sendable {
+    var opened = 0, reused = 0
+    var busy = 0, idle = 0, waiting = 0
+    var bufferedBytes = 0
+    var dnsCached = 0
+}
 
 /// 接続の置き場（相手ごと）と、要求の受付。すべて stack.queue の上で呼ぶ
 final class HTTPPool: @unchecked Sendable {
     let stack: GuestStack
     /// ブラウザ（WebKit）が User-Agent を付けてこなかったときに使う
     var userAgent = BrowserIdentity.userAgent
-    let maxPerHost = 6
+    var limits = PoolLimits()
+
+    /// 待っている要求（取り消されたら、順番が来たときに cancel を呼んで飛ばす）
+    private struct Waiter {
+        let token: RequestToken?
+        let run: () -> Void
+        let cancel: () -> Void
+    }
     private var idle: [String: [HTTPConn]] = [:]
     private var busy: [String: Int] = [:]
-    private var waiting: [String: [() -> Void]] = [:]
+    /// 相手ごとの待ち（同じ相手への接続が maxPerHost 本使われている）
+    private var waiting: [String: [Waiter]] = [:]
+    /// 全体の待ち（接続の合計が上限・貯めている中身が上限）
+    private var admission: [Waiter] = []
     private var dnsCache: [String: (ip: [UInt8], at: Date)] = [:]
     /// 名前を引いて分かったアドレスの種類（トップのページが LAN のものかを見るのに使う）
     private var hostClass: [String: IPClass] = [:]
     /// 使っていない接続を、これより長く置いておかない（相手はたいてい黙って閉じている）
     let idleLimit: TimeInterval = 50
     private(set) var reused = 0, opened = 0
+    /// 読んでいる途中の返事の中身の合計（バイト）
+    private(set) var bufferedBytes = 0
     /// Cookie の写し（正本は WebKit）。nil なら Cookie を送らない・受け取らない
     var cookieJar: CookieJar?
     /// HSTS の記録（リダイレクトを https に上げる）
@@ -2398,9 +2689,16 @@ final class HTTPPool: @unchecked Sendable {
         self.stack = stack
     }
 
+    func stats() -> PoolStats {
+        pruneIdle()
+        return PoolStats(opened: opened, reused: reused, busy: busy.values.reduce(0, +), idle: idle.values.reduce(0) { $0 + $1.count },
+                         waiting: waitingCount(), bufferedBytes: bufferedBytes, dnsCached: dnsCache.count)
+    }
+
     /// 送って返事を受け取る（リダイレクトは追いかける）
     /// followRedirects が false なら 3xx もそのまま返す（移動はブラウザ（WebKit）に任せるとき）
     func send(_ req: HTTPRequest, followRedirects: Bool = true, redirects: Int = 0, carried: [CookieChange] = [], done: @escaping (Result<HTTPResult, FetchError>) -> Void) {
+        if req.token?.isCancelled == true { done(.failure(HTTPPool.cancelled)); return }
         sendOnce(req, retry: true) { [weak self] r in
             guard let self else { return }
             guard case .success(var res) = r else { done(r); return }
@@ -2431,6 +2729,8 @@ final class HTTPPool: @unchecked Sendable {
         }
     }
 
+    static let cancelled = FetchError("取り消しました", kind: .cancelled)
+
     private func sendOnce(_ req: HTTPRequest, retry: Bool, done: @escaping (Result<HTTPResult, FetchError>) -> Void) {
         guard let rawHost = req.url.host, let scheme = req.url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
             done(.failure(FetchError("http か https のアドレスではありません"))); return
@@ -2443,25 +2743,47 @@ final class HTTPPool: @unchecked Sendable {
         // 先に名前を引いて、LAN への接続かを判定する（接続を使い回すときも、要求ごとに判定する）
         resolve(host) { [weak self] ip in
             guard let self else { return }
+            if req.token?.isCancelled == true { done(.failure(HTTPPool.cancelled)); return }
             guard let ip else { done(.failure(FetchError("名前が見つかりません: \(host)", kind: .dns))); return }
             if let e = self.checkLocalNetwork(req, host: host, ip: ip) { done(.failure(e)); return }
             let bytes = self.requestBytes(req, host: host)
             let run: (HTTPConn) -> Void = { [weak self] c in
-                c.send(bytes, isHead: req.method == "HEAD") { r, reusable, gotNothing in
+                guard let self else { return }
+                if req.token?.isCancelled == true {
+                    self.release(c, reusable: c.alive)
+                    done(.failure(HTTPPool.cancelled))
+                    return
+                }
+                var held = 0
+                let serial = c.send(bytes, isHead: req.method == "HEAD", limits: self.parserLimits(),
+                                    onGrow: { [weak self] n in held += n; self?.bufferedBytes += n }) { [weak self] r, reusable, gotNothing in
                     guard let self else { return }
+                    self.bufferedBytes -= held
+                    held = 0
                     self.release(c, reusable: reusable)
                     switch r {
                     case .success(let p):
-                        done(.success(self.result(p, req: req)))
+                        done(self.result(p, req: req))
                     case .failure(let e):
-                        // 使い回した接続が、相手に閉じられていた: 新しい接続でもう一度
-                        if retry && gotNothing && c.uses > 1 { self.sendOnce(req, retry: false, done: done) }
+                        // 使い回した接続が、相手に閉じられていた: 新しい接続でもう一度（取り消したものは除く）
+                        if e.kind != .cancelled && retry && gotNothing && c.uses > 1 { self.sendOnce(req, retry: false, done: done) }
                         else { done(.failure(e)) }
                     }
                 }
+                let q = self.stack.queue
+                req.token?.onCancel { [weak c] in q.async { c?.cancel(serial: serial) } }
             }
-            self.acquire(key: key, host: host, ip: ip, port: port, https: https, run: run)
+            self.admit(req.token, cancel: { done(.failure(HTTPPool.cancelled)) }, fail: { done(.failure($0)) }) { [weak self] in
+                self?.acquire(key: key, host: host, ip: ip, port: port, https: https, token: req.token,
+                              cancel: { done(.failure(HTTPPool.cancelled)) }, fail: { done(.failure($0)) }, run: run)
+            }
         }
+    }
+
+    private func parserLimits() -> ResponseParser.Limits {
+        var l = ResponseParser.Limits()
+        l.maxBody = limits.maxBodyPerRequest
+        return l
     }
 
     /// LAN への接続を判定する。止めるならエラーを返す
@@ -2492,23 +2814,72 @@ final class HTTPPool: @unchecked Sendable {
         return LocalNetworkPolicy.classify(host: h) ?? hostClass[h] ?? .publicAddress
     }
 
-    /// 空いている接続を使う。無ければ作る（6 本までなら）。いっぱいなら空くまで待つ
-    private func acquire(key: String, host: String, ip: [UInt8], port: UInt16, https: Bool, run: @escaping (HTTPConn) -> Void) {
-        while var list = idle[key], let c = list.popLast() {
-            idle[key] = list
-            if c.alive && Date().timeIntervalSince(c.idleSince) > idleLimit { c.close(); continue }
-            if c.alive {
-                busy[key, default: 0] += 1
-                reused += 1
-                run(c)
+    // MARK: 待ち行列と上限
+
+    private func waitingCount() -> Int {
+        admission.filter { $0.token?.isCancelled != true }.count
+            + waiting.values.reduce(0) { $0 + $1.filter { $0.token?.isCancelled != true }.count }
+    }
+
+    /// 待ち行列に入れる（いっぱいなら失敗）
+    private func enqueue(_ w: Waiter, key: String?, fail: (FetchError) -> Void) {
+        if waitingCount() >= limits.maxWaiting {
+            fail(FetchError("要求が多すぎます（\(limits.maxWaiting) 件待っています）", kind: .busy))
+            return
+        }
+        if let key { waiting[key, default: []].append(w) } else { admission.append(w) }
+    }
+
+    /// 貯めている中身が上限なら待たせる。空いていればすぐ go
+    private func admit(_ token: RequestToken?, cancel: @escaping () -> Void, fail: (FetchError) -> Void, _ go: @escaping () -> Void) {
+        if bufferedBytes < limits.maxBufferedTotal { go(); return }
+        stack.trace?("読んでいる途中の中身が \(bufferedBytes >> 20)MB あるので、新しい要求を待たせます")
+        enqueue(Waiter(token: token, run: go, cancel: cancel), key: nil, fail: fail)
+    }
+
+    /// 死んだ・古い「使っていない接続」を片付ける
+    private func pruneIdle() {
+        let now = Date()
+        for (k, list) in idle {
+            let keep = list.filter { c in
+                if c.alive && now.timeIntervalSince(c.idleSince) <= idleLimit { return true }
+                c.close()
+                return false
+            }
+            idle[k] = keep.isEmpty ? nil : keep
+        }
+    }
+
+    private var totalConnections: Int { busy.values.reduce(0, +) + idle.values.reduce(0) { $0 + $1.count } }
+
+    /// 空いている接続を使う。無ければ作る（上限まで）。いっぱいなら空くまで待つ
+    private func acquire(key: String, host: String, ip: [UInt8], port: UInt16, https: Bool, token: RequestToken?,
+                         cancel: @escaping () -> Void, fail: @escaping (FetchError) -> Void, run: @escaping (HTTPConn) -> Void) {
+        pruneIdle()
+        if var list = idle[key], let c = list.popLast() {
+            idle[key] = list.isEmpty ? nil : list
+            busy[key, default: 0] += 1
+            reused += 1
+            run(c)
+            return
+        }
+        let again = { [weak self] () -> Void in
+            self?.acquire(key: key, host: host, ip: ip, port: port, https: https, token: token, cancel: cancel, fail: fail, run: run)
+        }
+        if busy[key, default: 0] >= limits.maxPerHost {
+            enqueue(Waiter(token: token, run: again, cancel: cancel), key: key, fail: fail)
+            return
+        }
+        if totalConnections >= limits.maxTotalConnections {
+            // ほかの相手の、使っていない接続を 1 本閉じて場所を空ける。それも無ければ待つ
+            if let (k, list) = idle.first(where: { !$0.value.isEmpty }) {
+                var l = list
+                l.removeFirst().close()
+                idle[k] = l.isEmpty ? nil : l
+            } else {
+                enqueue(Waiter(token: token, run: again, cancel: cancel), key: nil, fail: fail)
                 return
             }
-        }
-        if busy[key, default: 0] >= maxPerHost {
-            waiting[key, default: []].append { [weak self] in
-                self?.acquire(key: key, host: host, ip: ip, port: port, https: https, run: run)
-            }
-            return
         }
         busy[key, default: 0] += 1
         let c = HTTPConn(key: key)
@@ -2517,18 +2888,27 @@ final class HTTPPool: @unchecked Sendable {
         run(c)
     }
 
-    /// 使い終わった接続を戻す（使い回せなければ閉じる）。待っている要求があれば 1 つ進める
+    /// 使い終わった接続を戻す（使い回せなければ閉じる）。待っている要求があれば進める
     private func release(_ c: HTTPConn, reusable: Bool) {
         if reusable && c.alive { c.idleSince = Date(); idle[c.key, default: []].append(c) } else { c.close() }
-        release(key: c.key)
+        busy[c.key, default: 1] -= 1
+        if busy[c.key] == 0 { busy[c.key] = nil }
+        drain(key: c.key)
     }
 
-    private func release(key: String) {
-        busy[key, default: 1] -= 1
-        if var w = waiting[key], !w.isEmpty {
+    /// 待っている要求を進める（相手ごとの待ち → 全体の待ち）。取り消されたものは飛ばす
+    private func drain(key: String) {
+        while var w = waiting[key], !w.isEmpty {
             let next = w.removeFirst()
-            waiting[key] = w
-            next()
+            waiting[key] = w.isEmpty ? nil : w
+            if next.token?.isCancelled == true { next.cancel(); continue }
+            next.run()
+            break
+        }
+        while !admission.isEmpty && bufferedBytes < limits.maxBufferedTotal && totalConnections < limits.maxTotalConnections {
+            let next = admission.removeFirst()
+            if next.token?.isCancelled == true { next.cancel(); continue }
+            next.run()
         }
     }
 
@@ -2598,7 +2978,7 @@ final class HTTPPool: @unchecked Sendable {
     }
 
     /// 返事をまとめる（Cookie を CookieJar に入れる・縮めた中身を戻す）
-    private func result(_ p: ResponseParser, req: HTTPRequest) -> HTTPResult {
+    private func result(_ p: ResponseParser, req: HTTPRequest) -> Result<HTTPResult, FetchError> {
         let url = req.url
         var headers = p.headers
         let lines = headers.values(for: "Set-Cookie")
@@ -2608,15 +2988,19 @@ final class HTTPPool: @unchecked Sendable {
         }
         var body = Data(p.body)
         if let enc = headers.value(for: "Content-Encoding"), !body.isEmpty {
-            if let g = ContentDecoding.decode(body, encoding: enc) {
+            switch ContentDecoding.decode(body, encoding: enc, maxOutput: limits.maxBodyPerRequest) {
+            case .success(let g):
                 body = g
                 headers.removeAll(named: ["content-encoding", "content-length"])
-            } else {
-                stack.trace?("縮めた中身（\(enc)）を戻せませんでした: \(url.absoluteString)")
+            case .failure(let f):
+                // 戻せない中身をそのまま渡すと、ページには壊れたデータになる。失敗にする
+                stack.trace?("縮めた中身（\(enc)）を戻せませんでした: \(url.absoluteString)（\(f.description)）")
+                if case .tooLarge = f { return .failure(FetchError(f.description, kind: .tooLarge)) }
+                return .failure(FetchError(f.description, kind: .malformed))
             }
         }
         headers.removeAll(named: ["transfer-encoding"])
-        return HTTPResult(status: p.status, headers: headers, body: body, url: url, cookieChanges: changes)
+        return .success(HTTPResult(status: p.status, headers: headers, body: body, url: url, cookieChanges: changes))
     }
 }
 
@@ -2627,10 +3011,39 @@ final class HTTPPool: @unchecked Sendable {
 // MARK: - http の返事を少しずつ読む
 //
 // ヘッダ → 中身。中身の終わりは「長さ指定（Content-Length）」「chunked」「閉じるまで」のどれか。
-// 100 Continue などの途中の返事は読み飛ばす
+// 100 Continue などの途中の返事は読み飛ばす。
+//
+// 外から来るデータなので、おかしなものは「壊れている（malformed）」「大きすぎる（tooLarge）」として止める（落ちない・貯めすぎない）:
+//  ・Content-Length は 0 以上の整数だけ。違う値が重複していたら拒否（同じ値の重複は 1 つにまとめる）
+//  ・Transfer-Encoding と Content-Length が両方あったら拒否（中身の境目があいまいになり、取り違えの元になるため）
+//  ・chunked: サイズは 16 進の数字だけ。チャンクの後ろは必ず CRLF。行・トレーラーの長さに上限
+//  ・ヘッダの合計・1 行・行数に上限。中身は limits.maxBody まで
+// 止めた接続は使い回さない（呼ぶ側の HTTPConn が閉じる）
 
 final class ResponseParser {
+    struct Limits {
+        var maxHeaderBytes = 64 * 1024
+        var maxHeaderLine = 8 * 1024
+        var maxHeaderCount = 100
+        var maxBody = 32 << 20
+        var maxChunkLine = 1024
+        var maxTrailerBytes = 8 * 1024
+        init() {}
+    }
+
+    enum Failure: Equatable {
+        case malformed(String)
+        case tooLarge(String)
+        var description: String {
+            switch self {
+            case .malformed(let s): return "返事が壊れています（\(s)）"
+            case .tooLarge(let s): return "返事が大きすぎます（\(s)）"
+            }
+        }
+    }
+
     let isHead: Bool
+    let limits: Limits
     private(set) var status = 0
     private(set) var headers: [(String, String)] = []
     private(set) var body = [UInt8]()
@@ -2638,30 +3051,44 @@ final class ResponseParser {
     private(set) var keepAlive = true
     /// 届いたバイト数（何も届かずに切れたかを見るため）
     private(set) var received = 0
+    /// おかしな返事だった（nil なら問題なし）
+    private(set) var failure: Failure?
+    /// 中身が増えたとき（増えたバイト数）。アプリ全体の貯めている量を数えるのに使う
+    var onBodyGrow: ((Int) -> Void)?
 
     private var head = [UInt8]()
     private var headDone = false
     private enum Mode { case length(Int), chunked, untilClose }
     private var mode = Mode.untilClose
-    private enum Chunk { case size, data(Int), dataEnd(Int), trailer }
+    private enum Chunk { case size, data(Int), cr, lf, trailer }
     private var chunk = Chunk.size
     private var line = [UInt8]()
+    private var trailerBytes = 0
 
-    init(isHead: Bool) { self.isHead = isHead }
+    init(isHead: Bool, limits: Limits = Limits()) {
+        self.isHead = isHead
+        self.limits = limits
+    }
 
     func feed(_ d: Data) {
         received += d.count
         var bytes = [UInt8](d)
-        while !complete && !bytes.isEmpty {
+        while !complete && failure == nil && !bytes.isEmpty {
             if headDone {
                 bytes = consumeBody(bytes)
                 continue
             }
             head.append(contentsOf: bytes)
-            guard let end = findHeadEnd() else { return }
+            guard let end = findHeadEnd() else {
+                if head.count > limits.maxHeaderBytes { fail(.tooLarge("ヘッダが \(limits.maxHeaderBytes / 1024)KB を超えています")) }
+                return
+            }
+            if end > limits.maxHeaderBytes { fail(.tooLarge("ヘッダが \(limits.maxHeaderBytes / 1024)KB を超えています")); return }
             bytes = Array(head[(end + 4)...])
-            parseHead(Array(head[0..<end]))
+            let headBytes = Array(head[0..<end])
             head = []
+            parseHead(headBytes)
+            if failure != nil { return }
             if status >= 100 && status < 200 { headDone = false }     // 100 Continue など: 次のヘッダを読む
         }
     }
@@ -2669,8 +3096,14 @@ final class ResponseParser {
     /// 相手が閉じた: 「閉じるまで」の形なら、ここで終わり
     func closed() -> Bool {
         if complete { return true }
+        if failure != nil { return false }
         if headDone, case .untilClose = mode { complete = true; keepAlive = false; return true }
         return false
+    }
+
+    private func fail(_ f: Failure) {
+        if failure == nil { failure = f }
+        keepAlive = false
     }
 
     private func findHeadEnd() -> Int? {
@@ -2679,63 +3112,128 @@ final class ResponseParser {
         return nil
     }
 
+    private func appendBody<C: Collection>(_ b: C) where C.Element == UInt8 {
+        if b.isEmpty { return }
+        if body.count + b.count > limits.maxBody {
+            fail(.tooLarge("中身が \(limits.maxBody >> 20)MB を超えています"))
+            return
+        }
+        body.append(contentsOf: b)
+        onBodyGrow?(b.count)
+    }
+
     private func parseHead(_ headBytes: [UInt8]) {
         headDone = true
         var lines = String(decoding: headBytes, as: UTF8.self).components(separatedBy: "\r\n")
         let first = lines.removeFirst()
-        let parts = first.split(separator: " ")
-        status = parts.count >= 2 ? Int(parts[1]) ?? 0 : 0
-        headers = lines.compactMap { l -> (String, String)? in
-            guard let c = l.firstIndex(of: ":") else { return nil }
-            return (String(l[..<c]).trimmingCharacters(in: .whitespaces), String(l[l.index(after: c)...]).trimmingCharacters(in: .whitespaces))
+        // 状態の行: "HTTP/1.1 200 OK"
+        let parts = first.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: false)
+        guard parts.count >= 2, parts[0].hasPrefix("HTTP/1."), parts[1].count == 3, let st = Int(parts[1]), (100...599).contains(st) else {
+            fail(.malformed("状態の行が読めません: \(first.prefix(60))")); return
         }
+        status = st
+        if lines.count > limits.maxHeaderCount { fail(.tooLarge("ヘッダが \(limits.maxHeaderCount) 行を超えています")); return }
+        var hs: [(String, String)] = []
+        for l in lines {
+            if l.utf8.count > limits.maxHeaderLine { fail(.tooLarge("ヘッダの 1 行が \(limits.maxHeaderLine / 1024)KB を超えています")); return }
+            if l.isEmpty { continue }
+            guard let c = l.firstIndex(of: ":") else {
+                if l.first == " " || l.first == "\t" { fail(.malformed("折り返したヘッダ（obs-fold）")); return }
+                continue
+            }
+            let name = String(l[..<c])
+            if name.isEmpty || name.contains(" ") || name.contains("\t") { fail(.malformed("ヘッダの名前が不正: \(name.prefix(40))")); return }
+            hs.append((name, String(l[l.index(after: c)...]).trimmingCharacters(in: .whitespaces)))
+        }
+        headers = hs
         let conn = headers.value(for: "Connection")?.lowercased() ?? ""
         keepAlive = first.hasPrefix("HTTP/1.0") ? conn.contains("keep-alive") : !conn.contains("close")
         if status >= 100 && status < 200 { return }
+
+        // 中身の長さの決め方
+        let te = headers.values(for: "Transfer-Encoding")
+        let cls = headers.values(for: "Content-Length")
+        if !te.isEmpty && !cls.isEmpty { fail(.malformed("Transfer-Encoding と Content-Length が両方あります")); return }
+        var length: Int?
+        if !cls.isEmpty {
+            var values = Set<String>()
+            for v in cls { for p in v.split(separator: ",", omittingEmptySubsequences: false) { values.insert(p.trimmingCharacters(in: .whitespaces)) } }
+            guard values.count == 1, let v = values.first, !v.isEmpty, v.count <= 18, v.allSatisfy({ $0.isASCII && $0.isNumber }), let n = Int(v) else {
+                fail(.malformed("Content-Length が不正: \(cls.joined(separator: " / ").prefix(60))")); return
+            }
+            length = n
+        }
         if isHead || status == 204 || status == 304 { complete = true; return }
-        if headers.value(for: "Transfer-Encoding")?.lowercased().contains("chunked") == true { mode = .chunked }
-        else if let l = headers.value(for: "Content-Length"), let n = Int(l) { mode = .length(n); if n == 0 { complete = true } }
-        else { mode = .untilClose; keepAlive = false }
+        if !te.isEmpty {
+            let codings = te.joined(separator: ",").lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            if codings.last == "chunked" { mode = .chunked }
+            else { mode = .untilClose; keepAlive = false }          // chunked で終わらないなら、閉じるまで（RFC 9112 6.3）
+        } else if let n = length {
+            if n > limits.maxBody { fail(.tooLarge("Content-Length が \(limits.maxBody >> 20)MB を超えています（\(n)）")); return }
+            mode = .length(n)
+            if n == 0 { complete = true }
+        } else {
+            mode = .untilClose; keepAlive = false
+        }
     }
 
     /// 中身を読む。余り（次の返事の分。普通は無い）を返す
     private func consumeBody(_ b: [UInt8]) -> [UInt8] {
         switch mode {
         case .untilClose:
-            body.append(contentsOf: b)
+            appendBody(b)
             return []
         case .length(let n):
-            let take = min(n - body.count, b.count)
-            body.append(contentsOf: b[0..<take])
+            let take = min(max(n - body.count, 0), b.count)
+            appendBody(b[0..<take])
             if body.count >= n { complete = true }
             return Array(b[take...])
         case .chunked:
             var i = 0
-            while i < b.count && !complete {
+            while i < b.count && !complete && failure == nil {
                 switch chunk {
                 case .size, .trailer:
                     let c = b[i]; i += 1
-                    guard c == 10 else { line.append(c); continue }
-                    let text = String(decoding: line, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if c != 10 {
+                        line.append(c)
+                        if case .trailer = chunk {
+                            trailerBytes += 1
+                            if trailerBytes > limits.maxTrailerBytes { fail(.tooLarge("トレーラーが \(limits.maxTrailerBytes / 1024)KB を超えています")) }
+                        } else if line.count > limits.maxChunkLine {
+                            fail(.malformed("チャンクのサイズの行が長すぎます"))
+                        }
+                        continue
+                    }
+                    if line.last == 13 { line.removeLast() }
+                    let text = String(decoding: line, as: UTF8.self)
                     line = []
                     if case .trailer = chunk {
                         if text.isEmpty { complete = true }
                     } else {
-                        let sizeText = text.split(separator: ";").first.map(String.init) ?? ""
-                        let n = Int(sizeText, radix: 16) ?? 0
+                        let sizeText = (text.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? "")
+                            .trimmingCharacters(in: CharacterSet(charactersIn: " \t"))
+                        guard !sizeText.isEmpty, sizeText.count <= 16, sizeText.allSatisfy({ $0.isHexDigit }), let n = Int(sizeText, radix: 16) else {
+                            fail(.malformed("チャンクのサイズが不正: \(sizeText.prefix(20))")); break
+                        }
+                        if n > limits.maxBody - body.count { fail(.tooLarge("チャンクが大きすぎます（\(n)）")); break }
                         chunk = n == 0 ? .trailer : .data(n)
                     }
                 case .data(let remain):
                     let take = min(remain, b.count - i)
-                    body.append(contentsOf: b[i..<(i + take)])
+                    appendBody(b[i..<(i + take)])
                     i += take
-                    chunk = remain - take == 0 ? .dataEnd(2) : .data(remain - take)
-                case .dataEnd(let k):                          // 中身のあとの \r\n
+                    chunk = remain - take == 0 ? .cr : .data(remain - take)
+                case .cr:                                     // 中身のあとの \r\n（必ずこの 2 バイト）
+                    guard b[i] == 13 else { fail(.malformed("チャンクの後ろが CRLF ではありません")); break }
                     i += 1
-                    chunk = k - 1 == 0 ? .size : .dataEnd(k - 1)
+                    chunk = .lf
+                case .lf:
+                    guard b[i] == 10 else { fail(.malformed("チャンクの後ろが CRLF ではありません")); break }
+                    i += 1
+                    chunk = .size
                 }
             }
-            return Array(b[i...])
+            return Array(b[min(i, b.count)...])
         }
     }
 }
@@ -2779,71 +3277,93 @@ enum ContentDecoding {
         #endif
     }
 
-    /// Content-Encoding に従って戻す。知らない形・戻せないときは nil
-    static func decode(_ d: Data, encoding: String) -> Data? {
+    enum Failure: Error, Equatable {
+        /// 知らない縮め方（この環境で戻せないものも）
+        case unsupported(String)
+        /// 壊れている・途中で切れている
+        case corrupt(String)
+        /// 戻した大きさが上限を超えた（圧縮爆弾など）
+        case tooLarge(Int)
+
+        var description: String {
+            switch self {
+            case .unsupported(let e): return "戻せない縮め方です（\(e)）"
+            case .corrupt(let e): return "縮めた中身（\(e)）が壊れています"
+            case .tooLarge(let n): return "戻した中身が \(n >> 20)MB を超えます"
+            }
+        }
+    }
+
+    /// Content-Encoding に従って戻す。戻した大きさは maxOutput まで
+    static func decode(_ d: Data, encoding: String, maxOutput: Int = 32 << 20) -> Result<Data, Failure> {
         // "gzip, br" のように重ねてあるときは、後ろから戻す
         var out = d
         for e in encoding.lowercased().split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }).reversed() {
+            let r: Result<Data, Failure>
             switch e {
             case "", "identity": continue
-            case "gzip", "x-gzip": guard let g = gunzip(out) else { return nil }; out = g
-            case "deflate": guard let g = inflateZlib(out) else { return nil }; out = g
-            case "br": guard let g = brotli(out) else { return nil }; out = g
-            default: return nil
+            case "gzip", "x-gzip": r = gunzip(out, maxOutput: maxOutput)
+            case "deflate": r = inflateZlib(out, maxOutput: maxOutput)
+            case "br": r = brotli(out, maxOutput: maxOutput)
+            default: return .failure(.unsupported(e))
+            }
+            switch r {
+            case .success(let g): out = g
+            case .failure(let f): return .failure(f)
             }
         }
-        return out
+        return .success(out)
     }
 
     /// gzip: 前（10 バイト〜）と後ろ（8 バイト）を外して、生の deflate として戻す
-    static func gunzip(_ d: Data) -> Data? {
+    static func gunzip(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
         let b = [UInt8](d)
-        guard b.count >= 18, b[0] == 0x1F, b[1] == 0x8B, b[2] == 8 else { return nil }
+        guard b.count >= 18, b[0] == 0x1F, b[1] == 0x8B, b[2] == 8 else { return .failure(.corrupt("gzip の頭が違います")) }
         let flags = b[3]
         var p = 10
-        if flags & 4 != 0 { guard p + 2 <= b.count else { return nil }; p += 2 + (Int(b[p]) | Int(b[p + 1]) << 8) }   // FEXTRA
+        if flags & 4 != 0 { guard p + 2 <= b.count else { return .failure(.corrupt("gzip")) }; p += 2 + (Int(b[p]) | Int(b[p + 1]) << 8) }   // FEXTRA
         if flags & 8 != 0 { while p < b.count && b[p] != 0 { p += 1 }; p += 1 }                                      // FNAME
         if flags & 16 != 0 { while p < b.count && b[p] != 0 { p += 1 }; p += 1 }                                     // FCOMMENT
         if flags & 2 != 0 { p += 2 }                                                                                  // FHCRC
-        guard p < b.count else { return nil }
-        return inflateRaw(b[p...])
+        guard p < b.count else { return .failure(.corrupt("gzip")) }
+        return inflateRaw(b[p...], name: "gzip", maxOutput: maxOutput)
     }
 
     /// deflate: 本当は zlib の包み（2 バイト＋後ろ 4 バイト）付き。包みの無い生の deflate を送るサーバーもあるので両方受ける
-    static func inflateZlib(_ d: Data) -> Data? {
+    static func inflateZlib(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
         let b = [UInt8](d)
-        if b.count >= 2 && b[0] & 0x0F == 8 && (Int(b[0]) << 8 | Int(b[1])) % 31 == 0 { return inflateRaw(b[2...]) }
-        return inflateRaw(b[...])
+        if b.count >= 2 && b[0] & 0x0F == 8 && (Int(b[0]) << 8 | Int(b[1])) % 31 == 0 { return inflateRaw(b[2...], name: "deflate", maxOutput: maxOutput) }
+        return inflateRaw(b[...], name: "deflate", maxOutput: maxOutput)
     }
 
-    static func inflateRaw(_ b: ArraySlice<UInt8>) -> Data? {
+    static func inflateRaw(_ b: ArraySlice<UInt8>, name: String, maxOutput: Int) -> Result<Data, Failure> {
         #if canImport(Compression)
-        return stream(b, COMPRESSION_ZLIB)      // Apple の ZLIB は「生の deflate」
+        return stream(b, COMPRESSION_ZLIB, name: name, maxOutput: maxOutput)      // Apple の ZLIB は「生の deflate」
         #else
-        return nil
+        return .failure(.unsupported(name))
         #endif
     }
 
-    static func brotli(_ d: Data) -> Data? {
+    static func brotli(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
         #if canImport(Compression)
-        if #available(iOS 15.0, macOS 12.0, *) { return stream([UInt8](d)[...], COMPRESSION_BROTLI) }
+        if #available(iOS 15.0, macOS 12.0, *) { return stream([UInt8](d)[...], COMPRESSION_BROTLI, name: "br", maxOutput: maxOutput) }
         #endif
-        return nil
+        return .failure(.unsupported("br"))
     }
 
     #if canImport(Compression)
-    /// 元の大きさが分からなくても戻せるよう、少しずつ戻す
-    private static func stream(_ src: ArraySlice<UInt8>, _ algorithm: compression_algorithm) -> Data? {
-        if src.isEmpty { return Data() }
+    /// 元の大きさが分からなくても戻せるよう、少しずつ戻す。最後まで戻せなかったら壊れている扱い
+    private static func stream(_ src: ArraySlice<UInt8>, _ algorithm: compression_algorithm, name: String, maxOutput: Int) -> Result<Data, Failure> {
+        if src.isEmpty { return .success(Data()) }
         let chunk = 1 << 16
         let out = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
         defer { out.deallocate() }
         var s = compression_stream(dst_ptr: out, dst_size: 0, src_ptr: UnsafePointer(out), src_size: 0, state: nil)
-        guard compression_stream_init(&s, COMPRESSION_STREAM_DECODE, algorithm) == COMPRESSION_STATUS_OK else { return nil }
+        guard compression_stream_init(&s, COMPRESSION_STREAM_DECODE, algorithm) == COMPRESSION_STATUS_OK else { return .failure(.unsupported(name)) }
         defer { compression_stream_destroy(&s) }
         var result = Data()
-        return src.withUnsafeBufferPointer { sb -> Data? in
-            guard let base = sb.baseAddress else { return nil }
+        return src.withUnsafeBufferPointer { sb -> Result<Data, Failure> in
+            guard let base = sb.baseAddress else { return .failure(.corrupt(name)) }
             s.src_ptr = base
             s.src_size = sb.count
             while true {
@@ -2851,11 +3371,11 @@ enum ContentDecoding {
                 s.dst_size = chunk
                 let st = compression_stream_process(&s, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
                 let produced = chunk - s.dst_size
+                if result.count + produced > maxOutput { return .failure(.tooLarge(maxOutput)) }
                 if produced > 0 { result.append(out, count: produced) }
-                if st == COMPRESSION_STATUS_END { return result }
-                // 壊れている・途中で切れている: 戻せた所までを使う（何も戻せなければ失敗）
-                if st != COMPRESSION_STATUS_OK || (produced == 0 && s.src_size == 0) { return result.isEmpty ? nil : result }
-                if result.count > 256 << 20 { return nil }
+                if st == COMPRESSION_STATUS_END { return .success(result) }
+                if st != COMPRESSION_STATUS_OK { return .failure(.corrupt(name)) }
+                if produced == 0 && s.src_size == 0 { return .failure(.corrupt("\(name)・途中で切れています")) }
             }
         }
     }
@@ -3091,6 +3611,10 @@ final class GuestStack: @unchecked Sendable {
     var output: (([UInt8]) -> Void)?
     /// 何が起きたかを知らせる（画面のログ用）
     var trace: ((String) -> Void)?
+    /// TCP の送り直しの回数（開発者向け。queue の上で数える）
+    var retransmits = 0
+    /// 順番を飛ばして届き、取っておいた TCP のセグメントの数（開発者向け）
+    var reordered = 0
 
     var mac = Net.guestMAC
     private(set) var ip = Net.zeroIP
@@ -3351,6 +3875,13 @@ final class GuestTCP: @unchecked Sendable {
     private let mss = 1460
     private var lastProgress = Date()
     private var retries = 0
+    /// 順番を飛ばして届いたデータ（番号 → 中身）。間が届いたら続けて渡す（落ちたフレームの分だけ送り直してもらえば済む）
+    private var ooo: [UInt32: [UInt8]] = [:]
+    private var oooBytes = 0
+    static let reorderLimit = 256 * 1024
+    /// 相手の窓が 0 になってからの時刻（窓を探る「持続タイマー」用）
+    private var zeroWindowSince: Date?
+    static let maxZeroWindow: TimeInterval = 60
 
     init(stack: GuestStack, lport: UInt16, rip: [UInt8], rport: UInt16, handler: Handler) {
         self.stack = stack; self.lport = lport; self.rip = rip; self.rport = rport; self.handler = handler
@@ -3428,6 +3959,7 @@ final class GuestTCP: @unchecked Sendable {
     /// 届いたセグメント
     func input(_ h: TCPHeader, payload: ArraySlice<UInt8>) {
         peerWindow = Int(h.window)
+        if peerWindow > 0 { zeroWindowSince = nil } else if zeroWindowSince == nil { zeroWindowSince = Date() }
         if h.flags.contains(.rst) {
             stack.trace?("← TCP RST \(rip.ipString):\(rport)")
             finish(state == .synSent ? "つながりませんでした" : "相手に切られました")
@@ -3460,10 +3992,8 @@ final class GuestTCP: @unchecked Sendable {
         }
         var needAck = false
         if !payload.isEmpty {
-            if h.seq == rcvNxt {
-                rcvNxt &+= UInt32(payload.count)
-                handler.data(Data(payload))
-            }
+            deliver(seq: h.seq, Array(payload))
+            if state == .closed { return }
             needAck = true
         }
         if h.flags.contains(.fin) && h.seq &+ UInt32(payload.count) == rcvNxt && !gotFIN {
@@ -3480,9 +4010,54 @@ final class GuestTCP: @unchecked Sendable {
         }
     }
 
-    /// 時間で見る（送り直し）
+    /// 届いた中身を、番号の順に渡す。重なっている所は外し、先の分は取っておく
+    private func deliver(seq start: UInt32, _ bytes: [UInt8]) {
+        var seq = start
+        var data = bytes
+        let before = Int32(bitPattern: rcvNxt &- seq)       // > 0: rcvNxt より前から始まる（送り直しの重なり）
+        if before > 0 {
+            if Int(before) >= data.count { return }         // 全部受け取り済み
+            data.removeFirst(Int(before))
+            seq = rcvNxt
+        }
+        if seq != rcvNxt {
+            // 先の分: 窓の中で、置き場に余裕があれば取っておく
+            let ahead = Int(Int32(bitPattern: seq &- rcvNxt))
+            if ahead > 0 && ahead < GuestTCP.reorderLimit && oooBytes + data.count <= GuestTCP.reorderLimit && ooo[seq] == nil {
+                ooo[seq] = data
+                oooBytes += data.count
+                stack.reordered += 1
+            }
+            return
+        }
+        rcvNxt &+= UInt32(data.count)
+        handler.data(Data(data))
+        // 取っておいた先の分が続いていれば渡す
+        while state != .closed, let (k, v) = ooo.first(where: { Int32(bitPattern: rcvNxt &- $0.key) >= 0 }) {
+            ooo[k] = nil
+            oooBytes -= v.count
+            let skip = Int(Int32(bitPattern: rcvNxt &- k))
+            if skip < v.count {
+                let rest = v[skip...]
+                rcvNxt &+= UInt32(rest.count)
+                handler.data(Data(rest))
+            }
+        }
+    }
+
+    /// 時間で見る（送り直し・窓を探る）
     func tick(_ now: Date) {
         if now.timeIntervalSince(lastProgress) < 1 { return }
+        // 相手の窓が 0: 送り直しの回数に数えずに、1 バイトだけ送って窓が開いたかを探る（持続タイマー）。長く開かなければ切る
+        if state == .established && peerWindow == 0 && !sendBuf.isEmpty {
+            if let z = zeroWindowSince, now.timeIntervalSince(z) > GuestTCP.maxZeroWindow { abort(); return }
+            sndNxt = sndUna
+            finSent = false
+            send([.ack, .psh], payload: ArraySlice(sendBuf.prefix(1)))
+            sndNxt = sndUna &+ 1
+            lastProgress = now
+            return
+        }
         if state == .synSent {
             retries += 1
             if retries > 8 { finish("つながりませんでした（時間切れ）"); return }
@@ -3492,6 +4067,7 @@ final class GuestTCP: @unchecked Sendable {
             retries += 1
             if retries > 12 { abort(); return }
             // 受け取りの返事が来ない: 先頭から送り直す
+            stack.retransmits += 1
             sndNxt = sndUna
             finSent = false
             lastProgress = now
@@ -3942,8 +4518,34 @@ final class VNetMachine: @unchecked Sendable {
         }
     }
 
-    func stats() -> String {
-        "フレーム 送 \(framesOut)（\(bytesOut / 1024)KB）・受 \(framesIn)（\(bytesIn / 1024)KB）・接続 新 \(pool.opened) 使い回し \(pool.reused)"
+    /// 開発者向けの数字のスナップショット
+    struct Stats: Sendable {
+        var framesOut = 0, framesIn = 0, bytesOut = 0, bytesIn = 0
+        var pool = PoolStats()
+        var droppedRx = 0
+        var tcpRetransmits = 0
+        /// 順番を飛ばして届き、取っておいたセグメント
+        var tcpReordered = 0
+        /// IP アドレスをもらえたか・もらった IP
+        var ready = false
+        var ip = ""
+
+        var summary: String {
+            "フレーム 送 \(framesOut)（\(bytesOut / 1024)KB）・受 \(framesIn)（\(bytesIn / 1024)KB）・接続 新 \(pool.opened) 使い回し \(pool.reused)"
+                + "・使用中 \(pool.busy) 待ち \(pool.waiting)" + (pool.bufferedBytes > 0 ? "・読み途中 \(pool.bufferedBytes / 1024)KB" : "")
+                + (droppedRx > 0 ? "・捨てたフレーム \(droppedRx)" : "") + (tcpRetransmits > 0 ? "・TCP 送り直し \(tcpRetransmits)" : "")
+        }
+    }
+
+    /// 数字を queue の上で集めて、done に渡す（画面のスレッドから直接読むと、値を書き換えている途中とぶつかるため）
+    func stats(_ done: @escaping @Sendable (Stats) -> Void) {
+        queue.async {
+            let s = Stats(framesOut: self.framesOut, framesIn: self.framesIn, bytesOut: self.bytesOut, bytesIn: self.bytesIn,
+                          pool: self.pool.stats(), droppedRx: self.card.droppedRx, tcpRetransmits: self.stack.retransmits,
+                          tcpReordered: self.stack.reordered,
+                          ready: self.stack.ready, ip: self.stack.ready ? self.stack.ip.ipString : "")
+            done(s)
+        }
     }
 }
 
@@ -4097,6 +4699,9 @@ final class VirtioNet: @unchecked Sendable {
 
     /// まだ OS に渡していない受け取ったフレーム
     private var pending: [[UInt8]] = []
+    /// RX キューがいっぱいで捨てたフレームの数（lock で守る）
+    private var dropped = 0
+    var droppedRx: Int { lock.lock(); defer { lock.unlock() }; return dropped }
     private let lock = NSLock()
     private var hasPending = false
 
@@ -4113,7 +4718,7 @@ final class VirtioNet: @unchecked Sendable {
     /// 外から届いたフレームを受け取る（どのスレッドからでもよい）
     func receive(_ frame: [UInt8]) {
         lock.lock()
-        if pending.count >= VirtioNet.maxPending { pending.removeFirst() }
+        if pending.count >= VirtioNet.maxPending { pending.removeFirst(); dropped += 1 }
         pending.append(frame)
         hasPending = true
         lock.unlock()
@@ -4539,6 +5144,10 @@ final class UserNet: @unchecked Sendable {
     private var tcps: [TCPKey: TCPConn] = [:]
     private var udps: [UDPKey: UDPFlow] = [:]
     private var timer: DispatchSourceTimer?
+    /// 名前を IPv4 にする方法（テストでは偽物に差し替える）。どのスレッドから呼ばれてもよいこと
+    var resolver: @Sendable (String) -> [[UInt8]]? = { UserNet.resolveIPv4($0) }
+    /// ゲストへの送り直しの回数（queue の上で数える。読むときは queue の上で）
+    private(set) var retransmits = 0
 
     init(factory: UserNetSocketFactory) {
         self.factory = factory
@@ -4701,8 +5310,9 @@ final class UserNet: @unchecked Sendable {
             return
         }
         let queue = self.queue
+        let resolver = self.resolver
         DispatchQueue.global(qos: .userInitiated).async {
-            let addrs = UserNet.resolveIPv4(question.name)
+            let addrs = resolver(question.name)
             let r = DNSMessage.reply(to: q, questionEnd: question.end, rcode: addrs == nil ? 3 : 0, answers: addrs ?? [])
             queue.async { [weak self] in self?.sendDNS(r, sport: sport) }
         }
@@ -4839,9 +5449,12 @@ final class UserNet: @unchecked Sendable {
         // データ
         var needAck = false
         if !payload.isEmpty {
-            if h.seq == c.rcvNxt {
-                c.sock?.send(Data(payload))
-                c.rcvNxt &+= UInt32(payload.count)
+            // 送り直しで前の分と重なっていたら、新しい所だけ外へ送る（先の分は捨てて、送り直してもらう）
+            let before = Int32(bitPattern: c.rcvNxt &- h.seq)
+            if before >= 0 && Int(before) < payload.count {
+                let rest = payload.dropFirst(Int(before))
+                c.sock?.send(Data(rest))
+                c.rcvNxt &+= UInt32(rest.count)
             }
             needAck = true
         }
@@ -4955,9 +5568,16 @@ final class UserNet: @unchecked Sendable {
                 if c.retries > 6 { remove(c); continue }
                 sendSYNACK(c)
                 c.lastProgress = now
+            } else if c.state == .established && c.sndNxt == c.sndUna && c.window == 0 && c.pending > 0
+                        && now.timeIntervalSince(c.lastProgress) > 1 {
+                // ゲストの窓が 0 のまま（送っている途中のものは無い）: 1 バイトだけ送って、窓が開いたかを探る（持続タイマー）
+                c.window = 1
+                c.lastProgress = now
+                pump(c)
             } else if c.state == .established && c.sndNxt != c.sndUna && now.timeIntervalSince(c.lastProgress) > 1 {
-                // 受け取りの返事が来ない: 先頭から送り直す
-                c.retries += 1
+                // 受け取りの返事が来ない: 先頭から送り直す（窓が 0 で探っているだけのときは、回数に数えない）
+                if c.window > 1 { c.retries += 1 }
+                retransmits += 1
                 if c.retries > 10 {
                     sendRST(c, seq: c.sndNxt)
                     remove(c); continue

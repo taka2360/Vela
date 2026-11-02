@@ -9,30 +9,6 @@ import WebKit
 // ・JavaScript が作るアドレス（fetch・XMLHttpRequest・img.src など）も、ページに入れた小さなスクリプトで書き換える
 // ・それでも直接読もうとするものは止める（実験なので、混ざらないように）
 
-/// ログをためておく（どのスレッドからでも足せる。画面には 0.3 秒ごとにまとめて出す。毎回出すと重い）
-final class LogBuffer: @unchecked Sendable {
-    private let lock = NSLock()
-    private var lines: [String] = []
-    private var dirty = false
-    let maxLines = 200
-
-    func add(_ s: String) {
-        lock.lock()
-        lines.append(s)
-        if lines.count > maxLines { lines.removeFirst(lines.count - maxLines) }
-        dirty = true
-        lock.unlock()
-    }
-
-    /// 変わっていれば全部を 1 つの文字列にして返す
-    func take() -> String? {
-        lock.lock(); defer { lock.unlock() }
-        if !dirty { return nil }
-        dirty = false
-        return lines.joined(separator: "\n")
-    }
-}
-
 /// 通信の作り
 enum NetMode: String {
     /// https・http をそのまま VNetScheme が引き受ける（アドレスは本物の https://…）
@@ -65,7 +41,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
     private let cookies = CookieBridge()
     private let actions = PageActionBridge()
     private var cookieSync: WebCookieSync?
-    private let logs = LogBuffer()
+    /// 開発者向けのログ（どのスレッドからでも書ける。画面には 0.3 秒ごとにまとめて出す）
+    let logs = DevLog()
     private var timer: Timer?
     private var logTimer: Timer?
 
@@ -204,8 +181,13 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
 
     private func refreshStatus() {
         guard mode.usesVNet else { status = "通信: \(mode.rawValue)"; return }
-        let ip = machine.stack.ready ? "IP \(machine.stack.ip.ipString)" : "IP をもらっています…"
-        status = "\(mode.rawValue)・\(ip)・\(machine.stats())"
+        let name = mode.rawValue
+        machine.stats { [weak self] s in
+            let model = self
+            let ip = s.ready ? "IP \(s.ip)" : "IP をもらっています…"
+            let text = "\(name)・\(ip)・\(s.summary)"
+            Task { @MainActor in model?.status = text }
+        }
     }
 
     /// エラーページのボタン・守りのスクリプトからの知らせ

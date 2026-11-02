@@ -146,6 +146,9 @@ final class VirtioNet: @unchecked Sendable {
 
     /// まだ OS に渡していない受け取ったフレーム
     private var pending: [[UInt8]] = []
+    /// RX キューがいっぱいで捨てたフレームの数（lock で守る）
+    private var dropped = 0
+    var droppedRx: Int { lock.lock(); defer { lock.unlock() }; return dropped }
     private let lock = NSLock()
     private var hasPending = false
 
@@ -162,7 +165,7 @@ final class VirtioNet: @unchecked Sendable {
     /// 外から届いたフレームを受け取る（どのスレッドからでもよい）
     func receive(_ frame: [UInt8]) {
         lock.lock()
-        if pending.count >= VirtioNet.maxPending { pending.removeFirst() }
+        if pending.count >= VirtioNet.maxPending { pending.removeFirst(); dropped += 1 }
         pending.append(frame)
         hasPending = true
         lock.unlock()

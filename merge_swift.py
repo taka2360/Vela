@@ -3,6 +3,8 @@
 
 使い方:
   python merge_swift.py                  # → VelaAll.swift（@main 付き。Playgrounds の「App」用）
+                                         #   と VelaParts/Vela1〜4.swift（同じ中身を 4 つに分けたもの）
+  python merge_swift.py --parts 6        # 分ける数を変える（0 なら分けたものは作らない）
   python merge_swift.py -o out.swift     # 出力先を変える
   python merge_swift.py --playground     # @main を外し、PlaygroundSupport のライブビューで動かす版
                                          # （Xcode / Playgrounds の「.playground」ページ用）
@@ -19,7 +21,7 @@ from pathlib import Path
 
 # README の順（ここに無いファイルは最後に名前順で足す）
 ORDER = [
-    "MyApp", "BrowserView", "BrowserModel", "Persistence", "VNetScheme", "HTTPSTakeover", "PageScripts",
+    "MyApp", "BrowserView", "BrowserModel", "Persistence", "DevLog", "VNetScheme", "HTTPSTakeover", "PageScripts",
     "NetPolicy", "CookieJar", "HSTSStore",
     "HTTPClient", "HTTPResponseParser", "HTTPSupport", "TLSClient",
     "GuestStack", "GuestTCP", "DNSMessage", "Packet",
@@ -84,6 +86,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-d", "--dir", default=Path(__file__).resolve().parent, type=Path, help="入力フォルダ")
     ap.add_argument("-o", "--output", default="VelaAll.swift", help="出力ファイル名")
+    ap.add_argument("--parts", type=int, default=4,
+                    help="VelaParts/ に、同じ中身をこの数のファイルに分けたものも作る（0 で作らない）。"
+                         "Playgrounds は 1 つのファイルが大きいと、作るのが 30 秒を超えて止まる（thunk の時間切れ）ため")
     ap.add_argument("--playground", action="store_true",
                     help="@main を外して PlaygroundSupport のライブビューで BrowserView を出す")
     args = ap.parse_args()
@@ -155,6 +160,39 @@ def main():
     )
     out_path.write_text(out, encoding="utf-8", newline="\n")
     print(f"→ {out_path}（{len(bodies)} ブロック, {out.count(chr(10))} 行）")
+
+    if args.parts > 0 and not args.playground:
+        write_parts(src_dir / "VelaParts", headers, bodies, names, args.parts)
+
+
+def write_parts(folder: Path, headers, bodies, names, n):
+    """同じ中身を n 個のファイルに分ける（元のファイルの区切りで分けるので、private な名前は 1 つのファイルの中に収まる）"""
+    folder.mkdir(exist_ok=True)
+    for old in folder.glob("Vela*.swift"):
+        old.unlink()
+    total = sum(b.count("\n") for b in bodies)
+    target = total / n
+    groups, cur, cur_lines = [], [], 0
+    for b in bodies:
+        lines = b.count("\n")
+        # 目安を超えるなら、ここで区切る（最後のグループは残りを全部）
+        if cur and cur_lines + lines / 2 > target and len(groups) < n - 1:
+            groups.append(cur)
+            cur, cur_lines = [], 0
+        cur.append(b)
+        cur_lines += lines
+    if cur:
+        groups.append(cur)
+    head = "\n".join(headers)
+    for i, g in enumerate(groups, 1):
+        text = (
+            f"// このファイルは merge_swift.py で自動生成したものです（直接編集しないでください）\n"
+            f"// VelaParts の {i} / {len(groups)}。全部まとめて Playgrounds に入れる（VelaAll.swift とは一緒に入れない）\n\n"
+            + head + "\n\n" + "\n".join(g)
+        )
+        path = folder / f"Vela{i}.swift"
+        path.write_text(text, encoding="utf-8", newline="\n")
+        print(f"→ {path}（{text.count(chr(10))} 行）")
 
 
 if __name__ == "__main__":

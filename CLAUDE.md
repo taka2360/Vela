@@ -3,6 +3,9 @@
 iPad の Swift Playgrounds（App、Swift 5.8）で動かす実験ブラウザ。ルートの `*.swift`（`VelaAll.swift` 以外）を Playgrounds に入れて使う。
 `VelaAll.swift` は `merge_swift.py` でそれらを 1 つにまとめたもの（手で直さず、直したら `python merge_swift.py` で作り直す）。
 新しい .swift を足したら `merge_swift.py` の ORDER と README のファイル一覧にも足す。
+`merge_swift.py` は同じ中身を 4 つに分けた `VelaParts/Vela1〜4.swift` も作る。ユーザーは Playgrounds にこちらを入れる
+（5,700 行の VelaAll.swift 1 つだと「Timed out waiting for a thunk to build after 30.0 seconds」で止まった）。
+1 つの部品が大きくなってきたら `--parts` を増やす。チェックは `swiftcheck.ps1 VelaParts`。
 
 ## Swift のコンパイルチェック（.swift を直したら必ず実行する）
 
@@ -25,8 +28,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\swiftcheck\swiftcheck.
 ## 単体テスト（UI・WebKit に頼らない部品）
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools	estsuntests.ps1            # 全部
-powershell -NoProfile -ExecutionPolicy Bypass -File tools	estsuntests.ps1 Cookie     # 名前に「Cookie」を含むテストだけ
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\tests\runtests.ps1            # 全部
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\tests\runtests.ps1 Cookie     # 名前に「Cookie」を含むテストだけ
 ```
 
 - テストに入れるアプリ側のファイルは `tools/tests/sources.txt`、テストは `tools/tests/*.swift`（入口は `main.swift`）

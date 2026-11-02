@@ -20,13 +20,15 @@ Android エミュレータと同じ「仮想 LAN カード（virtio-net）」と
 1. 新しい「App」を作る
 2. 最初からある ContentView.swift と MyApp.swift を消す（または中身をこのフォルダのものに入れ替える）
 3. このフォルダの .swift ファイルを全部入れる
-   画面: MyApp / BrowserView / BrowserModel / Persistence / VNetScheme / HTTPSTakeover / PageScripts
+   画面: MyApp / BrowserView / BrowserModel / Persistence / DevLog / VNetScheme / HTTPSTakeover / PageScripts
    守り: NetPolicy / CookieJar / HSTSStore
    http: HTTPClient / HTTPResponseParser / HTTPSupport / TLSClient
    TCP/IP: GuestStack / GuestTCP / DNSMessage / Packet
    カード: VNetMachine / VNetCore / VNetDriver
    ルーター: UserNet / UserNetApple
-   （全部で 23 ファイル。1 つにまとめた VelaAll.swift だけを入れてもよい）
+   （全部で 24 ファイル。まとめたものを使うなら VelaParts フォルダの Vela1〜4.swift の 4 つだけを入れる）
+   ※ 1 つにまとめた VelaAll.swift は大きすぎて、Playgrounds が「Timed out waiting for a thunk to build after 30.0 seconds」
+     で止まることがあります（1 つのファイルを作るのに 30 秒を超える）。そのときは VelaParts の 4 つを使ってください
 4. 実行して、アドレスに https://example.com/ などを入れて「開く」
 
 メモ
@@ -34,6 +36,10 @@ Android エミュレータと同じ「仮想 LAN カード（virtio-net）」と
 ・ロボット扱いされにくいよう、User-Agent・Accept-Language・Sec-Fetch-*・ヘッダの順番・圧縮（gzip/deflate/br）を iPad の Safari に揃えています
 ・リダイレクトは WebKit に本当の移動として伝えます（アドレス欄も移動先になります）
 ・http（80 番）は、今の iPad の環境では途中で 400 にされます（エミュレータのときと同じ）。HSTS の記録があるサイトは https に上げて読みます
+・壊れた返事（負の Content-Length・Transfer-Encoding と Content-Length の両方 など）は読まずに失敗にします。返事 1 つは 32MB まで、
+  読んでいる途中の合計が 128MB を超えたら新しい要求を待たせます。接続は同じ相手に 6 本・全部で 32 本まで
+・ページの読み込みをやめたら（WebKit が止めたら）、裏の通信も止めます
+・TCP は、順番を飛ばして届いた分を取っておき、送り直しで重なった分は外して受け取ります
 
 VNet の対応範囲
   VNet が読むもの: ページ本体と部品の http / https（HTTP/1.1）、fetch・XMLHttpRequest、リダイレクト
@@ -65,4 +71,4 @@ VNet の対応範囲
 ・SecureTransport は 2019 年から非推奨です（技術的負債）。将来 TLS エンジンを移すかは、別の課題です
 
 テスト（Windows から）
-  powershell -NoProfile -ExecutionPolicy Bypass -File tools	estsuntests.ps1
+  powershell -NoProfile -ExecutionPolicy Bypass -File tools\tests\runtests.ps1

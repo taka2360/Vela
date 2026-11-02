@@ -93,7 +93,33 @@ final class VNetMachine: @unchecked Sendable {
         }
     }
 
-    func stats() -> String {
-        "フレーム 送 \(framesOut)（\(bytesOut / 1024)KB）・受 \(framesIn)（\(bytesIn / 1024)KB）・接続 新 \(pool.opened) 使い回し \(pool.reused)"
+    /// 開発者向けの数字のスナップショット
+    struct Stats: Sendable {
+        var framesOut = 0, framesIn = 0, bytesOut = 0, bytesIn = 0
+        var pool = PoolStats()
+        var droppedRx = 0
+        var tcpRetransmits = 0
+        /// 順番を飛ばして届き、取っておいたセグメント
+        var tcpReordered = 0
+        /// IP アドレスをもらえたか・もらった IP
+        var ready = false
+        var ip = ""
+
+        var summary: String {
+            "フレーム 送 \(framesOut)（\(bytesOut / 1024)KB）・受 \(framesIn)（\(bytesIn / 1024)KB）・接続 新 \(pool.opened) 使い回し \(pool.reused)"
+                + "・使用中 \(pool.busy) 待ち \(pool.waiting)" + (pool.bufferedBytes > 0 ? "・読み途中 \(pool.bufferedBytes / 1024)KB" : "")
+                + (droppedRx > 0 ? "・捨てたフレーム \(droppedRx)" : "") + (tcpRetransmits > 0 ? "・TCP 送り直し \(tcpRetransmits)" : "")
+        }
+    }
+
+    /// 数字を queue の上で集めて、done に渡す（画面のスレッドから直接読むと、値を書き換えている途中とぶつかるため）
+    func stats(_ done: @escaping @Sendable (Stats) -> Void) {
+        queue.async {
+            let s = Stats(framesOut: self.framesOut, framesIn: self.framesIn, bytesOut: self.bytesOut, bytesIn: self.bytesIn,
+                          pool: self.pool.stats(), droppedRx: self.card.droppedRx, tcpRetransmits: self.stack.retransmits,
+                          tcpReordered: self.stack.reordered,
+                          ready: self.stack.ready, ip: self.stack.ready ? self.stack.ip.ipString : "")
+            done(s)
+        }
     }
 }

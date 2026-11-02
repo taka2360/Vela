@@ -14,6 +14,10 @@ final class GuestStack: @unchecked Sendable {
     var output: (([UInt8]) -> Void)?
     /// 何が起きたかを知らせる（画面のログ用）
     var trace: ((String) -> Void)?
+    /// TCP の送り直しの回数（開発者向け。queue の上で数える）
+    var retransmits = 0
+    /// 順番を飛ばして届き、取っておいた TCP のセグメントの数（開発者向け）
+    var reordered = 0
 
     var mac = Net.guestMAC
     private(set) var ip = Net.zeroIP
