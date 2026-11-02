@@ -54,6 +54,30 @@ func downloadTests() {
         c.cancel(); c.waitUntilIdle()
         expect(flag.cancelled); expectEqual(c.state, .cancelled); expect(!FileManager.default.fileExists(atPath: c.fileURL.path))
     }
+    test("書いている途中で onChange を入れても、固まらずに呼ばれる") {
+        // 競合そのものはテストでは再現できない。ここでは lock を重ねて固まらないこと・終わりの知らせが届くことを見る
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("vela-dl-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        guard let d = VNetDownload(source: url("https://e.test/r.bin"), suggestedName: "r.bin", expected: -1, in: dir) else { expect(false); return }
+        final class Counter: @unchecked Sendable { let lock = NSLock(); var n = 0; func add() { lock.lock(); n += 1; lock.unlock() } }
+        let calls = Counter()
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            for _ in 0..<2000 { d.write(Data([1])) }
+            done.signal()
+        }
+        DispatchQueue.concurrentPerform(iterations: 200) { i in
+            if i % 2 == 0 { d.onChange = { calls.add() } } else { _ = d.onChange }
+            d.cancelAction = {}
+            _ = d.cancelAction
+        }
+        done.wait()
+        d.finish(); d.waitUntilIdle()
+        expectEqual(d.received, 2000)
+        expectEqual(d.state, .finished)
+        expect(calls.n >= 1, "終わりの知らせ")
+    }
 }
 
 // MARK: - 落ちたときの記録

@@ -160,13 +160,22 @@ final class VNetDownload: @unchecked Sendable {
     let source: URL
     let fileURL: URL
     let expected: Int64
-    /// 取り消すとき（VNet の要求を止める）。始めた側が入れる
-    var cancelAction: (@Sendable () -> Void)?
-    /// 進み具合・状態が変わったとき（間引いて呼ぶ。どのスレッドから呼ばれるかは決まっていない）
-    var onChange: (@Sendable () -> Void)?
+    /// 取り消すとき（VNet の要求を止める）。始めた側が入れる（lock で守る）
+    var cancelAction: (@Sendable () -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _cancelAction }
+        set { lock.lock(); _cancelAction = newValue; lock.unlock() }
+    }
+    /// 進み具合・状態が変わったとき（間引いて呼ぶ。どのスレッドから呼ばれるかは決まっていない）。
+    /// 画面の側が、書き始めた後に（メインスレッドで）入れるので、queue からの読み出しと重ならないよう lock で守る
+    var onChange: (@Sendable () -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _onChange }
+        set { lock.lock(); _onChange = newValue; lock.unlock() }
+    }
 
     private let queue = DispatchQueue(label: "vela-download")
     private let lock = NSLock()
+    private var _cancelAction: (@Sendable () -> Void)?
+    private var _onChange: (@Sendable () -> Void)?
     private var handle: FileHandle?
     private var _received: Int64 = 0
     private var _state = State.running
