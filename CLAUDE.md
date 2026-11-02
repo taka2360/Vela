@@ -4,7 +4,7 @@ iPad の Swift Playgrounds（App、Swift 5.8）で動かす実験ブラウザ。
 `Playgrounds/VelaAll.swift` は `tools/merge_swift.py` でそれらを 1 つにまとめたもの（手で直さず、直したら `python tools/merge_swift.py` で作り直す）。
 新しい .swift を足したら、合うフォルダに置き、`tools/merge_swift.py` の ORDER と README.md のファイル一覧にも足す（ファイル名は Sources 全体で重ならないこと）。
 `merge_swift.py` は同じ中身を 10 個に分けた `Playgrounds/VelaParts/Vela1〜10.swift` も作る（1 つ 1,500 行くらいまでが目安）。ユーザーは Playgrounds にこちらを入れる
-（5,700 行の VelaAll.swift 1 つだと「Timed out waiting for a thunk to build after 30.0 seconds」で止まった）。
+（VelaAll.swift 1 つ（今は 1 万行を超える）だと「Timed out waiting for a thunk to build after 30.0 seconds」で止まる）。
 1 つの部品が大きくなってきたら `--parts` を増やす。チェックは `swiftcheck.ps1 Playgrounds\VelaParts`。
 
 ## Swift のコンパイルチェック（.swift を直したら必ず実行する）
@@ -13,7 +13,8 @@ Windows には Xcode が無いので、WSL の Ubuntu に入れた Swift 5.8.1�
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\swiftcheck\swiftcheck.ps1                                  # Sources の .swift 全部（*All.swift 以外）
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\swiftcheck\swiftcheck.ps1 Playgrounds\VelaAll.swift # まとめた版
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\swiftcheck\swiftcheck.ps1 Playgrounds\VelaParts     # まとめた版（ユーザーが入れる方）
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\swiftcheck\swiftcheck.ps1 Playgrounds\VelaAll.swift # 1 つにまとめた版
 ```
 
 - 最後の行が `結果: OK` ならエラー無し。`結果: NG` なら「==== エラー ====」の所を直す（終了コードも 0 / 1）
