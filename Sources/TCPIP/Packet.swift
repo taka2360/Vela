@@ -348,6 +348,30 @@ enum DHCP {
     static let request: UInt8 = 3
     static let ack: UInt8 = 5
 
+    /// DHCP（BOOTP）の 1 通を組み立てる（クライアントの問い合わせ・サーバーの返事の両方）。
+    /// xid は 4 バイト・flags は 2 バイト・chaddr は 16 バイト（MAC の後ろは 0）。options は並べた順に積み、最後に 255 を付ける
+    static func message(op: UInt8, xid: [UInt8], flags: [UInt8], yiaddr: [UInt8] = Net.zeroIP, siaddr: [UInt8] = Net.zeroIP,
+                        chaddr: [UInt8], options: [(UInt8, [UInt8])]) -> [UInt8] {
+        precondition(xid.count == 4 && flags.count == 2 && yiaddr.count == 4 && siaddr.count == 4 && chaddr.count == 16,
+                     "DHCP.message の長さが違う")
+        var m = [UInt8](repeating: 0, count: 236)
+        m[0] = op; m[1] = 1; m[2] = 6                      // 1 = 問い合わせ / 2 = 返事・イーサネット・MAC は 6 バイト
+        m.replaceSubrange(4..<8, with: xid)
+        m.replaceSubrange(10..<12, with: flags)
+        m.replaceSubrange(16..<20, with: yiaddr)
+        m.replaceSubrange(20..<24, with: siaddr)
+        m.replaceSubrange(28..<44, with: chaddr)
+        m.append(contentsOf: magicCookie)
+        // 配列を + でつなぐと型チェックがとても遅いので、1 つずつ足す
+        for (code, value) in options {
+            m.append(code)
+            m.append(UInt8(value.count))
+            m.append(contentsOf: value)
+        }
+        m.append(Opt.end)
+        return m
+    }
+
     /// オプション（番号 → 中身）。240 バイト目から読む
     static func options(_ p: [UInt8]) -> [UInt8: [UInt8]] {
         var out: [UInt8: [UInt8]] = [:]

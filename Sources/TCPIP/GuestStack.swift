@@ -133,21 +133,17 @@ final class GuestStack: @unchecked Sendable {
     }
 
     private func sendDHCP(type: UInt8, requested: [UInt8]?) {
-        var m = [UInt8](repeating: 0, count: 236)
-        m[0] = 1; m[1] = 1; m[2] = 6                       // 問い合わせ・イーサネット・MAC は 6 バイト
-        m.setBE32(dhcpXID, at: 4)
-        m[10] = 0x80                                       // ブロードキャストで返してほしい
-        m.replaceSubrange(28..<34, with: mac)
-        m += DHCP.magicCookie
-        m += [DHCP.Opt.messageType, 1, type]
+        var xid = [UInt8](repeating: 0, count: 4)
+        xid.setBE32(dhcpXID, at: 0)
+        var options: [(UInt8, [UInt8])] = [(DHCP.Opt.messageType, [type])]
         if let r = requested {
-            // 配列を + でつなぐと型チェックがとても遅いので、1 つずつ足す
-            m.append(contentsOf: [DHCP.Opt.requestedIP, 4] as [UInt8])
-            m.append(contentsOf: r)
-            m.append(contentsOf: [DHCP.Opt.serverID, 4] as [UInt8])
-            m.append(contentsOf: router)
+            options.append((DHCP.Opt.requestedIP, r))
+            options.append((DHCP.Opt.serverID, router))
         }
-        m += [DHCP.Opt.paramList, 3, DHCP.Opt.subnetMask, DHCP.Opt.router, DHCP.Opt.dnsServer, DHCP.Opt.end]                         // ほしいもの: サブネット・ルーター・DNS
+        options.append((DHCP.Opt.paramList, [DHCP.Opt.subnetMask, DHCP.Opt.router, DHCP.Opt.dnsServer]))   // ほしいもの: サブネット・ルーター・DNS
+        // flags 0x8000: ブロードキャストで返してほしい
+        let m = DHCP.message(op: 1, xid: xid, flags: [0x80, 0], chaddr: mac + [UInt8](repeating: 0, count: 16 - mac.count),
+                             options: options)
         sendUDP(sport: Port.dhcpClient, dst: Net.broadcastIP, dport: Port.dhcpServer, m, broadcast: true)
         dhcpSentAt = Date()
         trace?(type == DHCP.discover ? "→ DHCP DISCOVER（IP アドレスをください）" : "→ DHCP REQUEST")

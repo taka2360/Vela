@@ -178,22 +178,18 @@ final class UserNet: @unchecked Sendable {
         case DHCP.request: reply = DHCP.ack
         default: return
         }
-        var r = [UInt8](repeating: 0, count: 236)
-        r[0] = 2; r[1] = 1; r[2] = 6
-        r.replaceSubrange(4..<8, with: p[4..<8])           // xid
-        r[10] = p[10]; r[11] = p[11]                       // flags
-        r.replaceSubrange(16..<20, with: Net.guestIP)      // yiaddr
-        r.replaceSubrange(20..<24, with: Net.gateway)      // siaddr
-        r.replaceSubrange(28..<44, with: p[28..<44])       // chaddr
-        r += DHCP.magicCookie
-        r += [DHCP.Opt.messageType, 1, reply]
-        r += [DHCP.Opt.serverID, 4] + Net.gateway
-        r += [DHCP.Opt.leaseTime, 4, 0, 1, 0x51, 0x80]                     // 86400 秒
-        r += [DHCP.Opt.subnetMask, 4, 255, 255, 255, 0]
-        r += [DHCP.Opt.router, 4] + Net.gateway
-        r += [DHCP.Opt.dnsServer, 4] + Net.dns
-        r += [DHCP.Opt.mtu, 2, 0x05, 0xDC]                           // MTU 1500
-        r += [DHCP.Opt.end]
+        // xid・flags・chaddr は問い合わせのものをそのまま返す（p.count >= 240 は上で確かめた）
+        let options: [(UInt8, [UInt8])] = [
+            (DHCP.Opt.messageType, [reply]),
+            (DHCP.Opt.serverID, Net.gateway),
+            (DHCP.Opt.leaseTime, [0, 1, 0x51, 0x80]),           // 86400 秒
+            (DHCP.Opt.subnetMask, [255, 255, 255, 0]),
+            (DHCP.Opt.router, Net.gateway),
+            (DHCP.Opt.dnsServer, Net.dns),
+            (DHCP.Opt.mtu, [0x05, 0xDC]),                       // MTU 1500
+        ]
+        let r = DHCP.message(op: 2, xid: Array(p[4..<8]), flags: Array(p[10..<12]), yiaddr: Net.guestIP, siaddr: Net.gateway,
+                             chaddr: Array(p[28..<44]), options: options)
         // ブロードキャストで返す（ゲストはまだ IP を持っていないので）
         let u = UDPDatagram.build(src: Net.gateway, dst: Net.broadcastIP, sport: Port.dhcpServer, dport: Port.dhcpClient, r)
         sendIPv4(proto: IPProto.udp, src: Net.gateway, dst: Net.broadcastIP, dontFragment: false, u, to: Net.broadcastMAC)

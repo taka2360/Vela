@@ -343,21 +343,17 @@ final class GuestStack: @unchecked Sendable {
     }
 
     private func sendDHCP(type: UInt8, requested: [UInt8]?) {
-        var m = [UInt8](repeating: 0, count: 236)
-        m[0] = 1; m[1] = 1; m[2] = 6                       // 問い合わせ・イーサネット・MAC は 6 バイト
-        m.setBE32(dhcpXID, at: 4)
-        m[10] = 0x80                                       // ブロードキャストで返してほしい
-        m.replaceSubrange(28..<34, with: mac)
-        m += DHCP.magicCookie
-        m += [DHCP.Opt.messageType, 1, type]
+        var xid = [UInt8](repeating: 0, count: 4)
+        xid.setBE32(dhcpXID, at: 0)
+        var options: [(UInt8, [UInt8])] = [(DHCP.Opt.messageType, [type])]
         if let r = requested {
-            // 配列を + でつなぐと型チェックがとても遅いので、1 つずつ足す
-            m.append(contentsOf: [DHCP.Opt.requestedIP, 4] as [UInt8])
-            m.append(contentsOf: r)
-            m.append(contentsOf: [DHCP.Opt.serverID, 4] as [UInt8])
-            m.append(contentsOf: router)
+            options.append((DHCP.Opt.requestedIP, r))
+            options.append((DHCP.Opt.serverID, router))
         }
-        m += [DHCP.Opt.paramList, 3, DHCP.Opt.subnetMask, DHCP.Opt.router, DHCP.Opt.dnsServer, DHCP.Opt.end]                         // ほしいもの: サブネット・ルーター・DNS
+        options.append((DHCP.Opt.paramList, [DHCP.Opt.subnetMask, DHCP.Opt.router, DHCP.Opt.dnsServer]))   // ほしいもの: サブネット・ルーター・DNS
+        // flags 0x8000: ブロードキャストで返してほしい
+        let m = DHCP.message(op: 1, xid: xid, flags: [0x80, 0], chaddr: mac + [UInt8](repeating: 0, count: 16 - mac.count),
+                             options: options)
         sendUDP(sport: Port.dhcpClient, dst: Net.broadcastIP, dport: Port.dhcpServer, m, broadcast: true)
         dhcpSentAt = Date()
         trace?(type == DHCP.discover ? "→ DHCP DISCOVER（IP アドレスをください）" : "→ DHCP REQUEST")
@@ -1128,6 +1124,30 @@ enum DHCP {
     static let offer: UInt8 = 2
     static let request: UInt8 = 3
     static let ack: UInt8 = 5
+
+    /// DHCP（BOOTP）の 1 通を組み立てる（クライアントの問い合わせ・サーバーの返事の両方）。
+    /// xid は 4 バイト・flags は 2 バイト・chaddr は 16 バイト（MAC の後ろは 0）。options は並べた順に積み、最後に 255 を付ける
+    static func message(op: UInt8, xid: [UInt8], flags: [UInt8], yiaddr: [UInt8] = Net.zeroIP, siaddr: [UInt8] = Net.zeroIP,
+                        chaddr: [UInt8], options: [(UInt8, [UInt8])]) -> [UInt8] {
+        precondition(xid.count == 4 && flags.count == 2 && yiaddr.count == 4 && siaddr.count == 4 && chaddr.count == 16,
+                     "DHCP.message の長さが違う")
+        var m = [UInt8](repeating: 0, count: 236)
+        m[0] = op; m[1] = 1; m[2] = 6                      // 1 = 問い合わせ / 2 = 返事・イーサネット・MAC は 6 バイト
+        m.replaceSubrange(4..<8, with: xid)
+        m.replaceSubrange(10..<12, with: flags)
+        m.replaceSubrange(16..<20, with: yiaddr)
+        m.replaceSubrange(20..<24, with: siaddr)
+        m.replaceSubrange(28..<44, with: chaddr)
+        m.append(contentsOf: magicCookie)
+        // 配列を + でつなぐと型チェックがとても遅いので、1 つずつ足す
+        for (code, value) in options {
+            m.append(code)
+            m.append(UInt8(value.count))
+            m.append(contentsOf: value)
+        }
+        m.append(Opt.end)
+        return m
+    }
 
     /// オプション（番号 → 中身）。240 バイト目から読む
     static func options(_ p: [UInt8]) -> [UInt8: [UInt8]] {
