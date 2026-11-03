@@ -246,11 +246,10 @@ struct DownloadsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            SheetHeader(closeLabel: "閉じる", closeLeading: 12, close: { dismiss() }) {
                 Text("ダウンロード").font(.headline)
-                Spacer()
+            } trailing: {
                 Button("終わったものを一覧から外す") { manager.clearFinished() }
-                Button("閉じる") { dismiss() }.padding(.leading, 12)
             }
             .padding()
             ScrollView {

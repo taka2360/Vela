@@ -44,14 +44,14 @@ UserNet（小さなルーター）→ Network.framework → インターネッ�
 > [!NOTE]
 > 1 つにまとめた `Playgrounds/VelaAll.swift` もありますが、大きすぎて Playgrounds が
 > 「Timed out waiting for a thunk to build after 30.0 seconds」で止まることがあります。ふつうは `VelaParts` の 10 個を使ってください。
-> `VelaAll.swift` と `VelaParts` を一緒に入れてはいけません。`Sources/` の 51 ファイルをそのまま入れても動きます。
+> `VelaAll.swift` と `VelaParts` を一緒に入れてはいけません。`Sources/` の 52 ファイルをそのまま入れても動きます。
 
 ## フォルダの構成
 
 ```text
 Sources/              アプリのソース（ここを直す）
   App/                画面: MyApp / BrowserView / BrowserControls / TabViews / LibraryView /
-                            DevPanel / DevPanelPages / SettingsView / AdBlockView / Downloads
+                            DevPanel / DevPanelPages / SettingsView / AdBlockView / Downloads / SharedViews
   Browser/            ブラウザの中身: BrowserModels / BrowserStore / BrowserTab / TabWebDelegate / Library /
                             LibraryModel / AddressInput / ErrorPages / DownloadFiles / NetLog / Persistence /
                             DevLog / CrashLog

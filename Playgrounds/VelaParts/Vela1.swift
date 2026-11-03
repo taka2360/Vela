@@ -604,14 +604,13 @@ struct TabOverview: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            SheetHeader(closeLabel: "完了", closeLeading: 16, close: { dismiss() }) {
                 Text("タブ \(store.tabs.count) 枚").font(.headline)
-                Spacer()
+            } trailing: {
                 Button {
                     store.newTab(url: nil)
                     dismiss()
                 } label: { Image(systemName: "plus").font(.system(size: 20)) }
-                Button("完了") { dismiss() }.padding(.leading, 16)
             }
             .padding()
             ScrollView {
@@ -680,14 +679,12 @@ struct LibraryView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            SheetHeader(closeLabel: "完了", close: { dismiss() }) {
                 Picker("表示", selection: $store.libraryPage) {
                     ForEach(LibraryPage.allCases, id: \.self) { p in Text(p.rawValue).tag(p) }
                 }
                 .pickerStyle(.segmented)
                 .frame(maxWidth: 320)
-                Spacer()
-                Button("完了") { dismiss() }
             }
             .padding()
             if store.libraryPage == .bookmarks {
@@ -1062,9 +1059,9 @@ struct DevPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
+            SheetHeader(closeLabel: "閉じる", closeLeading: 12, close: { dismiss() }) {
                 Text("開発者パネル").font(.headline)
-                Spacer()
+            } trailing: {
                 Menu {
                     Button("ログをコピー") { UIPasteboard.general.string = store.logs.export() }
                     Button("通信の記録をコピー") { UIPasteboard.general.string = store.netLog.export() }
@@ -1074,7 +1071,6 @@ struct DevPanel: View {
                 } label: {
                     Label(store.hadCrash ? "コピー（前回は落ちた）" : "コピー", systemImage: "doc.on.doc")
                 }
-                Button("閉じる") { dismiss() }.padding(.leading, 12)
             }
             DevPageBar(page: $page)
             DevPageContent(store: store, page: page, tick: store.devTick)

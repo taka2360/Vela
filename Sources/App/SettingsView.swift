@@ -22,10 +22,8 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            SheetHeader(closeLabel: "完了", close: { dismiss() }) {
                 Text("設定").font(.headline)
-                Spacer()
-                Button("完了") { dismiss() }
             }
             .padding()
             List {

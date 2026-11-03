@@ -9,10 +9,8 @@ struct AdBlockView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            SheetHeader(closeLabel: "完了", close: { dismiss() }) {
                 Text("広告ブロック").font(.headline)
-                Spacer()
-                Button("完了") { dismiss() }
             }
             .padding()
             List {

@@ -64,14 +64,13 @@ struct TabOverview: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            SheetHeader(closeLabel: "完了", closeLeading: 16, close: { dismiss() }) {
                 Text("タブ \(store.tabs.count) 枚").font(.headline)
-                Spacer()
+            } trailing: {
                 Button {
                     store.newTab(url: nil)
                     dismiss()
                 } label: { Image(systemName: "plus").font(.system(size: 20)) }
-                Button("完了") { dismiss() }.padding(.leading, 16)
             }
             .padding()
             ScrollView {

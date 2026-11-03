@@ -9,14 +9,12 @@ struct LibraryView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            SheetHeader(closeLabel: "完了", close: { dismiss() }) {
                 Picker("表示", selection: $store.libraryPage) {
                     ForEach(LibraryPage.allCases, id: \.self) { p in Text(p.rawValue).tag(p) }
                 }
                 .pickerStyle(.segmented)
                 .frame(maxWidth: 320)
-                Spacer()
-                Button("完了") { dismiss() }
             }
             .padding()
             if store.libraryPage == .bookmarks {

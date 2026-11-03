@@ -1,5 +1,5 @@
 // このファイルは merge_swift.py で自動生成したものです（直接編集しないでください）
-// 元ファイル: MyApp.swift, BrowserView.swift, BrowserControls.swift, TabViews.swift, LibraryView.swift, DevPanel.swift, DevPanelPages.swift, SettingsView.swift, AdBlockView.swift, Downloads.swift, DownloadFiles.swift, BrowserModels.swift, BrowserStore.swift, BrowserTab.swift, TabWebDelegate.swift, Library.swift, LibraryModel.swift, AddressInput.swift, ErrorPages.swift, NetLog.swift, FilterLists.swift, ABPFilter.swift, BlockEngine.swift, ContentBlocker.swift, Persistence.swift, DevLog.swift, CrashLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, SiteUtil.swift, Cookies.swift, RedirectPolicy.swift, LocalNetworkPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPRequestBytes.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
+// 元ファイル: MyApp.swift, BrowserView.swift, BrowserControls.swift, TabViews.swift, LibraryView.swift, DevPanel.swift, DevPanelPages.swift, SettingsView.swift, AdBlockView.swift, Downloads.swift, SharedViews.swift, DownloadFiles.swift, BrowserModels.swift, BrowserStore.swift, BrowserTab.swift, TabWebDelegate.swift, Library.swift, LibraryModel.swift, AddressInput.swift, ErrorPages.swift, NetLog.swift, FilterLists.swift, ABPFilter.swift, BlockEngine.swift, ContentBlocker.swift, Persistence.swift, DevLog.swift, CrashLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, SiteUtil.swift, Cookies.swift, RedirectPolicy.swift, LocalNetworkPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPRequestBytes.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
 
 import SwiftUI
 import WebKit
@@ -604,14 +604,13 @@ struct TabOverview: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            SheetHeader(closeLabel: "完了", closeLeading: 16, close: { dismiss() }) {
                 Text("タブ \(store.tabs.count) 枚").font(.headline)
-                Spacer()
+            } trailing: {
                 Button {
                     store.newTab(url: nil)
                     dismiss()
                 } label: { Image(systemName: "plus").font(.system(size: 20)) }
-                Button("完了") { dismiss() }.padding(.leading, 16)
             }
             .padding()
             ScrollView {
@@ -680,14 +679,12 @@ struct LibraryView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            SheetHeader(closeLabel: "完了", close: { dismiss() }) {
                 Picker("表示", selection: $store.libraryPage) {
                     ForEach(LibraryPage.allCases, id: \.self) { p in Text(p.rawValue).tag(p) }
                 }
                 .pickerStyle(.segmented)
                 .frame(maxWidth: 320)
-                Spacer()
-                Button("完了") { dismiss() }
             }
             .padding()
             if store.libraryPage == .bookmarks {
@@ -1062,9 +1059,9 @@ struct DevPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
+            SheetHeader(closeLabel: "閉じる", closeLeading: 12, close: { dismiss() }) {
                 Text("開発者パネル").font(.headline)
-                Spacer()
+            } trailing: {
                 Menu {
                     Button("ログをコピー") { UIPasteboard.general.string = store.logs.export() }
                     Button("通信の記録をコピー") { UIPasteboard.general.string = store.netLog.export() }
@@ -1074,7 +1071,6 @@ struct DevPanel: View {
                 } label: {
                     Label(store.hadCrash ? "コピー（前回は落ちた）" : "コピー", systemImage: "doc.on.doc")
                 }
-                Button("閉じる") { dismiss() }.padding(.leading, 12)
             }
             DevPageBar(page: $page)
             DevPageContent(store: store, page: page, tick: store.devTick)
@@ -1584,10 +1580,8 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            SheetHeader(closeLabel: "完了", close: { dismiss() }) {
                 Text("設定").font(.headline)
-                Spacer()
-                Button("完了") { dismiss() }
             }
             .padding()
             List {
@@ -1675,10 +1669,8 @@ struct AdBlockView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            SheetHeader(closeLabel: "完了", close: { dismiss() }) {
                 Text("広告ブロック").font(.headline)
-                Spacer()
-                Button("完了") { dismiss() }
             }
             .padding()
             List {
@@ -2038,11 +2030,10 @@ struct DownloadsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            SheetHeader(closeLabel: "閉じる", closeLeading: 12, close: { dismiss() }) {
                 Text("ダウンロード").font(.headline)
-                Spacer()
+            } trailing: {
                 Button("終わったものを一覧から外す") { manager.clearFinished() }
-                Button("閉じる") { dismiss() }.padding(.leading, 12)
             }
             .padding()
             ScrollView {
@@ -2126,6 +2117,37 @@ extension Binding where Value == Bool {
     /// Binding(get: { x != nil }, set: { if !$0 { x = nil } }) と同じ
     static func present<T>(_ value: @escaping () -> T?, clear: @escaping () -> Void) -> Binding<Bool> {
         Binding(get: { value() != nil }, set: { if !$0 { clear() } })
+    }
+}
+
+// ======================================================================
+// MARK: - SharedViews.swift
+// ======================================================================
+
+// MARK: - いくつもの画面で同じ形の部品（シートの見出し など）
+
+/// シートの上の行: 見出し・Spacer・右の部品・閉じるボタン（HStack だけ。外側の padding は呼ぶ側が付ける）。
+/// 閉じるボタンの文言（完了・閉じる）と左の余白は、画面ごとに今の値を渡す（0 なら余白なし）
+struct SheetHeader<Title: View, Trailing: View>: View {
+    let closeLabel: String
+    var closeLeading: CGFloat = 0
+    let close: () -> Void
+    @ViewBuilder let title: () -> Title
+    @ViewBuilder let trailing: () -> Trailing
+
+    var body: some View {
+        HStack {
+            title()
+            Spacer()
+            trailing()
+            Button(closeLabel) { close() }.padding(.leading, closeLeading)
+        }
+    }
+}
+
+extension SheetHeader where Trailing == EmptyView {
+    init(closeLabel: String, closeLeading: CGFloat = 0, close: @escaping () -> Void, @ViewBuilder title: @escaping () -> Title) {
+        self.init(closeLabel: closeLabel, closeLeading: closeLeading, close: close, title: title, trailing: { EmptyView() })
     }
 }
 

@@ -322,10 +322,8 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            SheetHeader(closeLabel: "完了", close: { dismiss() }) {
                 Text("設定").font(.headline)
-                Spacer()
-                Button("完了") { dismiss() }
             }
             .padding()
             List {
@@ -413,10 +411,8 @@ struct AdBlockView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            SheetHeader(closeLabel: "完了", close: { dismiss() }) {
                 Text("広告ブロック").font(.headline)
-                Spacer()
-                Button("完了") { dismiss() }
             }
             .padding()
             List {
@@ -776,11 +772,10 @@ struct DownloadsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            SheetHeader(closeLabel: "閉じる", closeLeading: 12, close: { dismiss() }) {
                 Text("ダウンロード").font(.headline)
-                Spacer()
+            } trailing: {
                 Button("終わったものを一覧から外す") { manager.clearFinished() }
-                Button("閉じる") { dismiss() }.padding(.leading, 12)
             }
             .padding()
             ScrollView {
@@ -864,6 +859,37 @@ extension Binding where Value == Bool {
     /// Binding(get: { x != nil }, set: { if !$0 { x = nil } }) と同じ
     static func present<T>(_ value: @escaping () -> T?, clear: @escaping () -> Void) -> Binding<Bool> {
         Binding(get: { value() != nil }, set: { if !$0 { clear() } })
+    }
+}
+
+// ======================================================================
+// MARK: - SharedViews.swift
+// ======================================================================
+
+// MARK: - いくつもの画面で同じ形の部品（シートの見出し など）
+
+/// シートの上の行: 見出し・Spacer・右の部品・閉じるボタン（HStack だけ。外側の padding は呼ぶ側が付ける）。
+/// 閉じるボタンの文言（完了・閉じる）と左の余白は、画面ごとに今の値を渡す（0 なら余白なし）
+struct SheetHeader<Title: View, Trailing: View>: View {
+    let closeLabel: String
+    var closeLeading: CGFloat = 0
+    let close: () -> Void
+    @ViewBuilder let title: () -> Title
+    @ViewBuilder let trailing: () -> Trailing
+
+    var body: some View {
+        HStack {
+            title()
+            Spacer()
+            trailing()
+            Button(closeLabel) { close() }.padding(.leading, closeLeading)
+        }
+    }
+}
+
+extension SheetHeader where Trailing == EmptyView {
+    init(closeLabel: String, closeLeading: CGFloat = 0, close: @escaping () -> Void, @ViewBuilder title: @escaping () -> Title) {
+        self.init(closeLabel: closeLabel, closeLeading: closeLeading, close: close, title: title, trailing: { EmptyView() })
     }
 }
 

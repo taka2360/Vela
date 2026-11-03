@@ -18,9 +18,9 @@ struct DevPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
+            SheetHeader(closeLabel: "閉じる", closeLeading: 12, close: { dismiss() }) {
                 Text("開発者パネル").font(.headline)
-                Spacer()
+            } trailing: {
                 Menu {
                     Button("ログをコピー") { UIPasteboard.general.string = store.logs.export() }
                     Button("通信の記録をコピー") { UIPasteboard.general.string = store.netLog.export() }
@@ -30,7 +30,6 @@ struct DevPanel: View {
                 } label: {
                     Label(store.hadCrash ? "コピー（前回は落ちた）" : "コピー", systemImage: "doc.on.doc")
                 }
-                Button("閉じる") { dismiss() }.padding(.leading, 12)
             }
             DevPageBar(page: $page)
             DevPageContent(store: store, page: page, tick: store.devTick)
