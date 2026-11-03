@@ -67,7 +67,7 @@ struct BrowserView: View {
         .sheet(isPresented: $store.showLibrary) { LibraryView(store: store, library: store.library) }
         .sheet(isPresented: shareShown) { if let u = store.shareURL { ShareSheet(items: [u]) } }
         .fullScreenCover(isPresented: $store.showTabOverview) { TabOverview(store: store) }
-        .modifier(DialogModifier(store: store))
+        .modifier(DialogModifier(presenter: store.dialogs))
         .onChange(of: scenePhase) { phase in
             if phase != .active { store.saveSessionNow() }
         }
@@ -394,39 +394,39 @@ struct WebHost: UIViewRepresentable {
 
 @MainActor
 struct DialogModifier: ViewModifier {
-    @ObservedObject var store: BrowserStore
+    @ObservedObject var presenter: DialogPresenter
 
     func body(content: Content) -> some View {
         content.alert(title, isPresented: shown) {
-            DialogButtons(store: store)
+            DialogButtons(presenter: presenter)
         } message: {
-            Text(store.dialog?.message ?? "")
+            Text(presenter.dialog?.message ?? "")
         }
     }
 
     private var title: String {
-        store.dialog?.title ?? ""
+        presenter.dialog?.title ?? ""
     }
 
     private var shown: Binding<Bool> {
-        Binding(get: { store.dialog != nil }, set: { v in if !v && store.dialog != nil { store.answerDialog(ok: false) } })
+        Binding(get: { presenter.dialog != nil }, set: { v in if !v && presenter.dialog != nil { presenter.answer(ok: false) } })
     }
 }
 
 struct DialogButtons: View {
-    @ObservedObject var store: BrowserStore
+    @ObservedObject var presenter: DialogPresenter
 
     var body: some View {
-        switch store.dialog?.kind {
+        switch presenter.dialog?.kind {
         case .prompt?:
-            TextField("", text: $store.dialogInput)
-            Button("キャンセル", role: .cancel) { store.answerDialog(ok: false) }
-            Button("OK") { store.answerDialog(ok: true) }
+            TextField("", text: $presenter.dialogInput)
+            Button("キャンセル", role: .cancel) { presenter.answer(ok: false) }
+            Button("OK") { presenter.answer(ok: true) }
         case .confirm?:
-            Button("キャンセル", role: .cancel) { store.answerDialog(ok: false) }
-            Button("OK") { store.answerDialog(ok: true) }
+            Button("キャンセル", role: .cancel) { presenter.answer(ok: false) }
+            Button("OK") { presenter.answer(ok: true) }
         default:
-            Button("OK") { store.answerDialog(ok: true) }
+            Button("OK") { presenter.answer(ok: true) }
         }
     }
 }

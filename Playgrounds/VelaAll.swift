@@ -67,7 +67,7 @@ struct BrowserView: View {
         .sheet(isPresented: $store.showLibrary) { LibraryView(store: store, library: store.library) }
         .sheet(isPresented: shareShown) { if let u = store.shareURL { ShareSheet(items: [u]) } }
         .fullScreenCover(isPresented: $store.showTabOverview) { TabOverview(store: store) }
-        .modifier(DialogModifier(store: store))
+        .modifier(DialogModifier(presenter: store.dialogs))
         .onChange(of: scenePhase) { phase in
             if phase != .active { store.saveSessionNow() }
         }
@@ -394,39 +394,39 @@ struct WebHost: UIViewRepresentable {
 
 @MainActor
 struct DialogModifier: ViewModifier {
-    @ObservedObject var store: BrowserStore
+    @ObservedObject var presenter: DialogPresenter
 
     func body(content: Content) -> some View {
         content.alert(title, isPresented: shown) {
-            DialogButtons(store: store)
+            DialogButtons(presenter: presenter)
         } message: {
-            Text(store.dialog?.message ?? "")
+            Text(presenter.dialog?.message ?? "")
         }
     }
 
     private var title: String {
-        store.dialog?.title ?? ""
+        presenter.dialog?.title ?? ""
     }
 
     private var shown: Binding<Bool> {
-        Binding(get: { store.dialog != nil }, set: { v in if !v && store.dialog != nil { store.answerDialog(ok: false) } })
+        Binding(get: { presenter.dialog != nil }, set: { v in if !v && presenter.dialog != nil { presenter.answer(ok: false) } })
     }
 }
 
 struct DialogButtons: View {
-    @ObservedObject var store: BrowserStore
+    @ObservedObject var presenter: DialogPresenter
 
     var body: some View {
-        switch store.dialog?.kind {
+        switch presenter.dialog?.kind {
         case .prompt?:
-            TextField("", text: $store.dialogInput)
-            Button("キャンセル", role: .cancel) { store.answerDialog(ok: false) }
-            Button("OK") { store.answerDialog(ok: true) }
+            TextField("", text: $presenter.dialogInput)
+            Button("キャンセル", role: .cancel) { presenter.answer(ok: false) }
+            Button("OK") { presenter.answer(ok: true) }
         case .confirm?:
-            Button("キャンセル", role: .cancel) { store.answerDialog(ok: false) }
-            Button("OK") { store.answerDialog(ok: true) }
+            Button("キャンセル", role: .cancel) { presenter.answer(ok: false) }
+            Button("OK") { presenter.answer(ok: true) }
         default:
-            Button("OK") { store.answerDialog(ok: true) }
+            Button("OK") { presenter.answer(ok: true) }
         }
     }
 }
@@ -2591,15 +2591,37 @@ final class StatusModel: ObservableObject {
     }
 }
 
+/// JavaScript のダイアログを画面に中継するだけ（決まりは持たない。全部 DialogQueue）。
+/// queue の current・input が変わる直前に objectWillChange を出す
+@MainActor
+final class DialogPresenter: ObservableObject {
+    let queue: DialogQueue
+
+    /// BrowserStore のプロパティの初期値として作られる。自分の @MainActor のものは触らない（作った queue に通知の先を入れるだけ）
+    nonisolated init() {
+        let q = DialogQueue()
+        queue = q
+        q.willChange = { [weak self] in self?.objectWillChange.send() }
+    }
+
+    var dialog: JSDialog? { queue.current }
+    var dialogInput: String {
+        get { queue.input }
+        set { queue.input = newValue }
+    }
+
+    /// ダイアログを閉じる（ok: OK を押したか）
+    func answer(ok: Bool) { queue.answer(ok: ok) }
+}
+
 @MainActor
 final class BrowserStore: ObservableObject {
     @Published private(set) var tabs: [BrowserTab] = []
     @Published private(set) var selectedID: Int?
     @Published var showTabOverview = false
     @Published var showDevPanel = false
-    /// いま出しているダイアログ（順番待ちは dialogQueue）
-    @Published private(set) var dialog: JSDialog?
-    @Published var dialogInput = ""
+    /// JavaScript のダイアログ（出しているもの・入力欄・順番待ち。決まりは DialogQueue）
+    let dialogs = DialogPresenter()
     /// 毎秒のように変わる様子（VNet・ネットワーク・開発者パネルの合図）。見る画面だけが描き直されるよう分けてある
     let status = StatusModel()
     @Published var showSettings = false
@@ -2640,7 +2662,6 @@ final class BrowserStore: ObservableObject {
     private var nextTabID = 1
     /// 閉じたタブ（⌘⇧T で戻す。新しいものが後ろ）
     private var closedTabs: [SavedTab] = []
-    private var dialogQueue: [JSDialog] = []
     private let session = JSONFile<SessionData>(name: "session.json")
     private var timers: [Timer] = []
     private var memoryObserver: NSObjectProtocol?
@@ -2901,28 +2922,12 @@ final class BrowserStore: ObservableObject {
     // MARK: ダイアログ（JavaScript の alert・confirm・prompt）
 
     func presentDialog(_ d: JSDialog) {
-        if dialog == nil { show(d) } else { dialogQueue.append(d) }
-    }
-
-    private func show(_ d: JSDialog) {
-        if case .prompt(let def) = d.kind { dialogInput = def } else { dialogInput = "" }
-        dialog = d
-    }
-
-    /// ダイアログを閉じる（ok: OK を押したか）
-    func answerDialog(ok: Bool) {
-        guard let d = dialog else { return }
-        dialog = nil
-        d.respond(ok, ok ? dialogInput : nil)
-        if !dialogQueue.isEmpty { show(dialogQueue.removeFirst()) }
+        dialogs.queue.present(d)
     }
 
     /// そのタブのダイアログを全部取り消す（タブを閉じたとき）
     func cancelDialogs(for tab: BrowserTab) {
-        let mine = dialogQueue.filter { $0.tabID == tab.id }
-        dialogQueue.removeAll { $0.tabID == tab.id }
-        for d in mine { d.respond(false, nil) }
-        if let d = dialog, d.tabID == tab.id { answerDialog(ok: false) }
+        dialogs.queue.cancel(tabID: tab.id)
     }
 
     // MARK: WebKit のルール
