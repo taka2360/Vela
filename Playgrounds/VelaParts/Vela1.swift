@@ -756,8 +756,7 @@ struct BookmarkRow: View {
             SiteRow(icon: "book", title: bookmark.title, url: bookmark.url)
         }
         .contextMenu {
-            Button { open(newTab: true) } label: { Label("新しいタブで開く", systemImage: "plus.square.on.square") }
-            Button { UIPasteboard.general.string = bookmark.url } label: { Label("リンクをコピー", systemImage: "doc.on.doc") }
+            SiteLinkMenuItems(url: bookmark.url) { open(newTab: true) }
             Button { rename() } label: { Label("名前を変える", systemImage: "pencil") }
             Button { library.moveBookmark(bookmark.id, by: -1) } label: { Label("上へ", systemImage: "arrow.up") }
             Button { library.moveBookmark(bookmark.id, by: 1) } label: { Label("下へ", systemImage: "arrow.down") }
@@ -836,8 +835,7 @@ struct HistoryRow: View {
             SiteRow(icon: "clock", title: entry.title.isEmpty ? entry.url : entry.title, url: entry.url)
         }
         .contextMenu {
-            Button { open(newTab: true) } label: { Label("新しいタブで開く", systemImage: "plus.square.on.square") }
-            Button { UIPasteboard.general.string = entry.url } label: { Label("リンクをコピー", systemImage: "doc.on.doc") }
+            SiteLinkMenuItems(url: entry.url) { open(newTab: true) }
             Button(role: .destructive) { library.removeHistory(entry.url) } label: { Label("履歴から消す", systemImage: "trash") }
         }
     }

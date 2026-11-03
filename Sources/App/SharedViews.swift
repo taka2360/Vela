@@ -34,3 +34,15 @@ extension View {
         textFieldStyle(.roundedBorder).autocorrectionDisabled().textInputAutocapitalization(.never)
     }
 }
+
+/// ブックマーク・履歴の長押しメニューの先頭 2 つ: 「新しいタブで開く」と「リンクをコピー」（文字のまま写す）。
+/// 開き方（URL に直せないときは何もしない など）は、各行の open(newTab:) が決める
+struct SiteLinkMenuItems: View {
+    let url: String
+    let openInNewTab: () -> Void
+
+    var body: some View {
+        Button { openInNewTab() } label: { Label("新しいタブで開く", systemImage: "plus.square.on.square") }
+        Button { UIPasteboard.general.string = url } label: { Label("リンクをコピー", systemImage: "doc.on.doc") }
+    }
+}
