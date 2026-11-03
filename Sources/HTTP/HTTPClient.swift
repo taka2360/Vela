@@ -426,43 +426,48 @@ final class HTTPPool: @unchecked Sendable {
             if let e = self.checkLocalNetwork(req, host: host, ip: ip) { done(.failure(e)); return }
             let bytes = self.requestBytes(req, host: host)
             let run: (HTTPConn) -> Void = { [weak self] c in
-                guard let self else { return }
-                if req.token?.isCancelled == true {
-                    self.release(c, reusable: c.alive)
-                    done(.failure(HTTPPool.cancelled))
-                    return
-                }
-                var held = 0
-                let stream = StreamState()
-                let decide: ((ResponseParser) -> ((Data) -> Void)?)? = req.sink.map { sink in
-                    { [weak self] p in self?.startStream(p, req: req, sink: sink, state: stream) }
-                }
-                let serial = c.send(bytes, isHead: req.method == "HEAD", limits: self.parserLimits(),
-                                    onGrow: { [weak self] n in held += n; self?.bufferedBytes += n },
-                                    decide: decide) { [weak self] r, reusable, gotNothing in
-                    guard let self else { return }
-                    self.bufferedBytes -= held
-                    held = 0
-                    self.release(c, reusable: reusable)
-                    switch r {
-                    case .success(let p) where p.streaming:
-                        done(self.finishStream(p, req: req, state: stream))
-                    case .success(let p):
-                        done(self.result(p, req: req))
-                    case .failure(let e):
-                        // 使い回した接続が、相手に閉じられていた: 新しい接続でもう一度（取り消したものは除く）
-                        if e.kind != .cancelled && retry && gotNothing && c.uses > 1 { self.sendOnce(req, retry: false, done: done) }
-                        else { done(.failure(e)) }
-                    }
-                }
-                let q = self.stack.queue
-                req.token?.onCancel { [weak c] in q.async { c?.cancel(serial: serial) } }
+                self?.execute(c, req: req, bytes: bytes, retry: retry, done: done)
             }
             self.admit(req.token, cancel: { done(.failure(HTTPPool.cancelled)) }, fail: { done(.failure($0)) }) { [weak self] in
                 self?.acquire(key: key, host: host, ip: ip, port: port, https: https, token: req.token,
                               cancel: { done(.failure(HTTPPool.cancelled)) }, fail: { done(.failure($0)) }, run: run)
             }
         }
+    }
+
+    /// 1 本の接続で、1 つの要求を送って返事を待つ（sendOnce の続き。中身は前のクロージャ run のまま）
+    private func execute(_ c: HTTPConn, req: HTTPRequest, bytes: Data, retry: Bool,
+                         done: @escaping (Result<HTTPResult, FetchError>) -> Void) {
+        if req.token?.isCancelled == true {
+            self.release(c, reusable: c.alive)
+            done(.failure(HTTPPool.cancelled))
+            return
+        }
+        var held = 0
+        let stream = StreamState()
+        let decide: ((ResponseParser) -> ((Data) -> Void)?)? = req.sink.map { sink in
+            { [weak self] p in self?.startStream(p, req: req, sink: sink, state: stream) }
+        }
+        let serial = c.send(bytes, isHead: req.method == "HEAD", limits: self.parserLimits(),
+                            onGrow: { [weak self] n in held += n; self?.bufferedBytes += n },
+                            decide: decide) { [weak self] r, reusable, gotNothing in
+            guard let self else { return }
+            self.bufferedBytes -= held
+            held = 0
+            self.release(c, reusable: reusable)
+            switch r {
+            case .success(let p) where p.streaming:
+                done(self.finishStream(p, req: req, state: stream))
+            case .success(let p):
+                done(self.result(p, req: req))
+            case .failure(let e):
+                // 使い回した接続が、相手に閉じられていた: 新しい接続でもう一度（取り消したものは除く）
+                if e.kind != .cancelled && retry && gotNothing && c.uses > 1 { self.sendOnce(req, retry: false, done: done) }
+                else { done(.failure(e)) }
+            }
+        }
+        let q = self.stack.queue
+        req.token?.onCancel { [weak c] in q.async { c?.cancel(serial: serial) } }
     }
 
     /// 流す形の途中の様子（1 つの要求の間だけ）
