@@ -2539,6 +2539,11 @@ final class StatusModel: ObservableObject {
 
     /// BrowserStore のプロパティの初期値として作られる。何も触らない
     nonisolated init() {}
+
+    /// 値が今と同じなら代入しない（@Published は同じ値でも通知を出し、見ている画面が描き直されるため）
+    fileprivate func update<T: Equatable>(_ key: ReferenceWritableKeyPath<StatusModel, T>, _ value: T) {
+        if self[keyPath: key] != value { self[keyPath: key] = value }
+    }
 }
 
 @MainActor
@@ -2930,16 +2935,16 @@ final class BrowserStore: ObservableObject {
 
     private func refreshStatus() {
         guard defaultMode.usesVNet || tabs.contains(where: { $0.mode.usesVNet }) else {
-            status.vnetStatus = "VNet: 使っていません（\(takeover.description)）"
+            status.update(\.vnetStatus, "VNet: 使っていません（\(takeover.description)）")
             return
         }
         machine.stats { [weak self] s in
             let store = self
             let text = (s.ready ? "IP \(s.ip)" : "IP をもらっています…") + "・" + s.summary
             Task { @MainActor in
-                store?.status.vnetReady = s.ready
-                store?.status.vnetStatus = text
-                if store?.showDevPanel == true { store?.status.vnetStats = s }
+                store?.status.update(\.vnetReady, s.ready)
+                store?.status.update(\.vnetStatus, text)
+                if store?.showDevPanel == true { store?.status.update(\.vnetStats, s) }
             }
         }
     }
@@ -8469,7 +8474,7 @@ struct PoolLimits: Sendable {
 }
 
 /// 開発者向けの数字（queue の上で作ったスナップショット）
-struct PoolStats: Sendable {
+struct PoolStats: Sendable, Equatable {
     var opened = 0, reused = 0
     var busy = 0, idle = 0, waiting = 0
     var bufferedBytes = 0
@@ -10782,7 +10787,7 @@ final class VNetMachine: @unchecked Sendable {
     }
 
     /// 開発者向けの数字のスナップショット
-    struct Stats: Sendable {
+    struct Stats: Sendable, Equatable {
         var framesOut = 0, framesIn = 0, bytesOut = 0, bytesIn = 0
         var pool = PoolStats()
         var droppedRx = 0

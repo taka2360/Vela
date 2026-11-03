@@ -337,7 +337,7 @@ struct PoolLimits: Sendable {
 }
 
 /// 開発者向けの数字（queue の上で作ったスナップショット）
-struct PoolStats: Sendable {
+struct PoolStats: Sendable, Equatable {
     var opened = 0, reused = 0
     var busy = 0, idle = 0, waiting = 0
     var bufferedBytes = 0

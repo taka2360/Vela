@@ -94,7 +94,7 @@ final class VNetMachine: @unchecked Sendable {
     }
 
     /// 開発者向けの数字のスナップショット
-    struct Stats: Sendable {
+    struct Stats: Sendable, Equatable {
         var framesOut = 0, framesIn = 0, bytesOut = 0, bytesIn = 0
         var pool = PoolStats()
         var droppedRx = 0
