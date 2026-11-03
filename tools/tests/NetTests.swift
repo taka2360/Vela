@@ -367,6 +367,8 @@ func netTests() {
         expectEqual(got2.heads, [200])
         expectEqual(String(decoding: got2.data, as: UTF8.self), "other:none")
     }
+    net.serve("93.184.216.34:443") { _ in httpReply(200, "p443") }
+    requestBytesTests(m, net)
     tamper(m, drop: 41)
     test("フレームを捨てても（41 個に 1 個）欠けずに届く（送り直し・並べ直し）") {
         let r = ok(fetch(m, HTTPRequest(url: url("http://site.test/big")), timeout: 60))
