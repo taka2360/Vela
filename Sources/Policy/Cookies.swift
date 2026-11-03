@@ -80,13 +80,7 @@ enum SetCookieParser {
         for raw in parts {
             let a = raw.trimmingCharacters(in: .whitespaces)
             if a.isEmpty { continue }
-            let k: String, v: String
-            if let eq = a.firstIndex(of: "=") {
-                k = String(a[..<eq]).trimmingCharacters(in: .whitespaces).lowercased()
-                v = String(a[a.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
-            } else {
-                k = a.lowercased(); v = ""
-            }
+            let (k, v) = HeaderParams.splitAttribute(a)
             switch k {
             case "expires": if let d = HTTPDate.parse(v) { expires = d }
             case "max-age":

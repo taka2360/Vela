@@ -25,13 +25,8 @@ enum HSTSPolicy {
         for raw in header.split(separator: ";") {
             let d = raw.trimmingCharacters(in: .whitespaces)
             if d.isEmpty { continue }
-            let k: String, v: String
-            if let eq = d.firstIndex(of: "=") {
-                k = d[..<eq].trimmingCharacters(in: .whitespaces).lowercased()
-                v = d[d.index(after: eq)...].trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-            } else {
-                k = d.lowercased(); v = ""
-            }
+            let (k, raw) = HeaderParams.splitAttribute(d)
+            let v = raw.trimmingCharacters(in: CharacterSet(charactersIn: "\""))      // HSTS では値の引用符を外す
             if !seen.insert(k).inserted { return nil }     // 同じ指示が 2 回あるものは無効（RFC 6797）
             switch k {
             case "max-age":

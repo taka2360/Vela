@@ -4,6 +4,16 @@ import Foundation
 
 func headerParamsTests() {
     print("key=value の属性")
+    test("HeaderParams.splitAttribute") {
+        func sp(_ s: String) -> [String] { let r = HeaderParams.splitAttribute(s); return [r.key, r.value] }
+        expectEqual(sp("Max-Age=10"), ["max-age", "10"])
+        expectEqual(sp("Path = /a "), ["path", "/a"])
+        expectEqual(sp("Secure"), ["secure", ""])
+        expectEqual(sp("=x"), ["", "x"])
+        expectEqual(sp("a=b=c"), ["a", "b=c"])
+        expectEqual(sp("k=\"q\""), ["k", "\"q\""], "引用符は外さない")
+        expectEqual(sp("K=V"), ["k", "V"], "値は小文字にしない")
+    }
     let now = Date(timeIntervalSince1970: 1_800_000_000)
     func cookie(_ s: String) -> CookieRecord? {
         if case .cookie(let c) = SetCookieParser.parse(s, url: url("https://www.example.com/app/x"), now: now) { return c }

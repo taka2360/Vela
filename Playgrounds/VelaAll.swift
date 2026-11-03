@@ -7340,13 +7340,7 @@ enum SetCookieParser {
         for raw in parts {
             let a = raw.trimmingCharacters(in: .whitespaces)
             if a.isEmpty { continue }
-            let k: String, v: String
-            if let eq = a.firstIndex(of: "=") {
-                k = String(a[..<eq]).trimmingCharacters(in: .whitespaces).lowercased()
-                v = String(a[a.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
-            } else {
-                k = a.lowercased(); v = ""
-            }
+            let (k, v) = HeaderParams.splitAttribute(a)
             switch k {
             case "expires": if let d = HTTPDate.parse(v) { expires = d }
             case "max-age":
@@ -7873,13 +7867,8 @@ enum HSTSPolicy {
         for raw in header.split(separator: ";") {
             let d = raw.trimmingCharacters(in: .whitespaces)
             if d.isEmpty { continue }
-            let k: String, v: String
-            if let eq = d.firstIndex(of: "=") {
-                k = d[..<eq].trimmingCharacters(in: .whitespaces).lowercased()
-                v = d[d.index(after: eq)...].trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-            } else {
-                k = d.lowercased(); v = ""
-            }
+            let (k, raw) = HeaderParams.splitAttribute(d)
+            let v = raw.trimmingCharacters(in: CharacterSet(charactersIn: "\""))      // HSTS では値の引用符を外す
             if !seen.insert(k).inserted { return nil }     // 同じ指示が 2 回あるものは無効（RFC 6797）
             switch k {
             case "max-age":
@@ -9060,6 +9049,17 @@ enum HeaderTokens {
     static func list(_ s: String, lowercase: Bool) -> [String] {
         (lowercase ? s.lowercased() : s).split(separator: ",", omittingEmptySubsequences: false)
             .map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+}
+
+enum HeaderParams {
+    /// 「key=value」の属性 1 つを分ける（Set-Cookie の属性・Strict-Transport-Security の指示）。
+    /// part は前後の空白を取った、空でないもの（呼ぶ側が trim して空を飛ばす）。最初の = で分け、
+    /// キーは前後の空白を取って小文字、値は前後の空白を取る。= が無ければ（全体を小文字, ""）。引用符は外さない
+    static func splitAttribute(_ part: String) -> (key: String, value: String) {
+        guard let eq = part.firstIndex(of: "=") else { return (part.lowercased(), "") }
+        return (part[..<eq].trimmingCharacters(in: .whitespaces).lowercased(),
+                part[part.index(after: eq)...].trimmingCharacters(in: .whitespaces))
     }
 }
 

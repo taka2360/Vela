@@ -39,6 +39,17 @@ enum HeaderTokens {
     }
 }
 
+enum HeaderParams {
+    /// 「key=value」の属性 1 つを分ける（Set-Cookie の属性・Strict-Transport-Security の指示）。
+    /// part は前後の空白を取った、空でないもの（呼ぶ側が trim して空を飛ばす）。最初の = で分け、
+    /// キーは前後の空白を取って小文字、値は前後の空白を取る。= が無ければ（全体を小文字, ""）。引用符は外さない
+    static func splitAttribute(_ part: String) -> (key: String, value: String) {
+        guard let eq = part.firstIndex(of: "=") else { return (part.lowercased(), "") }
+        return (part[..<eq].trimmingCharacters(in: .whitespaces).lowercased(),
+                part[part.index(after: eq)...].trimmingCharacters(in: .whitespaces))
+    }
+}
+
 // MARK: gzip・zlib の頭（純 Swift。一括と流す形の両方が使う）
 
 enum GzipHeader {
