@@ -30,8 +30,8 @@ struct PageMenu: View {
             ModeSwitchItems(store: store, tab: tab)
         } label: {
             Text("ぁあ")
-                .font(.system(size: 20, weight: .medium))
-                .padding(.horizontal, 8)
+                .font(.system(size: 18, weight: .medium))
+                .padding(.horizontal, 7)
         }
     }
 }

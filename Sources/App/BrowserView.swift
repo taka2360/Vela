@@ -55,7 +55,7 @@ struct TopBar: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 18) {
+            HStack(spacing: 16) {
                 NavButtons(tab: tab)
                 Button { store.openLibrary(.bookmarks) } label: { Image(systemName: "book") }
                 AddressField(store: store, tab: tab, editor: store.address, library: store.library)
@@ -66,10 +66,10 @@ struct TopBar: View {
                     .keyboardShortcut("t", modifiers: .command)
                 Button { store.openTabOverview() } label: { Image(systemName: "square.on.square") }
             }
-            // 大きさは前（18pt・高さ 36）の 1.3 倍くらい
-            .font(.system(size: 23))
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
+            // 大きさは最初（18pt・高さ 36）の 1.17 倍くらい
+            .font(.system(size: 21))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
             LoadingBar(progress: tab.progress, visible: tab.isLoading)
         }
         .background(Color(UIColor.secondarySystemBackground))
@@ -101,7 +101,7 @@ struct NavButtons: View {
     @ObservedObject var tab: BrowserTab
 
     var body: some View {
-        HStack(spacing: 23) {
+        HStack(spacing: 21) {
             Button { tab.goBack() } label: { Image(systemName: "chevron.backward") }
                 .disabled(!tab.canGoBack)
                 .contextMenu { HistoryMenu(tab: tab, back: true) }
@@ -183,8 +183,8 @@ struct AddressField: View {
                 }
             }
         }
-        .background(RoundedRectangle(cornerRadius: 13).fill(Color(UIColor.tertiarySystemFill)))
-        .frame(height: 46)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color(UIColor.tertiarySystemFill)))
+        .frame(height: 41)
         .frame(maxWidth: .infinity)
         .onChange(of: focused) { f in
             if editor.editing != f { editor.editing = f }
@@ -201,30 +201,30 @@ struct AddressField: View {
             .textInputAutocapitalization(.never)
             .keyboardType(.webSearch)
             .submitLabel(.go)
-            .font(.system(size: 20))
+            .font(.system(size: 18))
             .onSubmit {
                 store.open(editor.text, in: tab)
                 focused = false
             }
-            .padding(.horizontal, 13)
+            .padding(.horizontal, 12)
     }
 
     private var display: some View {
-        HStack(spacing: 8) {
-            if tab.isSecure { Image(systemName: "lock.fill").font(.system(size: 16)).foregroundStyle(.secondary) }
+        HStack(spacing: 7) {
+            if tab.isSecure { Image(systemName: "lock.fill").font(.system(size: 14)).foregroundStyle(.secondary) }
             Text(displayText)
-                .font(.system(size: 20))
+                .font(.system(size: 18))
                 .lineLimit(1)
                 .foregroundColor(tab.url == nil ? .secondary : .primary)
             if tab.blockedCount > 0 {
                 Label("\(tab.blockedCount)", systemImage: "shield.lefthalf.filled")
-                    .font(.system(size: 14))
+                    .font(.system(size: 13))
                     .foregroundStyle(.secondary)
             }
             ModeBadge(tab: tab, status: store.status)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.horizontal, 13)
+        .padding(.horizontal, 12)
     }
 
     private var displayText: String {
@@ -248,14 +248,14 @@ struct ModeBadge: View {
     var body: some View {
         HStack(spacing: 4) {
             Text(label)
-                .font(.system(size: 13, weight: .semibold))
-                .padding(.horizontal, 6)
+                .font(.system(size: 12, weight: .semibold))
+                .padding(.horizontal, 5)
                 .padding(.vertical, 3)
                 .background(RoundedRectangle(cornerRadius: 5).fill(color.opacity(0.18)))
                 .foregroundColor(color)
             if !tab.nonVNetUsage.isEmpty {
                 Text(tab.nonVNetUsage.sorted().joined(separator: "・"))
-                    .font(.system(size: 13))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             }
         }

@@ -277,6 +277,9 @@ struct HomeBackgroundView: View {
             }
         }
         .ignoresSafeArea()
+        // .clipped() は見た目を切るだけで、触れる範囲は切らない。scaledToFill ではみ出した写真が
+        // ツールバーの上に重なって、ボタンを押せなくなる。背景は触れないようにする
+        .allowsHitTesting(false)
     }
 }
 
@@ -372,6 +375,7 @@ struct SwatchBox<P: View>: View {
             preview
                 .frame(width: 80, height: 56)
                 .clipShape(shape)
+                .allowsHitTesting(false)     // はみ出した写真が、隣の見本を押せなくしないように
                 .overlay(shape.stroke(selected ? Color.accentColor : Color.gray.opacity(0.3), lineWidth: selected ? 3 : 1))
             Text(title).font(.system(size: 12)).lineLimit(1).foregroundColor(.primary)
         }

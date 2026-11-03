@@ -683,6 +683,7 @@ public extension View {
     func scaledToFill() -> _M { .init() }
     func scaledToFit() -> _M { .init() }
     func clipped(antialiased: Bool = false) -> _M { .init() }
+    func allowsHitTesting(_ enabled: Bool) -> _M { .init() }
 }
 
 /// CoreTransferable（iOS 16。SwiftUI から見える）
