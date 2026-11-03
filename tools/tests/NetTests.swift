@@ -206,6 +206,13 @@ func tamper(_ m: VNetMachine, drop every: Int = 0, swap swapEvery: Int = 0) {
 
 // MARK: テスト
 
+/// 中身の確かめ用の数（順番が入れ替わっても分かる）
+func bodySum(_ d: Data) -> Int {
+    var s = 0
+    for b in d { s = (s &* 31 &+ Int(b)) & 0xFFFFFF }
+    return s
+}
+
 func netTests() {
     print("VNet の全部（偽のサーバー）")
     let net = FakeNet()
@@ -221,6 +228,7 @@ func netTests() {
         case "/post307": return httpReply(307, headers: [("Location", "/echo")])
         case "/post303": return httpReply(303, headers: [("Location", "/echo")])
         case "/echo": return httpReply(200, "\(r.method) \(r.body.count)")
+        case "/sum": return httpReply(200, "\(r.body.count) \(bodySum(r.body))")
         case "/to-lan": return httpReply(302, headers: [("Location", "http://192.168.1.10/admin")])
         case "/to-secure": return httpReply(302, headers: [("Location", "http://secure.test/x")])
         case "/login": return httpReply(200, "ok", headers: [("Set-Cookie", "sid=abc; Path=/"), ("Set-Cookie", "pref=1; SameSite=Strict")])
@@ -253,6 +261,15 @@ func netTests() {
         expectEqual(ok(fetch(m, req)).map { String(decoding: $0.body, as: UTF8.self) }, "POST 4")
         req.url = url("http://site.test/post303")
         expectEqual(ok(fetch(m, req)).map { String(decoding: $0.body, as: UTF8.self) }, "GET 0")
+    }
+    test("大きい POST（300KB）: ゲストの送り待ちが欠けずに・順番どおりに出る") {
+        var bytes = [UInt8](repeating: 0, count: 300_000)
+        for i in 0..<bytes.count { bytes[i] = UInt8(truncatingIfNeeded: i * 7 + i / 251) }
+        let body = Data(bytes)
+        var req = HTTPRequest(url: url("http://site.test/sum"))
+        req.method = "POST"; req.body = body; req.headers = [("Content-Type", "application/octet-stream")]
+        let want = "\(body.count) \(bodySum(body))"
+        expectEqual(ok(fetch(m, req, timeout: 60)).map { String(decoding: $0.body, as: UTF8.self) }, want)
     }
     test("LAN: 公開サイトから LAN へのリダイレクト・DNS リバインディングを止める（サーバーに届かない）") {
         let before = net.received.filter { $0.server.hasPrefix("192.168.") }.count
