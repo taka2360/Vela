@@ -10619,6 +10619,23 @@ final class GuestRAM: @unchecked Sendable {
     func store16(_ pa: UInt64, _ v: UInt16) { pointer(pa).storeBytes(of: v, as: UInt16.self) }
     func store32(_ pa: UInt64, _ v: UInt32) { pointer(pa).storeBytes(of: v, as: UInt32.self) }
     func store64(_ pa: UInt64, _ v: UInt64) { pointer(pa).storeBytes(of: v, as: UInt64.self) }
+
+    // カード用: 確かめてから読み書きする（範囲は pointer(pa, count:) と同じ）。外れていれば nil / false で、何も書かない
+    func load16(checked pa: UInt64) -> UInt16? { pointer(pa, count: 2)?.loadUnaligned(as: UInt16.self) }
+    func load32(checked pa: UInt64) -> UInt32? { pointer(pa, count: 4)?.loadUnaligned(as: UInt32.self) }
+    func load64(checked pa: UInt64) -> UInt64? { pointer(pa, count: 8)?.loadUnaligned(as: UInt64.self) }
+    @discardableResult
+    func store16(checked pa: UInt64, _ v: UInt16) -> Bool {
+        guard let p = pointer(pa, count: 2) else { return false }
+        p.storeBytes(of: v, as: UInt16.self)
+        return true
+    }
+    @discardableResult
+    func store32(checked pa: UInt64, _ v: UInt32) -> Bool {
+        guard let p = pointer(pa, count: 4) else { return false }
+        p.storeBytes(of: v, as: UInt32.self)
+        return true
+    }
 }
 
 // MARK: - virtio-mmio の決まり（カードとドライバの両方が使う）
@@ -10859,11 +10876,12 @@ final class VirtioNet: @unchecked Sendable {
 
     // MARK: キュー（RAM はゲストが書いた場所なので、確かめながら読み書きする）
 
-    private func load16(_ pa: UInt64) -> UInt16 { ram.pointer(pa, count: 2)?.loadUnaligned(as: UInt16.self) ?? 0 }
-    private func load32(_ pa: UInt64) -> UInt32 { ram.pointer(pa, count: 4)?.loadUnaligned(as: UInt32.self) ?? 0 }
-    private func load64(_ pa: UInt64) -> UInt64 { ram.pointer(pa, count: 8)?.loadUnaligned(as: UInt64.self) ?? 0 }
-    private func store16(_ pa: UInt64, _ v: UInt16) { ram.pointer(pa, count: 2)?.storeBytes(of: v, as: UInt16.self) }
-    private func store32(_ pa: UInt64, _ v: UInt32) { ram.pointer(pa, count: 4)?.storeBytes(of: v, as: UInt32.self) }
+    // 外れたアドレスは、読むと 0・書くと何もしない（ゲストが変な値を書いても落ちない）
+    private func load16(_ pa: UInt64) -> UInt16 { ram.load16(checked: pa) ?? 0 }
+    private func load32(_ pa: UInt64) -> UInt32 { ram.load32(checked: pa) ?? 0 }
+    private func load64(_ pa: UInt64) -> UInt64 { ram.load64(checked: pa) ?? 0 }
+    private func store16(_ pa: UInt64, _ v: UInt16) { ram.store16(checked: pa, v) }
+    private func store32(_ pa: UInt64, _ v: UInt32) { ram.store32(checked: pa, v) }
 
     /// ドライバが並べた番号（avail.idx）
     private func availIdx(_ q: Queue) -> UInt16 { load16(q.avail + 2) }

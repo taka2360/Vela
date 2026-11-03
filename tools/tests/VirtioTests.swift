@@ -66,6 +66,32 @@ func virtioTests() {
         expect(ram.pointer(b &+ s, count: 0) != nil, "終わりちょうどで 0 バイト")
         expect(ram.pointer(b &+ s &+ 1, count: 0) == nil)
     }
+    test("GuestRAM の確かめ付きの読み書き（5 つの関数・幅ごとの境界）") {
+        let ram = GuestRAM(megabytes: 1)
+        let b = ram.base, s = ram.size
+        // 読み: 16・32・64
+        for (w, load) in [(UInt64(2), { (a: UInt64) -> UInt64? in ram.load16(checked: a).map(UInt64.init) }),
+                          (UInt64(4), { (a: UInt64) -> UInt64? in ram.load32(checked: a).map(UInt64.init) }),
+                          (UInt64(8), { (a: UInt64) -> UInt64? in ram.load64(checked: a) })] {
+            expect(load(b) != nil, "base w=\(w)")
+            expect(load(b + s - w) != nil, "ぎりぎり w=\(w)")
+            expect(load(b + s - w + 1) == nil, "はみ出す w=\(w)")
+            expect(load(b - 1) == nil, "base より下 w=\(w)")
+            expect(load(UInt64.max) == nil, "UInt64.max w=\(w)")
+        }
+        // 書き: 16・32（書いた値が読める・はみ出すときは隣も変わらない）
+        expect(ram.store16(checked: b + s - 2, 0xBEEF)); expectEqual(ram.load16(checked: b + s - 2), 0xBEEF)
+        expect(ram.store32(checked: b + s - 4, 0xDEAD_BEEF)); expectEqual(ram.load32(checked: b + s - 4), 0xDEAD_BEEF)
+        ram.store32(b + s - 8, 0x1122_3344)
+        expect(!ram.store16(checked: b + s - 1, 0xFFFF)); expect(!ram.store32(checked: b + s - 3, 0xFFFF_FFFF))
+        expectEqual(ram.load32(checked: b + s - 8), 0x1122_3344, "はみ出す書き込みで、手前が変わらない")
+        expectEqual(ram.load32(checked: b + s - 4), 0xDEAD_BEEF, "はみ出す書き込みで、終わりの 4 バイトも変わらない")
+        expect(!ram.store16(checked: b - 1, 1)); expect(!ram.store32(checked: UInt64.max, 1))
+        expect(ram.store16(checked: b, 0x0102)); expectEqual(ram.load16(checked: b), 0x0102)
+        expectEqual(ram.load16(b), 0x0102, "確かめ無しの版と同じ所を読む")
+        ram.store64(b + 16, 0x0102_0304_0506_0708)
+        expectEqual(ram.load64(checked: b + 16), 0x0102_0304_0506_0708)
+    }
     test("カード: キューの置き場所（num・align・ページの大きさを変えて）") {
         for num: UInt32 in [0, 8, 256] {
             for align: UInt32 in [4096, 64, 8192] {
