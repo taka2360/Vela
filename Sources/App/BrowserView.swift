@@ -38,6 +38,7 @@ struct BrowserView: View {
         .modifier(DialogModifier(presenter: store.dialogs))
         .onChange(of: scenePhase) { phase in
             if phase != .active { store.saveSessionNow() }
+            if phase == .active { store.adblock.updateIfDue() }
         }
     }
 

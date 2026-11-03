@@ -27,6 +27,8 @@ final class TabWebDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
         }
         let main = navigationAction.targetFrame?.isMainFrame ?? true
         if main, let u = navigationAction.request.url { tab.applyAdBlock(for: VNetURL.toReal(u) ?? u) }
+        // サブフレーム: 読み込む前にそのホストのスクリプトレットを足す（uBO もフレームのホストごとに選ぶ）
+        if !main, let u = navigationAction.request.url { tab.noteSubframe(u) }
         if main, let u = navigationAction.request.url, let up = tab.httpsFirstUpgrade(u) {
             webView.load(URLRequest(url: up))
             return .cancel

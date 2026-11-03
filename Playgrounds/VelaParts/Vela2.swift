@@ -460,7 +460,14 @@ struct AdBlockView: View {
                         .disabled(customURL.isEmpty || adblock.busy)
                     }
                 } header: {
-                    Text("リスト（4 日ごとに自動で更新）")
+                    Text("リスト（リストが決めた間隔で自動で更新。無ければ 4 日ごと）")
+                }
+                Section {
+                    ScriptletStatusRow(adblock: adblock)
+                } header: {
+                    Text("スクリプトレット（YouTube などの広告をページの中で消す）")
+                } footer: {
+                    Text("切り替えは、今見ているページを読み直して効かせます。ほかのタブは次にページを開いたときから。")
                 }
                 if !adblock.disabledSites.isEmpty {
                     Section {
@@ -491,7 +498,8 @@ struct AdBlockView: View {
     ・VNet のタブ: 通信は Vela が 1 つずつ調べて止めます（止めた数をアドレス欄に出し、開発者パネルのログに記録します）。広告の枠を隠すのは WebKit のルールです。
     ・標準の通信のタブ: 通信も枠を隠すのも WebKit のルールで止めます（止めた数は数えられません）。
     ・ページそのもの（アドレス欄で開くページ）は止めません。
-    ・対応しない書き方（スクリプトを使うもの・正規表現・$redirect など）は読み飛ばします。リストの行の「対応外」がその数です。
+    ・スクリプトレット（uBO の ##+js(…)）: YouTube の動画広告のように、ページ自身のデータに入って届く広告は、通信を止めても消えません。uBlock filters の行と、uBlock Origin の道具（GPLv3。Vela の GitHub が毎日 uBO の最新版から作って署名したもの）で、ページの中で消します。YouTube が仕組みを変えても、リストと道具の自動更新でついていきます。サーバー側で動画に混ぜた広告は消せません。
+    ・対応しない書き方（AdGuard のスクリプト・正規表現・$redirect・##^ など）は読み飛ばします。リストの行の「対応外」がその数です。
     ・リストのダウンロードは標準の通信で行います。起動してすぐの数秒は、リストを読み終わるまでブロックが効きません。
     """
 }
@@ -539,7 +547,36 @@ struct FilterListRow: View {
         } else {
             date = "まだ"
         }
-        return "通信 \(list.networkRules)・隠す \(list.cosmeticRules)・対応外 \(list.unsupported)・更新 \(date)"
+        var s = "通信 \(list.networkRules)・隠す \(list.cosmeticRules)"
+        if let n = list.scriptletRules, n > 0 { s += "・スクリプト \(n)" }
+        s += "・対応外 \(list.unsupported)・更新 \(date)"
+        if let h = list.expiresHours { s += h % 24 == 0 ? "（\(h / 24) 日ごと）" : "（\(h) 時間ごと）" }
+        if AdBlocker.isTrusted(list) { s += "・信頼する" }
+        return s
+    }
+}
+
+struct ScriptletStatusRow: View {
+    @ObservedObject var adblock: AdBlocker
+    @State private var checking = false
+
+    var body: some View {
+        HStack {
+            if checking { ProgressView().padding(.trailing, 4) }
+            VStack(alignment: .leading, spacing: 2) {
+                Text("道具: \(adblock.scriptletStatus)").font(.system(size: 13))
+                Text("使えるルール \(adblock.scriptletRuleCount) 個").font(.system(size: 12)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("道具を確かめる") {
+                checking = true
+                Task {
+                    await adblock.updateScriptletsIfDue(force: true)
+                    checking = false
+                }
+            }
+            .disabled(checking)
+        }
     }
 }
 

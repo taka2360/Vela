@@ -58,6 +58,18 @@ final class BrowserTab: ObservableObject, Identifiable {
     private(set) var navEvents: [(Date, String)] = []
     /// いま入れている広告ブロックの WebKit のルール
     private var adRuleLists: [WKContentRuleList] = []
+    /// makeConfiguration で入れる固定のスクリプト（スクリプトレットを入れ替えるとき、removeAllUserScripts の後に入れ直す）
+    private var baseScripts: [WKUserScript] = []
+    /// スクリプトレットを選ぶフレームの URL（[0] がトップ。サブフレームは最近の maxScriptletFrames 個）
+    private var scriptletFrames: [URL] = []
+    private var scriptletKey: String?
+    static let maxScriptletFrames = 8
+
+    /// 同じ文書か（# の後だけ違うものは同じ）
+    nonisolated static func sameDocument(_ a: URL, _ b: URL) -> Bool {
+        func strip(_ u: URL) -> String { let s = u.absoluteString; return s.firstIndex(of: "#").map { String(s[..<$0]) } ?? s }
+        return strip(a) == strip(b)
+    }
     /// エラーページを出した URL（履歴に入れない）
     private var errorPageURL: URL?
     /// 最後に履歴に入れた URL（後からタイトルが変わったら直す）
@@ -135,6 +147,7 @@ final class BrowserTab: ObservableObject, Identifiable {
         observe(wv)
         webView = wv
         adRuleLists = []
+        scriptletKey = nil
         applyAdBlock(for: pendingURL ?? url)
         log("WebView を作りました（\(mode.rawValue)）")
         return wv
@@ -144,6 +157,7 @@ final class BrowserTab: ObservableObject, Identifiable {
     private func makeConfiguration() -> WKWebViewConfiguration {
         let config = WKWebViewConfiguration()
         let content = config.userContentController
+        var scripts: [WKUserScript] = []
         if mode.usesVNet, let store {
             let s = VNetScheme()
             s.machine = store.machine
@@ -182,10 +196,10 @@ final class BrowserTab: ObservableObject, Identifiable {
             } else {
                 config.setURLSchemeHandler(s, forURLScheme: "vnet")
                 config.setURLSchemeHandler(s, forURLScheme: "vnets")
-                content.addUserScript(WKUserScript(source: PageScripts.rewriteURLs, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+                scripts.append(WKUserScript(source: PageScripts.rewriteURLs, injectionTime: .atDocumentStart, forMainFrameOnly: false))
             }
             // Cookie: ページの JavaScript が変えたら「合図」だけもらって、WebKit の置き場（正本）を読み直す
-            content.addUserScript(WKUserScript(source: PageScripts.watchCookies, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+            scripts.append(WKUserScript(source: PageScripts.watchCookies, injectionTime: .atDocumentStart, forMainFrameOnly: false))
             cookies.log = { m in lb.add(m, tab: tabID) }
             cookies.onSignal = { [weak store] in
                 let st = store
@@ -197,10 +211,12 @@ final class BrowserTab: ObservableObject, Identifiable {
         }
         // LAN の保護: WebSocket は VNet を通らないので、ページの中でも止める
         if VelaSettings.localNetworkProtection {
-            content.addUserScript(WKUserScript(source: PageScripts.webSocketGuard, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+            scripts.append(WKUserScript(source: PageScripts.webSocketGuard, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
         // VNet を通らない通信（WebSocket）を使ったら知らせてもらう
-        content.addUserScript(WKUserScript(source: PageScripts.trackNonVNet, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        scripts.append(WKUserScript(source: PageScripts.trackNonVNet, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        for sc in scripts { content.addUserScript(sc) }
+        baseScripts = scripts
         actions.onAction = { [weak self] body, isMain, origin in
             let tab = self
             Task { @MainActor in tab?.handleAction(body, isMainFrame: isMain, origin: origin) }
@@ -424,15 +440,65 @@ final class BrowserTab: ObservableObject, Identifiable {
         store?.adblock.noteBlocked()
     }
 
-    /// 開くページに合わせて、広告ブロックの WebKit のルールを入れ替える（サイトごとの OFF・リストの更新）
-    func applyAdBlock(for target: URL?) {
-        guard let wv = webView, let store else { return }
+    /// 開くページに合わせて、広告ブロックの WebKit のルールとスクリプトレットを入れ替える（サイトごとの OFF・リストの更新）。
+    /// メインフレームの移動のたびに呼ばれ、スクリプトレットを選ぶフレームはトップだけに戻す。
+    /// reloadIfChanged: 今のページのスクリプトレットが変わったら読み直す（入れたスクリプトは、もう動いたページには効かない・外せないため）
+    @discardableResult
+    func applyAdBlock(for target: URL?, reloadIfChanged: Bool = false) -> Bool {
+        guard let wv = webView, let store else { return false }
         let want = store.adblock.ruleLists(for: mode, host: target?.host)
-        if want.map({ $0.identifier }) == adRuleLists.map({ $0.identifier }) { return }
+        if want.map({ $0.identifier }) != adRuleLists.map({ $0.identifier }) {
+            let content = wv.configuration.userContentController
+            for l in adRuleLists { content.remove(l) }
+            for l in want { content.add(l) }
+            adRuleLists = want
+        }
+        if let t = target, scriptletFrames.first.map({ !BrowserTab.sameDocument($0, t) }) ?? true { scriptletFrames = [t] }
+        if target == nil { scriptletFrames = [] }
+        let changed = applyScriptlets()
+        if changed && reloadIfChanged && wv.url != nil {
+            log("広告ブロックの切り替えを、開いているページに効かせるため読み直します", category: .block)
+            wv.reload()
+        }
+        return changed
+    }
+
+    /// サブフレームの移動（その前に呼ぶ）。そのホストのスクリプトレットも入れる
+    func noteSubframe(_ u: URL) {
+        guard webView != nil, let s = u.scheme?.lowercased(), ["http", "https", "vnet", "vnets"].contains(s),
+              let h = u.host?.lowercased(), !scriptletFrames.isEmpty else { return }
+        let real = VNetURL.toReal(u) ?? u
+        if scriptletFrames.dropFirst().contains(where: { $0.host?.lowercased() == h }) { return }
+        if scriptletFrames.first?.host?.lowercased() == h { return }
+        scriptletFrames.append(real)
+        if scriptletFrames.count > 1 + BrowserTab.maxScriptletFrames { scriptletFrames.remove(at: 1) }
+        applyScriptlets()
+    }
+
+    /// 選ぶフレームが変わったら、ユーザースクリプトを入れ直す（1 つずつ外す API が無いので、全部外して固定のものを入れ直す）。変わったら true
+    @discardableResult
+    private func applyScriptlets() -> Bool {
+        guard let wv = webView, let store else { return false }
+        let inj = scriptletFrames.isEmpty ? nil : store.adblock.scriptlets(top: scriptletFrames[0], frames: Array(scriptletFrames.dropFirst()))
+        if inj?.key == scriptletKey { return false }
         let content = wv.configuration.userContentController
-        for l in adRuleLists { content.remove(l) }
-        for l in want { content.add(l) }
-        adRuleLists = want
+        content.removeAllUserScripts()
+        for s in baseScripts { content.addUserScript(s) }
+        if let inj {
+            if !inj.main.isEmpty {
+                content.addUserScript(WKUserScript(source: inj.main, injectionTime: .atDocumentStart, forMainFrameOnly: false, in: .page))
+            }
+            if !inj.isolated.isEmpty {
+                content.addUserScript(WKUserScript(source: inj.isolated, injectionTime: .atDocumentStart, forMainFrameOnly: false, in: .defaultClient))
+            }
+            let hosts = scriptletFrames.compactMap { $0.host }.joined(separator: "・")
+            log("スクリプトレット \(inj.filters.count) 個を入れます（\(hosts)）: " + inj.filters.prefix(30).joined(separator: "  "), level: .debug, category: .block)
+        } else if scriptletKey != nil {
+            log("スクリプトレットを外しました", level: .debug, category: .block)
+        }
+        let had = scriptletKey
+        scriptletKey = inj?.key
+        return had != inj?.key
     }
 
     // MARK: 文字の大きさ・ページ内を検索

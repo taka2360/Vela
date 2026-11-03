@@ -224,6 +224,30 @@ func scriptletTests() {
         } else { expect(false, "本物") }
     }
 
+    test("リストの一覧: 組み込みは一覧で上書き・trusted は一覧の id と URL が合うものだけ") {
+        // 保存ファイルで URL を書き換えても、組み込みのものは一覧の URL に戻る
+        var evil = FilterListInfo(id: "ublock-quick-fixes", name: "x", url: "https://evil.example/list.txt", enabled: true, builtIn: true)
+        evil.lastUpdated = Date(timeIntervalSince1970: 1)
+        let fake = FilterListInfo(id: "ublock-fake", name: "y", url: "https://evil.example/2.txt", enabled: true, builtIn: true)
+        let m = FilterCatalog.merge(saved: [evil, fake])
+        let qf = m.first { $0.id == "ublock-quick-fixes" }!
+        expectEqual(qf.url, "https://ublockorigin.github.io/uAssets/filters/quick-fixes.txt")
+        expectEqual(qf.lastUpdated, Date(timeIntervalSince1970: 1))
+        expect(FilterCatalog.isTrusted(qf))
+        // 一覧に無い「組み込み」は自分で足したもの扱い・信頼しない
+        let f = m.first { $0.id == "ublock-fake" }!
+        expect(!f.builtIn && !FilterCatalog.isTrusted(f))
+        expect(!FilterCatalog.isTrusted(evil))
+        expect(!FilterCatalog.isTrusted(m.first { $0.id == "easylist" }!))
+        // 足りない組み込みは足す
+        expectEqual(Set(m.map { $0.id }), Set(FilterCatalog.lists.map { $0.id } + ["ublock-fake"]))
+        // 古い adblock.json（scriptletRules などが無い）も読める
+        let old = #"{"lists":[{"id":"easylist","name":"E","url":"u","enabled":true,"builtIn":true,"networkRules":1,"cosmeticRules":2,"unsupported":3}]}"#
+        let st = try JSONDecoder().decode(AdBlockState.self, from: Data(old.utf8))
+        expectEqual(st.lists.first?.scriptletRules, nil)
+        expectEqual(st.scriptletsChecked, nil)
+    }
+
     test("decompile（ログの形）") {
         expectEqual(ScriptletIndex.decompile(#"["json-prune","a b",""]"#, isException: false), "##+js(json-prune, a b, '')")
         expectEqual(ScriptletIndex.decompile(#"["x","a,b"]"#, isException: true), "#@#+js(x, 'a,b')")

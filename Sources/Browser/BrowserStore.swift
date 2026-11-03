@@ -160,9 +160,11 @@ final class BrowserStore: ObservableObject {
         if defaultMode == .vnetsLegacy { compileVNetOnlyRules() }
 
         library.load(logs: logs)
-        adblock.onRuleListsChanged = { [weak self] in
+        adblock.onRuleListsChanged = { [weak self] userAction in
             guard let self else { return }
-            for t in self.tabs { t.applyAdBlock(for: t.url) }
+            // 利用者が ON/OFF を切り替えたときだけ、見ているタブを読み直す（リストの自動更新では読み直さない。動画の途中で止まらないように）
+            let sel = self.selectedTab
+            for t in self.tabs { t.applyAdBlock(for: t.url, reloadIfChanged: userAction && t === sel) }
         }
         adblock.start(logs: logs)
         downloads.log = { s in lb.add(s, level: .info, category: .download) }
