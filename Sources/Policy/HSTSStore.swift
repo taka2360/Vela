@@ -54,16 +54,17 @@ final class HSTSStore: @unchecked Sendable {
     static let maxEntries = 5000
     private let lock = NSLock()
     private var entries: [String: HSTSEntry] = [:]
-    private let fileURL: URL?
-    private var saveScheduled = false
-    private let saveQueue = DispatchQueue(label: "vela-hsts-save")
+    /// hsts.json（nil なら保存しない）。書くのは JSONFile（まとめて書く・.atomic・壊れていたら .broken で残す）
+    private let file: JSONFile<[HSTSEntry]>?
     /// ログ（どのスレッドからでもよい）
     var log: (@Sendable (String) -> Void)?
 
-    /// fileURL が nil なら保存しない（テスト用）
-    init(fileURL: URL?, now: Date = Date()) {
-        self.fileURL = fileURL
-        if let f = fileURL, let d = try? Data(contentsOf: f), let list = try? JSONDecoder().decode([HSTSEntry].self, from: d) {
+    /// fileURL が nil なら保存しない（テスト用）。saveDelay: 変わってから書くまで（まとめて書く間。テストでだけ短くする）
+    init(fileURL: URL?, now: Date = Date(), saveDelay: TimeInterval = 2) {
+        file = fileURL.map { JSONFile(name: $0.lastPathComponent, directory: $0.deletingLastPathComponent(), delay: saveDelay) }
+        file?.log = { [weak self] s in self?.log?(s) }
+        // 読めない（壊れている）ファイルは JSONFile が .broken として残す。init のときは log がまだ無いので、ログには出ない
+        if let list = file?.load() {
             for e in list where e.expires > now { entries[e.host] = e }
         }
     }
@@ -132,22 +133,20 @@ final class HSTSStore: @unchecked Sendable {
         scheduleSave()
     }
 
-    /// まとめて 2 秒後に書く
-    private func scheduleSave() {
-        guard fileURL != nil else { return }
-        lock.lock()
-        if saveScheduled { lock.unlock(); return }
-        saveScheduled = true
-        lock.unlock()
-        saveQueue.asyncAfter(deadline: .now() + 2) { [weak self] in self?.saveNow() }
+    private func snapshot() -> [HSTSEntry] {
+        lock.lock(); defer { lock.unlock() }
+        return Array(entries.values)
     }
 
+    /// まとめて saveDelay 秒後に書く（その間に何度変わっても、書くのは最後の中身）
+    private func scheduleSave() {
+        guard let file else { return }
+        file.save(snapshot())
+    }
+
+    /// 今の中身をすぐ書く（何も変わっていなくても書く）。予約していた書き込みは、これで済んだことになる
     func saveNow() {
-        guard let f = fileURL else { return }
-        lock.lock()
-        saveScheduled = false
-        let list = Array(entries.values)
-        lock.unlock()
-        if let d = try? JSONEncoder().encode(list) { try? d.write(to: f, options: .atomic) }
+        guard let file else { return }
+        file.saveNow(snapshot())
     }
 }
