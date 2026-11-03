@@ -50,6 +50,22 @@ func virtioTests() {
         expectEqual(ram.load32(used + 4), 0, "used[0].id", file: file, line: line)
     }
 
+    test("GuestRAM.pointer(pa, count:) の境界（ゲストが書いたアドレスの確かめ）") {
+        let ram = GuestRAM(megabytes: 1)
+        let b = ram.base, s = ram.size
+        for w in [1, 2, 4, 8] {
+            expect(ram.pointer(b, count: w) != nil, "base w=\(w)")
+            expect(ram.pointer(b &+ s &- UInt64(w), count: w) != nil, "ぎりぎり w=\(w)")
+            expect(ram.pointer(b &+ s &- UInt64(w) &+ 1, count: w) == nil, "はみ出す w=\(w)")
+            expect(ram.pointer(b &- 1, count: w) == nil, "base より下 w=\(w)")
+            expect(ram.pointer(UInt64.max, count: w) == nil, "UInt64.max w=\(w)")
+            expect(ram.pointer(0, count: w) == nil, "0 w=\(w)")
+        }
+        expect(ram.pointer(b, count: Int(s)) != nil, "全部")
+        expect(ram.pointer(b, count: Int(s) + 1) == nil, "size を超える")
+        expect(ram.pointer(b &+ s, count: 0) != nil, "終わりちょうどで 0 バイト")
+        expect(ram.pointer(b &+ s &+ 1, count: 0) == nil)
+    }
     test("カード: キューの置き場所（num・align・ページの大きさを変えて）") {
         for num: UInt32 in [0, 8, 256] {
             for align: UInt32 in [4096, 64, 8192] {
