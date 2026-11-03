@@ -782,9 +782,7 @@ struct HistoryPage: View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 TextField("履歴を検索", text: $query)
-                    .textFieldStyle(.roundedBorder)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
+                    .searchFieldStyle()
                 ClearHistoryMenu(library: library)
             }
             .padding(.horizontal)
@@ -1185,7 +1183,7 @@ struct DevLogPage: View {
                     ForEach(LogCategory.allCases, id: \.self) { c in Button(c.rawValue) { category = c } }
                 }
                 Toggle("このタブだけ", isOn: $onlyThisTab).fixedSize()
-                TextField("探す", text: $query).textFieldStyle(.roundedBorder).autocorrectionDisabled().textInputAutocapitalization(.never)
+                TextField("探す", text: $query).searchFieldStyle()
                 Button("コピー") { UIPasteboard.general.string = filtered.map { $0.line }.joined(separator: "\n") }
                 Button("消す") { store.logs.clear() }
             }

@@ -112,9 +112,7 @@ struct HistoryPage: View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 TextField("履歴を検索", text: $query)
-                    .textFieldStyle(.roundedBorder)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
+                    .searchFieldStyle()
                 ClearHistoryMenu(library: library)
             }
             .padding(.horizontal)

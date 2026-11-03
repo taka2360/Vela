@@ -17,7 +17,7 @@ struct DevNetworkPage: View {
             HStack(spacing: 12) {
                 Toggle("失敗・ブロックだけ", isOn: $onlyProblems).fixedSize()
                 Toggle("このタブだけ", isOn: $onlyThisTab).fixedSize()
-                TextField("URL を探す", text: $query).textFieldStyle(.roundedBorder).autocorrectionDisabled().textInputAutocapitalization(.never)
+                TextField("URL を探す", text: $query).searchFieldStyle()
                 Button("消す") { store.netLog.clear() }
             }
             .font(.system(size: 13))
@@ -88,7 +88,7 @@ struct DevCookiePage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                TextField("ドメイン・名前で探す", text: $query).textFieldStyle(.roundedBorder).autocorrectionDisabled().textInputAutocapitalization(.never)
+                TextField("ドメイン・名前で探す", text: $query).searchFieldStyle()
                 Text("\(cookies.count) / \(store.cookieJar.count) 個").font(.system(size: 13))
             }
             Text("VNet が使う Cookie の写し（正本は WebKit の置き場）。値は先頭だけ出します。消すのは 設定 → データ からできます")

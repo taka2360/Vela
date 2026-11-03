@@ -144,7 +144,7 @@ struct DevLogPage: View {
                     ForEach(LogCategory.allCases, id: \.self) { c in Button(c.rawValue) { category = c } }
                 }
                 Toggle("このタブだけ", isOn: $onlyThisTab).fixedSize()
-                TextField("探す", text: $query).textFieldStyle(.roundedBorder).autocorrectionDisabled().textInputAutocapitalization(.never)
+                TextField("探す", text: $query).searchFieldStyle()
                 Button("コピー") { UIPasteboard.general.string = filtered.map { $0.line }.joined(separator: "\n") }
                 Button("消す") { store.logs.clear() }
             }

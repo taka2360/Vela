@@ -37,7 +37,7 @@ struct DevNetworkPage: View {
             HStack(spacing: 12) {
                 Toggle("失敗・ブロックだけ", isOn: $onlyProblems).fixedSize()
                 Toggle("このタブだけ", isOn: $onlyThisTab).fixedSize()
-                TextField("URL を探す", text: $query).textFieldStyle(.roundedBorder).autocorrectionDisabled().textInputAutocapitalization(.never)
+                TextField("URL を探す", text: $query).searchFieldStyle()
                 Button("消す") { store.netLog.clear() }
             }
             .font(.system(size: 13))
@@ -108,7 +108,7 @@ struct DevCookiePage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                TextField("ドメイン・名前で探す", text: $query).textFieldStyle(.roundedBorder).autocorrectionDisabled().textInputAutocapitalization(.never)
+                TextField("ドメイン・名前で探す", text: $query).searchFieldStyle()
                 Text("\(cookies.count) / \(store.cookieJar.count) 個").font(.system(size: 13))
             }
             Text("VNet が使う Cookie の写し（正本は WebKit の置き場）。値は先頭だけ出します。消すのは 設定 → データ からできます")
@@ -890,6 +890,14 @@ struct SheetHeader<Title: View, Trailing: View>: View {
 extension SheetHeader where Trailing == EmptyView {
     init(closeLabel: String, closeLeading: CGFloat = 0, close: @escaping () -> Void, @ViewBuilder title: @escaping () -> Title) {
         self.init(closeLabel: closeLabel, closeLeading: closeLeading, close: close, title: title, trailing: { EmptyView() })
+    }
+}
+
+extension View {
+    /// 検索欄（開発者パネルのログ・通信・Cookie、履歴）: 角丸の枠 → 自動修正なし → 大文字にしない。
+    /// アドレス欄と広告ブロックの URL 入力は並びが違うので使わない
+    func searchFieldStyle() -> some View {
+        textFieldStyle(.roundedBorder).autocorrectionDisabled().textInputAutocapitalization(.never)
     }
 }
 

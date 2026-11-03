@@ -26,3 +26,11 @@ extension SheetHeader where Trailing == EmptyView {
         self.init(closeLabel: closeLabel, closeLeading: closeLeading, close: close, title: title, trailing: { EmptyView() })
     }
 }
+
+extension View {
+    /// 検索欄（開発者パネルのログ・通信・Cookie、履歴）: 角丸の枠 → 自動修正なし → 大文字にしない。
+    /// アドレス欄と広告ブロックの URL 入力は並びが違うので使わない
+    func searchFieldStyle() -> some View {
+        textFieldStyle(.roundedBorder).autocorrectionDisabled().textInputAutocapitalization(.never)
+    }
+}
