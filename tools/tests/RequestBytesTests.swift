@@ -33,7 +33,8 @@ func requestBytesBuildTests() {
 func requestBytesTests(_ m: VNetMachine, _ net: FakeNet) {
     print("送る要求のヘッダ")
     func last(_ path: String) -> FakeRequest? { net.received.last { $0.path == path } }
-    func names(_ r: FakeRequest?) -> [String] { r?.headers.map { $0.0 } ?? [] }
+    /// ヘッダの名前の並び。Cookie は前のテスト（/login）が動いたかで有る無しが変わるので外す（Cookie の位置は build のテストで見る）
+    func names(_ r: FakeRequest?) -> [String] { r?.headers.map { $0.0 }.filter { $0 != "Cookie" } ?? [] }
 
     test("ヘッダの順番（知らない名前は content-type の所に来た順・外すものは外す・既定の値）") {
         var req = HTTPRequest(url: url("http://site.test/order"))
@@ -43,7 +44,7 @@ func requestBytesTests(_ m: VNetMachine, _ net: FakeNet) {
         _ = fetch(m, req)
         let r = last("/order")
         expectEqual(names(r), ["Host", "X-Custom", "X-Other", "accept", "Sec-Fetch-Site", "Accept-Language", "User-Agent",
-                               "Referer", "Accept-Encoding", "Cookie", "Connection"])   // Cookie は前のテストで入った CookieJar から
+                               "Referer", "Accept-Encoding", "Connection"])
         expectEqual(r?.headers.value(for: "Host"), "site.test", "Host は自分で決める")
         expectEqual(r?.headers.value(for: "Connection"), "keep-alive")
         expectEqual(r?.headers.value(for: "accept"), "text/html", "来た Accept はそのまま")
@@ -59,7 +60,7 @@ func requestBytesTests(_ m: VNetMachine, _ net: FakeNet) {
         expectEqual(r?.headers.value(for: "Accept"), "*/*")
         expectEqual(r?.headers.value(for: "User-Agent"), "Mine/1.0")
         expectEqual(r?.headers.value(for: "Accept-Encoding"), "identity")
-        expectEqual(names(r), ["Host", "Accept", "Accept-Language", "User-Agent", "Range", "Accept-Encoding", "Cookie", "Connection"])
+        expectEqual(names(r), ["Host", "Accept", "Accept-Language", "User-Agent", "Range", "Accept-Encoding", "Connection"])
     }
     test("Content-Length: POST・PUT・PATCH で中身が無いときは 0、ほかは付けない（大文字だけ見る）") {
         for (method, want) in [("POST", "0"), ("PUT", "0"), ("PATCH", "0"), ("DELETE", nil), ("post", nil)] as [(String, String?)] {
