@@ -267,11 +267,9 @@ final class UserNet: @unchecked Sendable {
         let iss: UInt32                   // こちらの最初の番号
         var sndUna: UInt32                // ゲストがまだ受け取ったと言っていない最初の番号
         var sndNxt: UInt32                // 次に送る番号
-        /// 外から来た（まだ受け取りの返事が無い）データ。buf[bufPos...] が sndUna から先。
-        /// 先頭を消すとそのたびに全部ずらすことになって遅いので、位置で覚えてときどき詰める
-        var buf = [UInt8]()
-        var bufPos = 0
-        var pending: Int { buf.count - bufPos }
+        /// 外から来た（まだ受け取りの返事が無い）データ。読める並びの先頭が sndUna
+        var buf = ByteQueue()
+        var pending: Int { buf.count }
         var window: UInt32 = 65535
         var mss = 536
         var remoteEOF = false             // 外の相手が閉じた
@@ -291,9 +289,8 @@ final class UserNet: @unchecked Sendable {
         /// ゲストが受け取ったと言った分を buf から外す
         func dropAcked(_ n: Int) {
             guard n > 0 else { return }
-            bufPos += n
-            if bufPos == buf.count { buf.removeAll(keepingCapacity: true); bufPos = 0 }
-            else if bufPos > 131072 && bufPos * 2 > buf.count { buf.removeFirst(bufPos); bufPos = 0 }
+            buf.consume(n)
+            buf.compact(above: 131072, resetWhenEmpty: true)
         }
     }
 
@@ -434,8 +431,7 @@ final class UserNet: @unchecked Sendable {
             let room = Int(c.window) - sent
             if room <= 0 { break }
             let n = min(unsent, c.mss, room)
-            let start = c.bufPos + sent
-            sendTCP(c, [.ack, .psh], seq: c.sndNxt, payload: c.buf[start..<(start + n)])
+            sendTCP(c, [.ack, .psh], seq: c.sndNxt, payload: c.buf.slice(at: sent, count: n))
             c.sndNxt &+= UInt32(n)
         }
         checkDone(c)
