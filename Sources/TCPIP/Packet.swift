@@ -49,6 +49,50 @@ extension Array where Element == UInt8 {
     var macString: String { map { String(format: "%02x", $0) }.joined(separator: ":") }
 }
 
+// MARK: 読み位置付きのバイトの列
+
+/// 前から読んでいくバイトの列（UserNet の TCP の送り待ち・GuestTCP の送り待ち・TLS の受け取り待ちで使う）。
+/// 先頭を消すと毎回全部ずらすことになって遅いので、読み位置（pos）で覚えて、ときどき詰める。
+/// いつも 0 <= pos <= buf.count。読める並びは buf[pos...]。詰めるのは compact を呼んだときだけ（呼ぶ時点は使う側が決める）
+struct ByteQueue {
+    private(set) var buf: [UInt8] = []
+    private(set) var pos = 0
+
+    var count: Int { buf.count - pos }
+    var isEmpty: Bool { pos >= buf.count }
+
+    mutating func append<S: Sequence>(contentsOf s: S) where S.Element == UInt8 { buf.append(contentsOf: s) }
+
+    /// 読める並びの at から count バイト（コピーしない）。0 <= at、0 <= count、at + count <= self.count であること
+    func slice(at: Int, count n: Int) -> ArraySlice<UInt8> {
+        precondition(at >= 0 && n >= 0 && at <= count && n <= count - at, "ByteQueue.slice の範囲外")
+        return buf[(pos + at)..<(pos + at + n)]
+    }
+
+    /// 先頭の n バイト（足りなければある分だけ）
+    func prefix(_ n: Int) -> ArraySlice<UInt8> { buf[pos..<(pos + min(max(n, 0), count))] }
+
+    /// 先頭の n バイトを p に写す（読み位置は動かさない）。0 <= n <= count。p に n バイトの場所があるのは呼ぶ側の責任
+    func copy(into p: UnsafeMutableRawPointer, count n: Int) {
+        precondition(n >= 0 && n <= count, "ByteQueue.copy の範囲外")
+        if n == 0 { return }
+        buf.withUnsafeBytes { p.copyMemory(from: $0.baseAddress! + pos, byteCount: n) }
+    }
+
+    /// 先頭の n バイトを読んだことにする（n <= 0 なら何もしない。n <= count であること）。詰めはしない
+    mutating func consume(_ n: Int) {
+        guard n > 0 else { return }
+        precondition(n <= count, "ByteQueue.consume の範囲外")
+        pos += n
+    }
+
+    /// 詰める。空で resetWhenEmpty なら中身を消す（場所は取っておく）。そうでなく pos > above かつ pos * 2 > buf.count なら、読んだ所を消す
+    mutating func compact(above: Int, resetWhenEmpty: Bool) {
+        if resetWhenEmpty && pos == buf.count { buf.removeAll(keepingCapacity: true); pos = 0 }
+        else if pos > above && pos * 2 > buf.count { buf.removeFirst(pos); pos = 0 }
+    }
+}
+
 // MARK: 確認用の値（チェックサム）
 
 enum Checksum {

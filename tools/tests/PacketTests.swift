@@ -66,6 +66,52 @@ func packetTests() {
         expect(!TCPSeq.endsAt(seq: 0xFFFF_FFFE, count: 3, rcvNxt: 2))
         expect(TCPSeq.endsAt(seq: 9, count: 0, rcvNxt: 9), "データが無い FIN")
     }
+    test("ByteQueue: 足す・読む・途中まで読む・全部読んだ後に足す") {
+        var q = ByteQueue()
+        expect(q.isEmpty); expectEqual(q.count, 0); expectEqual(Array(q.prefix(1)), [])
+        q.append(contentsOf: [1, 2, 3, 4, 5])
+        expectEqual(q.count, 5)
+        expectEqual(Array(q.slice(at: 1, count: 3)), [2, 3, 4])
+        expectEqual(Array(q.slice(at: 5, count: 0)), [])
+        expectEqual(Array(q.prefix(1)), [1])
+        expectEqual(Array(q.prefix(9)), [1, 2, 3, 4, 5])
+        q.consume(2)
+        expectEqual(q.count, 3); expectEqual(Array(q.slice(at: 0, count: 3)), [3, 4, 5])
+        q.consume(0); q.consume(-3)
+        expectEqual(q.count, 3, "0 以下は何もしない")
+        var out = [UInt8](repeating: 0, count: 4)
+        out.withUnsafeMutableBytes { q.copy(into: $0.baseAddress!, count: 2) }
+        expectEqual(out, [3, 4, 0, 0]); expectEqual(q.count, 3, "copy は読み位置を動かさない")
+        q.consume(3)
+        expect(q.isEmpty)
+        q.append(contentsOf: Data([9, 8]))
+        expectEqual(Array(q.slice(at: 0, count: 2)), [9, 8], "全部読んだ後に足した分")
+    }
+    test("ByteQueue: compact の境界（above・pos*2 == buf.count・resetWhenEmpty）") {
+        func make(_ total: Int, read: Int) -> ByteQueue {
+            var q = ByteQueue(); q.append(contentsOf: (0..<total).map { UInt8($0 & 0xFF) }); q.consume(read); return q
+        }
+        // pos == above では詰めない、above + 1 なら詰める（pos*2 > buf.count のとき）
+        var a = make(30, read: 10); a.compact(above: 10, resetWhenEmpty: false)
+        expectEqual(a.pos, 10)
+        var b = make(20, read: 11); b.compact(above: 10, resetWhenEmpty: false)
+        expectEqual(b.pos, 0); expectEqual(b.buf.count, 9); expectEqual(b.buf.first, 11)
+        // pos*2 == buf.count では詰めない
+        var c = make(24, read: 12); c.compact(above: 10, resetWhenEmpty: false)
+        expectEqual(c.pos, 12)
+        // 空のとき: resetWhenEmpty なら消す。そうでなければ、above の決まりだけで決める
+        var d = make(8, read: 8); d.compact(above: 100, resetWhenEmpty: true)
+        expectEqual(d.pos, 0); expectEqual(d.buf.count, 0)
+        var e = make(8, read: 8); e.compact(above: 100, resetWhenEmpty: false)
+        expectEqual(e.pos, 8, "TLS の形: 空でも消さない")
+        var f = make(200, read: 200); f.compact(above: 100, resetWhenEmpty: false)
+        expectEqual(f.pos, 0); expectEqual(f.buf.count, 0)
+        // 詰めた後も、読める中身は同じ
+        var g = make(300_000, read: 200_000)
+        let before = Array(g.slice(at: 0, count: g.count))
+        g.compact(above: 131072, resetWhenEmpty: true)
+        expectEqual(g.pos, 0); expectEqual(Array(g.slice(at: 0, count: g.count)), before)
+    }
     test("EthernetFrame・ARPPacket を読む") {
         let mac: [UInt8] = [2, 0, 0, 0, 0, 9]
         let f = arpFrame(op: ARP.request, srcMAC: mac, senderIP: [10, 0, 2, 9], targetIP: Net.dns)
