@@ -28,6 +28,40 @@ extension Array where Element == (String, String) {
     }
 }
 
+// MARK: gzip・zlib の頭（純 Swift。一括と流す形の両方が使う）
+
+enum GzipHeader {
+    enum Outcome: Equatable {
+        /// 頭がまだ全部届いていない（一括なら壊れている扱い、流す形なら続きを待つ。決めるのは呼ぶ側）
+        case needMore
+        case bad(String)
+        /// 頭の長さ（ここから後ろが deflate）。length <= 渡したバイト数
+        case length(Int)
+    }
+
+    /// gzip の頭を読む。見るのはマジック・CM=8・FEXTRA・FNAME・FCOMMENT・FHCRC（予約フラグ・CRC は見ない。長さの上限も無い）
+    static func parse(_ b: [UInt8]) -> Outcome {
+        if b.count < 10 { return .needMore }
+        guard b[0] == 0x1F, b[1] == 0x8B, b[2] == 8 else { return .bad("gzip の頭が違います") }
+        let flags = b[3]
+        var p = 10
+        if flags & 4 != 0 {                                         // FEXTRA
+            guard p + 2 <= b.count else { return .needMore }
+            p += 2 + (Int(b[p]) | Int(b[p + 1]) << 8)
+        }
+        for flag in [UInt8(8), 16] where flags & flag != 0 {        // FNAME・FCOMMENT（0 で終わる）
+            guard let z = b[min(p, b.count)...].firstIndex(of: 0) else { return .needMore }
+            p = z + 1
+        }
+        if flags & 2 != 0 { p += 2 }                                 // FHCRC
+        if p > b.count { return .needMore }
+        return .length(p)
+    }
+
+    /// zlib の包み（2 バイト）か: CM=8 で、2 バイトを 16 ビットとして見ると 31 の倍数
+    static func isZlib(_ b0: UInt8, _ b1: UInt8) -> Bool { b0 & 0x0F == 8 && (Int(b0) << 8 | Int(b1)) % 31 == 0 }
+}
+
 // MARK: 縮めた中身を戻す（gzip・deflate・br）
 
 enum ContentDecoding {
@@ -83,20 +117,20 @@ enum ContentDecoding {
     static func gunzip(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
         let b = [UInt8](d)
         guard b.count >= 18, b[0] == 0x1F, b[1] == 0x8B, b[2] == 8 else { return .failure(.corrupt("gzip の頭が違います")) }
-        let flags = b[3]
-        var p = 10
-        if flags & 4 != 0 { guard p + 2 <= b.count else { return .failure(.corrupt("gzip")) }; p += 2 + (Int(b[p]) | Int(b[p + 1]) << 8) }   // FEXTRA
-        if flags & 8 != 0 { while p < b.count && b[p] != 0 { p += 1 }; p += 1 }                                      // FNAME
-        if flags & 16 != 0 { while p < b.count && b[p] != 0 { p += 1 }; p += 1 }                                     // FCOMMENT
-        if flags & 2 != 0 { p += 2 }                                                                                  // FHCRC
-        guard p < b.count else { return .failure(.corrupt("gzip")) }
-        return inflateRaw(b[p...], name: "gzip", maxOutput: maxOutput)
+        // 一括では、頭が途中までしか無い（needMore）・頭の後ろに 1 バイトも無い、はどちらも壊れている扱い
+        switch GzipHeader.parse(b) {
+        case .needMore: return .failure(.corrupt("gzip"))
+        case .bad(let why): return .failure(.corrupt(why))
+        case .length(let p):
+            guard p < b.count else { return .failure(.corrupt("gzip")) }
+            return inflateRaw(b[p...], name: "gzip", maxOutput: maxOutput)
+        }
     }
 
     /// deflate: 本当は zlib の包み（2 バイト＋後ろ 4 バイト）付き。包みの無い生の deflate を送るサーバーもあるので両方受ける
     static func inflateZlib(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
         let b = [UInt8](d)
-        if b.count >= 2 && b[0] & 0x0F == 8 && (Int(b[0]) << 8 | Int(b[1])) % 31 == 0 { return inflateRaw(b[2...], name: "deflate", maxOutput: maxOutput) }
+        if b.count >= 2 && GzipHeader.isZlib(b[0], b[1]) { return inflateRaw(b[2...], name: "deflate", maxOutput: maxOutput) }
         return inflateRaw(b[...], name: "deflate", maxOutput: maxOutput)
     }
 
@@ -238,24 +272,15 @@ final class StreamDecoder {
         case .deflate:
             // zlib の包み（2 バイト）があれば外す。無いもの（生の deflate）も受ける
             if b.count < 2 { return .needMore }
-            if b[0] & 0x0F == 8 && (Int(b[0]) << 8 | Int(b[1])) % 31 == 0 { return .done(Array(b[2...])) }
+            if GzipHeader.isZlib(b[0], b[1]) { return .done(Array(b[2...])) }
             return .done(b)
         case .gzip:
-            if b.count < 10 { return .needMore }
-            guard b[0] == 0x1F, b[1] == 0x8B, b[2] == 8 else { return .bad("gzip の頭が違います") }
-            let flags = b[3]
-            var p = 10
-            if flags & 4 != 0 {                                         // FEXTRA
-                guard p + 2 <= b.count else { return .needMore }
-                p += 2 + (Int(b[p]) | Int(b[p + 1]) << 8)
+            // 流す形では、頭が途中までなら続きを待つ（最後まで来ても足りなければ finish が「頭の途中で終わりました」）
+            switch GzipHeader.parse(b) {
+            case .needMore: return .needMore
+            case .bad(let why): return .bad(why)
+            case .length(let p): return .done(Array(b[p...]))
             }
-            for flag in [UInt8(8), 16] where flags & flag != 0 {        // FNAME・FCOMMENT（0 で終わる）
-                guard let z = b[min(p, b.count)...].firstIndex(of: 0) else { return .needMore }
-                p = z + 1
-            }
-            if flags & 2 != 0 { p += 2 }                                 // FHCRC
-            if p > b.count { return .needMore }
-            return .done(Array(b[p...]))
         }
     }
 

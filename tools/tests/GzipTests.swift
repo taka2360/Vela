@@ -54,6 +54,36 @@ func gzipTests() {
         expectEqual(decodeGzipOutcome(Array((gzipHead(flags: 0) + body).prefix(17))), "corrupt:gzip の頭が違います", "18 バイト未満")
         expectEqual(decodeGzipOutcome([]), "corrupt:gzip の頭が違います", "空（中身が空なら戻さないのは HTTPClient.result の方）")
     }
+    test("GzipHeader.parse（流す形の決まり: 足りなければ needMore）") {
+        expectEqual(GzipHeader.parse([]), .needMore)
+        expectEqual(GzipHeader.parse(Array(gzipHead(flags: 0).prefix(9))), .needMore, "10 バイト未満")
+        expectEqual(GzipHeader.parse(gzipHead(flags: 0)), .length(10), "ちょうど最後で終わる")
+        expectEqual(GzipHeader.parse(gzipHead(flags: 0) + body), .length(10))
+        expectEqual(GzipHeader.parse(gzipHead(flags: 0, magic: [0x1F, 0x8C])), .bad("gzip の頭が違います"))
+        expectEqual(GzipHeader.parse(gzipHead(flags: 0, cm: 9)), .bad("gzip の頭が違います"))
+        expectEqual(GzipHeader.parse(gzipHead(flags: 0xE0) + body), .length(10), "予約フラグは見ていない")
+        // FEXTRA: 長さの 2 バイトが途中で切れる・中身が途中で切れる・65535
+        expectEqual(GzipHeader.parse(Array(gzipHead(flags: 4, extra: [1]).prefix(11))), .needMore)
+        expectEqual(GzipHeader.parse(gzipHead(flags: 4, extra: [1, 2], extraLen: 5)), .needMore)
+        expectEqual(GzipHeader.parse(gzipHead(flags: 4, extra: [1, 2, 3])), .length(15))
+        expectEqual(GzipHeader.parse(gzipHead(flags: 4, extra: [UInt8](repeating: 7, count: 65535)) + body), .length(12 + 65535))
+        // FNAME・FCOMMENT: 0 が無ければ needMore、あればその次から
+        expectEqual(GzipHeader.parse(gzipHead(flags: 8, name: [0x61, 0x62])), .needMore)
+        expectEqual(GzipHeader.parse(gzipHead(flags: 16, comment: [0x61])), .needMore)
+        expectEqual(GzipHeader.parse(gzipHead(flags: 8 | 16, name: [0x61, 0], comment: [0x62])), .needMore)
+        expectEqual(GzipHeader.parse(gzipHead(flags: 8 | 16, name: [0x61, 0], comment: [0x62, 0])), .length(14))
+        // FHCRC: 2 バイト足りなければ needMore
+        expectEqual(GzipHeader.parse(gzipHead(flags: 2, hcrc: 1)), .needMore)
+        expectEqual(GzipHeader.parse(gzipHead(flags: 2)), .length(12))
+        expectEqual(GzipHeader.parse(gzipHead(flags: 2 | 4 | 8 | 16, extra: [9], name: [0x61, 0], comment: [0x62, 0])), .length(19))
+        // FEXTRA の長さで先へ飛んだ後の FNAME（0 を探す所が無い）
+        expectEqual(GzipHeader.parse(gzipHead(flags: 4 | 8, extra: [], extraLen: 100, name: [0])), .needMore)
+    }
+    test("GzipHeader.isZlib") {
+        expect(GzipHeader.isZlib(0x78, 0x9C)); expect(GzipHeader.isZlib(0x78, 0x01)); expect(GzipHeader.isZlib(0x78, 0xDA))
+        expect(!GzipHeader.isZlib(0x78, 0x9D), "31 の倍数でない")
+        expect(!GzipHeader.isZlib(0x79, 0x9C), "CM が 8 でない")
+    }
     test("一括: 頭が途中までしか無い → corrupt(gzip)") {
         // FEXTRA の中身が途中で切れる（長さは 65535 と言っているのに 10 バイトしか無い）
         expectEqual(decodeGzipOutcome(gzipHead(flags: 4, extra: [UInt8](repeating: 1, count: 10), extraLen: 65535)), "corrupt:gzip")
