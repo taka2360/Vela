@@ -84,6 +84,16 @@ struct FetchError: Error, Sendable, CustomStringConvertible {
     let description: String
     var kind: Kind
     init(_ description: String, kind: Kind = .other) { self.description = description; self.kind = kind }
+
+    /// 返事を読めなかった: 大きすぎるなら tooLarge、それ以外は malformed
+    init(_ f: ResponseParser.Failure) {
+        if case .tooLarge = f { self.init(f.description, kind: .tooLarge) } else { self.init(f.description, kind: .malformed) }
+    }
+
+    /// 縮めた中身を戻せなかった: 大きすぎるなら tooLarge、それ以外（壊れている・戻せない縮め方）は malformed
+    init(_ f: ContentDecoding.Failure) {
+        if case .tooLarge = f { self.init(f.description, kind: .tooLarge) } else { self.init(f.description, kind: .malformed) }
+    }
 }
 
 // MARK: - 1 本の接続
@@ -206,9 +216,7 @@ final class HTTPConn: @unchecked Sendable {
         if let f = p.failure {
             // おかしな返事: その要求は失敗にして、接続は切る（続きのバイトの区切りが信用できないため）
             alive = false
-            let kind: FetchError.Kind
-            if case .tooLarge = f { kind = .tooLarge } else { kind = .malformed }
-            finishCurrent(.failure(FetchError(f.description, kind: kind)), reusable: false)
+            finishCurrent(.failure(FetchError(f)), reusable: false)
             tcp?.abort()
             return
         }
@@ -469,7 +477,9 @@ final class HTTPPool: @unchecked Sendable {
             guard let d = state.decoder else { sink.onData(chunk); return }
             switch d.feed(chunk) {
             case .success(let out): if !out.isEmpty { sink.onData(out) }
-            case .failure(let f): state.failure = FetchError(f.description, kind: .malformed)
+            // 流す形の StreamDecoder には上限が無い（maxOutput = Int.max）ので、今は tooLarge にならず必ず malformed。
+            // 流す形に上限を付けたら、ここも tooLarge になる
+            case .failure(let f): state.failure = FetchError(f)
             }
         }
     }
@@ -479,7 +489,7 @@ final class HTTPPool: @unchecked Sendable {
         if let d = state.decoder, state.failure == nil {
             switch d.finish() {
             case .success(let out): if !out.isEmpty { state.sink?.onData(out) }
-            case .failure(let f): state.failure = FetchError(f.description, kind: .malformed)
+            case .failure(let f): state.failure = FetchError(f)        // 上と同じく、今は必ず malformed
             }
         }
         if let f = state.failure {
@@ -706,8 +716,7 @@ final class HTTPPool: @unchecked Sendable {
             case .failure(let f):
                 // 戻せない中身をそのまま渡すと、ページには壊れたデータになる。失敗にする
                 stack.trace?("縮めた中身（\(enc)）を戻せませんでした: \(url.absoluteString)（\(f.description)）")
-                if case .tooLarge = f { return .failure(FetchError(f.description, kind: .tooLarge)) }
-                return .failure(FetchError(f.description, kind: .malformed))
+                return .failure(FetchError(f))
             }
         }
         headers.removeAll(named: ["transfer-encoding"])
