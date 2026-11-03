@@ -9,6 +9,7 @@ Sources/Policy/CookieJar.swift
 Sources/HTTP/HTTPSupport.swift
 Sources/HTTP/HTTPResponseParser.swift
 Sources/HTTP/HTTPClient.swift
+Sources/HTTP/HTTPRequestBytes.swift
 Sources/HTTP/TLSClient.swift
 Sources/TCPIP/Packet.swift
 Sources/TCPIP/DNSMessage.swift

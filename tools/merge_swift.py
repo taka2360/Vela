@@ -23,7 +23,7 @@ from pathlib import Path
 ORDER = [
     "MyApp", "BrowserView", "BrowserControls", "TabViews", "LibraryView", "DevPanel", "DevPanelPages", "SettingsView", "AdBlockView", "Downloads", "DownloadFiles", "BrowserModels", "BrowserStore", "BrowserTab", "TabWebDelegate", "Library", "LibraryModel", "AddressInput", "ErrorPages", "NetLog", "FilterLists", "ABPFilter", "BlockEngine", "ContentBlocker", "Persistence", "DevLog", "CrashLog", "VNetScheme", "HTTPSTakeover", "PageScripts",
     "NetPolicy", "SiteUtil", "Cookies", "RedirectPolicy", "LocalNetworkPolicy", "CookieJar", "HSTSStore",
-    "HTTPClient", "HTTPResponseParser", "HTTPSupport", "TLSClient",
+    "HTTPClient", "HTTPRequestBytes", "HTTPResponseParser", "HTTPSupport", "TLSClient",
     "GuestStack", "GuestTCP", "DNSMessage", "Packet",
     "VNetMachine", "VNetCore", "VNetDriver",
     "UserNet", "UserNetApple",

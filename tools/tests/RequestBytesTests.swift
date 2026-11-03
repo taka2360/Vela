@@ -3,6 +3,33 @@ import Foundation
 // MARK: - 送る要求のバイト（ヘッダの順番・外すもの・既定の値）のテスト（今の動きを書き留めたもの）
 // 偽のサーバー（FakeNet）に届いた要求を見る。Linux には Compression が無いので、Accept-Encoding はいつも identity
 
+/// HTTPRequestBytes.build を直接呼んだときの、要求の行とヘッダ（中身は除く）
+func builtHead(_ req: HTTPRequest, host: String, ua: String = "UA/1", cookie: String? = nil) -> [String] {
+    let d = HTTPRequestBytes.build(req, host: host, userAgent: ua, cookie: cookie)
+    let text = String(decoding: d, as: UTF8.self)
+    let head = text.components(separatedBy: "\r\n\r\n").first ?? ""
+    return head.components(separatedBy: "\r\n")
+}
+
+func requestBytesBuildTests() {
+    print("HTTPRequestBytes.build")
+    test("要求の行・Host・Cookie の位置・中身") {
+        var req = HTTPRequest(url: url("http://example.test:8080/a%20b?q=1"))
+        req.method = "POST"; req.body = Data("xyz".utf8); req.headers = [("Content-Type", "text/plain"), ("Origin", "http://example.test")]
+        let h = builtHead(req, host: "example.test", cookie: "k=v")
+        expectEqual(h, ["POST /a%20b?q=1 HTTP/1.1", "Host: example.test:8080", "Origin: http://example.test", "Content-Type: text/plain",
+                        "Accept: */*", "Accept-Language: \(BrowserIdentity.acceptLanguage)", "User-Agent: UA/1",
+                        "Content-Length: 3", "Accept-Encoding: \(ContentDecoding.acceptEncoding)", "Cookie: k=v", "Connection: keep-alive"])
+        let d = HTTPRequestBytes.build(req, host: "example.test", userAgent: "UA/1", cookie: nil)
+        expect(d.suffix(7) == Data("\r\n\r\nxyz".utf8), "ヘッダの後ろに中身")
+        expect(!builtHead(req, host: "example.test").contains { $0.hasPrefix("Cookie:") }, "cookie が nil なら付けない")
+    }
+    test("IPv6 の Host は、渡された（角かっこを外した）名前のまま") {
+        let h = builtHead(HTTPRequest(url: url("http://[::1]:8080/")), host: "::1")
+        expectEqual(h[1], "Host: ::1:8080")
+    }
+}
+
 func requestBytesTests(_ m: VNetMachine, _ net: FakeNet) {
     print("送る要求のヘッダ")
     func last(_ path: String) -> FakeRequest? { net.received.last { $0.path == path } }
