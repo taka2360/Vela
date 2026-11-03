@@ -8,6 +8,7 @@ import Network
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+import CryptoKit
 import ObjectiveC
 #if canImport(Compression)
 import Compression

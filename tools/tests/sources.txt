@@ -29,6 +29,7 @@ Sources/Browser/CrashLog.swift
 Sources/Browser/LibraryModel.swift
 Sources/AdBlock/FilterPreparser.swift
 Sources/AdBlock/ABPFilter.swift
+Sources/AdBlock/Scriptlets.swift
 Sources/AdBlock/BlockEngine.swift
 Sources/AdBlock/ContentBlocker.swift
 Sources/Browser/NetLog.swift

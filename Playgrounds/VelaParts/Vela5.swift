@@ -8,6 +8,7 @@ import Network
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+import CryptoKit
 import ObjectiveC
 #if canImport(Compression)
 import Compression
@@ -15,247 +16,6 @@ import Compression
 #if canImport(Security)
 import Security
 #endif
-
-// ======================================================================
-// MARK: - FilterPreparser.swift
-// ======================================================================
-
-// MARK: - リストの前処理（!#if / !#else / !#endif と !#include）
-//
-// uBlock Origin（uBO）1.75.2 の static-filtering-parser.js の preparser（preparserTokens・evaluateExpr・splitter・expandIncludes）を写したもの。
-// ・知らない名前の !#if は「判定しない」（中も外も残す）。cap_ で始まる知らない名前だけは偽
-// ・env は uBO が持つ値の名前（"ublock"・"mobile" など）。Vela は ext_ublock を真にし、UA に Mobile があれば env_mobile も真（uBO の vapi-common.js と同じ判定）
-// ・!#include は、URL の形と「..」を含むものを断り、元のリストと同じ場所（サブフォルダは可）から読む。捨てる枝の中の include は読まない
-
-enum FilterPreparser {
-    /// uBO の preparserTokens（!#if の名前 → env の値の名前）
-    static let tokens: [String: String] = [
-        "ext_ublock": "ublock",
-        "ext_ubol": "ubol",
-        "ext_devbuild": "devbuild",
-        "env_brave": "brave",
-        "env_chromium": "chromium",
-        "env_edge": "edge",
-        "env_firefox": "firefox",
-        "env_legacy": "legacy",
-        "env_mobile": "mobile",
-        "env_mv3": "mv3",
-        "env_safari": "safari",
-        "cap_html_filtering": "html_filtering",
-        "cap_ipaddress": "ipaddress",
-        "false": "false",
-        "ext_abp": "false",
-        "adguard": "adguard",
-        "adguard_app_android": "false",
-        "adguard_app_cli": "false",
-        "adguard_app_ios": "false",
-        "adguard_app_mac": "false",
-        "adguard_app_windows": "false",
-        "adguard_ext_android_cb": "false",
-        "adguard_ext_chromium": "chromium",
-        "adguard_ext_chromium_mv3": "mv3",
-        "adguard_ext_edge": "edge",
-        "adguard_ext_firefox": "firefox",
-        "adguard_ext_opera": "chromium",
-        "adguard_ext_safari": "false",
-    ]
-
-    /// Vela の env（uBO の vAPI.webextFlavor.soup のうち、!#if が見るもの）
-    static func env(userAgent: String) -> [String] {
-        var e = ["ublock"]
-        if userAgent.range(of: #"\bMobile\b"#, options: .regularExpression) != nil { e.append("mobile") }
-        return e
-    }
-
-    /// 1 つの名前（先頭の ! は打ち消し）。知らない名前なら nil
-    static func evaluateToken(_ raw: String, _ env: [String]) -> Bool? {
-        var token = Substring(raw)
-        let not = token.hasPrefix("!")
-        if not { token = token.dropFirst() }
-        var state = tokens[String(token)]
-        if state == nil {
-            if !token.hasPrefix("cap_") { return nil }
-            state = "false"
-        }
-        // JS: state === 'false' && not || env.includes(state) !== not
-        return (state == "false" && not) || (env.contains(state!) != not)
-    }
-
-    /// 式（&& と || は左から順に。括弧は全体を囲むものだけ）。判定できなければ nil
-    static func evaluateExpr(_ raw: String, _ env: [String]) -> Bool? {
-        var expr = Substring(raw)
-        if expr.hasPrefix("(") && expr.hasSuffix(")") && expr.count >= 2 { expr = expr.dropFirst().dropLast() }
-        // uBO: /(?:(?:&&|\|\|)\s+)?\S+/g
-        let words = expr.split(whereSeparator: { $0.isWhitespace })
-        var matches: [(op: Substring?, word: Substring)] = []
-        var i = 0
-        while i < words.count {
-            let w = words[i]
-            if (w == "&&" || w == "||") && i + 1 < words.count {
-                matches.append((w, words[i + 1])); i += 2
-            } else {
-                matches.append((nil, w)); i += 1
-            }
-        }
-        guard let first = matches.first else { return nil }
-        if first.op != nil || first.word.hasPrefix("|") || first.word.hasPrefix("&") { return nil }
-        var result = evaluateToken(String(first.word), env)
-        for m in matches.dropFirst() {
-            guard let op = m.op else { return nil }       // 「a b」のような並び
-            guard let state = evaluateToken(String(m.word), env) else { return nil }
-            if op == "||" {
-                result = (result == true) ? true : state  // undefined || x → x
-            } else {
-                result = (result == nil) ? nil : (result! && state)
-            }
-        }
-        return result
-    }
-
-    enum Directive { case ifExpr(String), elseBranch, endif }
-
-    /// 「!#if 式」「!#else」「!#endif」の行か（uBO: /^!#(if|else|endif)\b([^\n]*)/）
-    static func directive(_ line: Substring) -> Directive? {
-        guard line.hasPrefix("!#") else { return nil }
-        let rest = line.dropFirst(2)
-        func word(_ w: String) -> Substring? {
-            guard rest.hasPrefix(w) else { return nil }
-            let after = rest.dropFirst(w.count)
-            if let c = after.first, c.isLetter || c.isNumber || c == "_" { return nil }
-            return after
-        }
-        if let a = word("endif") { _ = a; return .endif }
-        if let a = word("else") { _ = a; return .elseBranch }
-        if let a = word("if") { return .ifExpr(a.trimmingCharacters(in: .whitespaces)) }
-        return nil
-    }
-
-    /// uBO の splitter を行ごとに。残す行なら true を返す閉包を、行を順に渡して使う
-    final class Splitter {
-        private final class Details { var known: Bool; var discard: Bool; init(_ k: Bool, _ d: Bool) { known = k; discard = d } }
-        private var stack: [Details] = []
-        private(set) var discarding = false
-        let env: [String]
-        init(env: [String]) { self.env = env }
-
-        private func shouldDiscard() -> Bool { stack.contains { $0.known && $0.discard } }
-        private func begif(_ d: Details) {
-            if !discarding && d.known && d.discard { discarding = true }
-            stack.append(d)
-        }
-        private func endif() {
-            if !stack.isEmpty { stack.removeLast() }
-            if discarding && !shouldDiscard() { discarding = false }
-        }
-
-        /// その行を残すか（!#if などの行そのものは、どちらにしても注釈として読み飛ばされる）
-        func keep(_ line: Substring) -> Bool {
-            switch directive(line) {
-            case .ifExpr(let e)?:
-                let r = FilterPreparser.evaluateExpr(e, env)
-                begif(Details(r != nil, r == false))
-                return false
-            case .elseBranch?:
-                guard let d = stack.last else { return false }
-                endif()
-                d.discard = !d.discard
-                begif(d)
-                return false
-            case .endif?:
-                endif()
-                return false
-            case nil:
-                return !discarding
-            }
-        }
-    }
-
-    /// !#if で捨てる行を除いたもの（行の区切りは \n）
-    static func prune(_ text: String, env: [String]) -> String {
-        let s = Splitter(env: env)
-        var out: [Substring] = []
-        text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" || $0 == "\r" }).forEach { line in
-            if s.keep(line) { out.append(line) }
-        }
-        return out.joined(separator: "\n")
-    }
-
-    // MARK: !#include
-
-    static let maxIncludeDepth = 3
-    static let maxTotalBytes = 16 << 20
-
-    /// include の名前から、読みに行く URL（だめなら nil）。uBO: URL の形と「..」は断る。元のリストの最後の / までに付ける
-    static func includeURL(_ name: String, base: URL) -> URL? {
-        let n = name.trimmingCharacters(in: .whitespaces)
-        if n.isEmpty || n.contains("..") { return nil }
-        if let u = URL(string: n), u.scheme != nil { return nil }
-        let b = base.absoluteString
-        guard let slash = b.lastIndex(of: "/") else { return nil }
-        return URL(string: String(b[...slash]) + n)
-    }
-
-    /// 残る枝の中の「!#include 名前」の名前（uBO: /^!#include +(\S+)/）
-    static func includeName(_ line: Substring) -> String? {
-        guard line.hasPrefix("!#include ") else { return nil }
-        let rest = line.dropFirst("!#include".count).drop(while: { $0 == " " })
-        let name = rest.prefix(while: { !$0.isWhitespace })
-        return name.isEmpty ? nil : String(name)
-    }
-
-    struct Expanded {
-        var text: String
-        var included: [URL] = []
-        var failed: [String] = []
-    }
-
-    /// include を読んで、その位置に埋め込む。fetch は読めなければ nil。同じ URL は 1 回だけ・深さと合計の大きさに上限
-    static func expandIncludes(_ text: String, base: URL, env: [String],
-                               fetch: (URL) async -> String?) async -> Expanded {
-        var seen: Set<String> = [base.absoluteString]
-        var total = text.utf8.count
-        var included: [URL] = [], failed: [String] = []
-        func expand(_ text: String, base: URL, depth: Int) async -> String {
-            let s = Splitter(env: env)
-            var out: [String] = []
-            for line in text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" || $0 == "\r" }) {
-                let kept = s.keep(line)
-                out.append(String(line))
-                guard kept, let name = includeName(line) else { continue }
-                guard let u = includeURL(name, base: base) else { failed.append("\(name)（読めない名前）"); continue }
-                if seen.contains(u.absoluteString) { continue }
-                seen.insert(u.absoluteString)
-                if depth >= maxIncludeDepth { failed.append("\(name)（深すぎる）"); continue }
-                guard let sub = await fetch(u) else { failed.append("\(name)（読めない）"); continue }
-                if total + sub.utf8.count > maxTotalBytes { failed.append("\(name)（大きすぎる）"); continue }
-                total += sub.utf8.count
-                included.append(u)
-                let body = await expand(sub, base: u, depth: depth + 1)
-                out.append("! >>>>>>>> \(u.absoluteString)")
-                out.append(body)
-                out.append("! <<<<<<<< \(u.absoluteString)")
-            }
-            return out.joined(separator: "\n")
-        }
-        let t = await expand(text, base: base, depth: 0)
-        return Expanded(text: t, included: included, failed: failed)
-    }
-
-    /// 「! Expires: 8 hours」「! Expires: 4 days (update frequency)」→ 時間（1〜168 に丸める）。無ければ nil
-    static func expiresHours(_ text: String) -> Int? {
-        for line in text.split(separator: "\n", maxSplits: 60, omittingEmptySubsequences: true).prefix(60) {
-            let l = line.trimmingCharacters(in: .whitespaces)
-            guard l.lowercased().hasPrefix("! expires:") else { continue }
-            let rest = l.dropFirst("! expires:".count).trimmingCharacters(in: .whitespaces).lowercased()
-            let num = rest.prefix(while: { $0.isNumber })
-            guard let v = Int(num), v > 0 else { return nil }
-            let unit = rest.dropFirst(num.count).trimmingCharacters(in: .whitespaces)
-            let hours = unit.hasPrefix("h") ? v : v * 24
-            return min(max(hours, 1), 168)
-        }
-        return nil
-    }
-}
 
 // ======================================================================
 // MARK: - ABPFilter.swift
@@ -269,7 +29,8 @@ enum FilterPreparser {
 //         （third-party / first-party、script / image / stylesheet / xmlhttprequest / subdocument / font / media /
 //          websocket / ping / other / document、domain=、match-case、important、~ の打ち消し）
 //   隠す: ##セレクタ（全部のサイト）・a.com,b.com##セレクタ（そのサイト）・#@#（例外）
-// 対応しないもの（数えて読み飛ばす）: /正規表現/、$redirect・$csp・$removeparam など、#?#・#$#・#%#（スクリプト・拡張の書き方）、
+//   スクリプトレット: ##+js(…)・#@#+js(…)（uBO の書き方。Scriptlets.swift）
+// 対応しないもの（数えて読み飛ばす）: /正規表現/、$redirect・$csp・$removeparam など、#?#・#$#・#%#（AdGuard などのスクリプト・拡張の書き方）、
 //   $popup・$elemhide など、:has-text() などの拡張セレクタ
 
 /// 読み込みの種類（ルールの $script などと照らし合わせる）
@@ -307,6 +68,8 @@ struct CosmeticRule: Equatable {
 struct ParsedFilterList {
     var network: [NetworkRule] = []
     var cosmetic: [CosmeticRule] = []
+    /// ##+js(…) / #@#+js(…)（Scriptlets.swift）
+    var scriptlets: [ScriptletFilter] = []
     var unsupported = 0
     /// リストの見出しの「! Title:」
     var title: String?
@@ -331,6 +94,7 @@ enum ABPParser {
                 switch r {
                 case .network(let n): out.network.append(n)
                 case .cosmetic(let c): out.cosmetic.append(c)
+                case .scriptlet(let s): out.scriptlets.append(s)
                 }
             } else {
                 out.unsupported += 1
@@ -339,10 +103,12 @@ enum ABPParser {
         return out
     }
 
-    enum Rule { case network(NetworkRule), cosmetic(CosmeticRule) }
+    enum Rule { case network(NetworkRule), cosmetic(CosmeticRule), scriptlet(ScriptletFilter) }
 
     /// 1 行を読む。対応しない書き方なら nil
     static func parseLine(_ line: String) -> Rule? {
+        // スクリプトレット（uBO の ##+js(…)）
+        if let s = ScriptletParser.parse(line) { return .scriptlet(s) }
         // 隠すルール（## / #@#）。スクリプトや拡張の書き方（#?# #$# #%# #@?# など）は読まない
         if let r = line.range(of: "#@#") ?? line.range(of: "##") {
             let isException = line[r] == "#@#"
@@ -475,6 +241,695 @@ enum ABPParser {
         else if !exclude.isEmpty { r.types = Set(ResourceType.allCases).subtracting(exclude).subtracting([.document]) }
         if r.types?.isEmpty == true { return false }
         return true
+    }
+}
+
+// ======================================================================
+// MARK: - Scriptlets.swift
+// ======================================================================
+
+// MARK: - スクリプトレット（##+js(...)）。uBlock Origin（uBO）1.75.2 の仕組みを写したもの
+//
+// ・行を読む:      static-filtering-parser.js の parseExtPatternScriptlet・ArglistParser（引数の分け方・引用符・\, の扱い）
+// ・入れる:        scriptlet-filtering-core.js の compile（normalizeRawFilter・trusted の検査・ドメイン無しは例外だけ）
+// ・選ぶ:          static-ext-filtering-db.js（ホストと親ドメイン・entity・パス・正規表現）と retrieve（祖先 >>・例外・#@#+js()）
+// ・組み立てる:    lookupScriptlet・patchScriptlet・sortedCalls（依存の関数は 1 回だけ。try { 呼び出し } catch {}）
+//   uBO の外側の包み（main は即時実行・isolated は関数の定義だけで呼ぶ側が実行）は写さず、Vela が両方とも (function(){ … })(); で包む
+// 道具の中身（関数）は uBO のソースから作った resources/ubo-scriptlets.json（ScriptletLibrary）を使う。Vela は道具を書かない
+
+/// 1 行のスクリプトレットのルール（まだ道具の名前は正規化していない）
+struct ScriptletFilter: Equatable {
+    struct Target: Equatable {
+        /// 小文字のホスト・entity（youtube.*）・*・a.com/path・a.com>>・/正規表現/
+        var value: String
+        var not: Bool
+    }
+    /// args[0] は道具の名前（書かれたまま。末尾の .js は外す）。空なら #@#+js()
+    var args: [String]
+    var targets: [Target]
+    var isException: Bool
+    /// 読めなかったドメインの数
+    var badTargets = 0
+    var text: String
+}
+
+// MARK: 行を読む
+
+enum ScriptletParser {
+    /// 「ドメイン##+js(…)」「ドメイン#@#+js(…)」なら読む。スクリプトレットの行でなければ nil
+    static func parse(_ line: String) -> ScriptletFilter? {
+        guard let hash = line.firstIndex(of: "#") else { return nil }
+        let rest = line[hash...]
+        let isException: Bool
+        let pattern: Substring
+        if rest.hasPrefix("##+js(") { isException = false; pattern = rest.dropFirst(2) }
+        else if rest.hasPrefix("#@#+js(") { isException = true; pattern = rest.dropFirst(3) }
+        else { return nil }
+        guard pattern.hasSuffix(")") else { return nil }
+        let inner = String(pattern.dropFirst(4).dropLast())
+        var f = ScriptletFilter(args: arguments(inner), targets: [], isException: isException, text: line)
+        let domains = line[..<hash]
+        if !domains.isEmpty {
+            for (t, bad) in parseTargets(String(domains)) {
+                if bad { f.badTargets += 1 } else if let t { f.targets.append(t) }
+            }
+        }
+        return f
+    }
+
+    /// +js( と ) の間を、uBO と同じく引数に分ける（[道具の名前, 引数…]）
+    static func arguments(_ s: String) -> [String] {
+        let u = Array(s.utf16)
+        if u.isEmpty { return [] }
+        var p = ArglistParser()
+        let t = p.nextArg(u, 0)
+        var token = jsSlice(u, t.argBeg, t.argEnd)
+        if token.hasSuffix(".js") { token.removeLast(3) }
+        var out = [token]
+        // 残り（uBO: parseExtPatternScriptletArglist。新しい文字列として最初から数える）
+        let a = Array(u[t.separatorEnd...])
+        let end = a.count
+        if end == 0 { return out }
+        var i = 0
+        while true {
+            let d = p.nextArg(a, i)
+            if i == end { break }
+            let raw = d.argEnd > d.argBeg ? Array(a[d.argBeg..<d.argEnd]) : []
+            out.append(d.transform ? p.normalizeArg(raw) : String(utf16CodeUnits: raw, count: raw.count))
+            i = d.separatorEnd
+        }
+        return out
+    }
+
+    /// JS の slice(b, e)（e が b より前なら空）
+    static func jsSlice(_ u: [UInt16], _ b: Int, _ e: Int) -> String {
+        let b = min(max(b, 0), u.count), e = min(max(e, 0), u.count)
+        guard e > b else { return "" }
+        return String(utf16CodeUnits: Array(u[b..<e]), count: e - b)
+    }
+
+    /// ドメインの並び（, 区切り。/正規表現/ の中の , は区切りにしない）。(ターゲット, 読めない)
+    static func parseTargets(_ s: String) -> [(ScriptletFilter.Target?, Bool)] {
+        var out: [(ScriptletFilter.Target?, Bool)] = []
+        let chars = Array(s)
+        var i = 0
+        while i < chars.count {
+            var j = i
+            let not = chars[j] == "~"
+            if not { j += 1 }
+            var end: Int
+            if j < chars.count && chars[j] == "/" {
+                // 正規表現: 次の「/,」か終わりまで
+                end = j + 1
+                var found = false
+                while end < chars.count {
+                    if chars[end] == "/" && (end + 1 == chars.count || chars[end + 1] == ",") { end += 1; found = true; break }
+                    end += 1
+                }
+                if !found { end = chars.count }
+            } else {
+                end = j
+                while end < chars.count && chars[end] != "," { end += 1 }
+            }
+            let item = String(chars[j..<end])
+            if !item.isEmpty { out.append(normalizeTarget(item, not: not)) }
+            i = end + 1
+        }
+        return out
+    }
+
+    private static let reHostnameAscii = try! NSRegularExpression(pattern: #"^(?:[\da-z][\da-z_-]*\.)*[\da-z][\da-z-]*[\da-z]$"#)
+    private static let rePlainEntity = try! NSRegularExpression(pattern: #"^(?:[\da-z][\da-z_-]*\.)+\*$"#)
+
+    static func matches(_ re: NSRegularExpression, _ s: String) -> Bool {
+        re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil
+    }
+
+    /// 1 つのターゲットを確かめる（uBO: reAdvancedDomainSyntax /^([^>]+?)(>>)?(\/.*)?$/ と normalizeHostnameValue の ASCII の所）
+    static func normalizeTarget(_ raw: String, not: Bool) -> (ScriptletFilter.Target?, Bool) {
+        if raw.hasPrefix("/") {
+            guard raw.count > 2, raw.hasSuffix("/"),
+                  (try? NSRegularExpression(pattern: String(raw.dropFirst().dropLast()))) != nil else { return (nil, true) }
+            return (ScriptletFilter.Target(value: raw, not: not), false)
+        }
+        // ホスト・>>・/パス に分ける
+        var host = Substring(raw), path: Substring = "", ancestor = false
+        if let slash = host.firstIndex(of: "/") { path = host[slash...]; host = host[..<slash] }
+        if host.hasSuffix(">>") { ancestor = true; host = host.dropLast(2) }
+        if host.contains(">") { return (nil, true) }
+        let h = host.lowercased()
+        let ok = h == "*" || matches(reHostnameAscii, h) || matches(rePlainEntity, h)
+        guard ok else { return (nil, true) }
+        return (ScriptletFilter.Target(value: h + (ancestor ? ">>" : "") + path, not: not), false)
+    }
+}
+
+/// uBO の ArglistParser（区切りは「,」。位置は UTF-16 で数える。JS の文字列と同じ）
+struct ArglistParser {
+    let separatorCode: UInt16 = 0x2C
+    var actualSeparatorCode: UInt16 = 0x2C
+    var quoteBeg = 0, quoteEnd = 0, argBeg = 0, argEnd = 0, separatorBeg = 0, separatorEnd = 0
+    var transform = false
+
+    static func isWS(_ c: UInt16) -> Bool {
+        // JS の \s（よく出るもの）
+        switch c {
+        case 0x20, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0xA0, 0x1680, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF: return true
+        case 0x2000...0x200A: return true
+        default: return false
+        }
+    }
+
+    static func leftWS(_ p: [UInt16], from: Int) -> Int {
+        var n = 0
+        while from + n < p.count && isWS(p[from + n]) { n += 1 }
+        return n
+    }
+
+    /// p[0..<end] の末尾の空白の数（uBO: /(?:^|\S)(\s+)$/）
+    static func rightWS(_ p: [UInt16], end: Int) -> Int {
+        var n = 0
+        while end - n - 1 >= 0 && isWS(p[end - n - 1]) { n += 1 }
+        return n
+    }
+
+    mutating func nextArg(_ pattern: [UInt16], _ beg: Int) -> ArglistParser {
+        let len = pattern.count
+        quoteBeg = beg + ArglistParser.leftWS(pattern, from: beg)
+        let qc: UInt16 = quoteBeg < len ? pattern[quoteBeg] : 0
+        if qc == 0x22 || qc == 0x27 || qc == 0x60 {
+            indexOfNextArgSeparator(pattern, qc)
+            if argEnd != len {
+                quoteEnd = argEnd + 1
+                separatorBeg = quoteEnd
+                separatorEnd = quoteEnd
+                separatorEnd += ArglistParser.leftWS(pattern, from: quoteEnd)
+                if separatorEnd == len { return self }
+                if pattern[separatorEnd] == separatorCode {
+                    separatorEnd += 1
+                    return self
+                }
+            }
+        }
+        indexOfNextArgSeparator(pattern, separatorCode)
+        separatorBeg = argEnd
+        separatorEnd = argEnd
+        if separatorBeg < len { separatorEnd += 1 }
+        argEnd -= ArglistParser.rightWS(pattern, end: separatorBeg)
+        quoteEnd = argEnd
+        return self
+    }
+
+    /// 「\区切り」の \ を外す（区切りは今の actualSeparator。uBO と同じく、引用符で囲んだ引数ならその引用符）
+    func normalizeArg(_ arg: [UInt16]) -> String {
+        let ch = actualSeparatorCode
+        var s = arg
+        var out: [UInt16] = []
+        while let pos = s.lastIndex(of: ch) {
+            out = Array(s[pos...]) + out
+            s = Array(s[..<pos])
+            var n = 0
+            while n < s.count && s[s.count - 1 - n] == 0x5C { n += 1 }
+            if n == 0 { continue }
+            let tail = Array(repeating: UInt16(0x5C), count: (n & 1) != 0 ? n - 1 : n)
+            out = tail + out
+            s.removeLast(n)
+        }
+        let all = s + out
+        return String(utf16CodeUnits: all, count: all.count)
+    }
+
+    private mutating func indexOfNextArgSeparator(_ pattern: [UInt16], _ code: UInt16) {
+        argBeg = code != separatorCode ? quoteBeg + 1 : quoteBeg
+        argEnd = argBeg
+        transform = false
+        actualSeparatorCode = code
+        while argEnd < pattern.count {
+            guard let pos = pattern[argEnd...].firstIndex(of: code) else { argEnd = pattern.count; return }
+            // 前に奇数個の \ があれば、エスケープされた区切り
+            var n = 0
+            while pos - n - 1 >= 0 && pattern[pos - n - 1] == 0x5C { n += 1 }
+            if n % 2 == 0 { argEnd = pos; return }
+            transform = true
+            argEnd = pos + 1
+        }
+    }
+}
+
+// MARK: 道具（uBO から作った JSON）
+
+struct ScriptletLibrary {
+    struct Item: Codable, Equatable {
+        var name: String
+        var aliases: [String]
+        var requiresTrust: Bool
+        var world: String
+        var dependencies: [String]
+        var priority: Int?
+        var js: String
+    }
+    struct File: Codable {
+        var format: Int
+        var ubo: String
+        var commit: String?
+        var generated: String?
+        var license: String?
+        var notice: String?
+        var source: String?
+        var scriptlets: [Item]
+    }
+
+    let ubo: String
+    let generated: String?
+    private(set) var items: [String: Item] = [:]
+    private(set) var aliases: [String: String] = [:]
+
+    static let empty = ScriptletLibrary(ubo: "", generated: nil, items: [])
+
+    init(ubo: String, generated: String?, items: [Item]) {
+        self.ubo = ubo
+        self.generated = generated
+        for i in items {
+            self.items[i.name] = i
+            for a in i.aliases { aliases[a] = i.name }
+        }
+    }
+
+    init(json: Data) throws {
+        let f = try JSONDecoder().decode(File.self, from: json)
+        guard f.format == 1 else { throw NSError(domain: "Vela", code: 1, userInfo: [NSLocalizedDescriptionKey: "知らない形式（format \(f.format)）"]) }
+        self.init(ubo: f.ubo, generated: f.generated, items: f.scriptlets)
+    }
+
+    var isEmpty: Bool { items.isEmpty }
+    var count: Int { items.count }
+
+    /// 落とした道具の大きさの上限
+    static let maxBytes = 4 << 20
+
+    enum UpdateError: Error, Equatable, CustomStringConvertible {
+        case tooLarge(Int)
+        case badSignature
+        case unreadable(String)
+        case older(new: String, current: String)
+        case empty
+        var description: String {
+            switch self {
+            case .tooLarge(let n): return "大きすぎます（\(n / 1024)KB）"
+            case .badSignature: return "署名が合いません"
+            case .unreadable(let m): return "読めません（\(m)）"
+            case .older(let a, let b): return "今のもの（\(b)）より古いものです（\(a)）"
+            case .empty: return "道具が空です"
+            }
+        }
+    }
+
+    /// 署名を確かめた後の検査: 形式・中身があるか・前より古くないか（generated は ISO 8601 なので文字の順で比べられる）
+    static func acceptUpdate(_ data: Data, current: ScriptletLibrary?) -> Result<ScriptletLibrary, UpdateError> {
+        if data.count > maxBytes { return .failure(.tooLarge(data.count)) }
+        let lib: ScriptletLibrary
+        do { lib = try ScriptletLibrary(json: data) } catch { return .failure(.unreadable("\(error)")) }
+        if lib.isEmpty { return .failure(.empty) }
+        if let cur = current?.generated, let new = lib.generated, new < cur { return .failure(.older(new: new, current: cur)) }
+        if current?.generated != nil && lib.generated == nil { return .failure(.older(new: "?", current: current!.generated!)) }
+        return .success(lib)
+    }
+
+    /// redirect-engine の contentFromName（別名 → 本名。mime は名前の拡張子）
+    func content(_ name: String, ext: String) -> Item? {
+        let n = aliases[name] ?? name
+        guard n.hasSuffix(ext), let i = items[n] else { return nil }
+        return i
+    }
+
+    /// normalizeRawFilter の名前の所: "set" → "set-constant"（.js は付けない）。知らない名前はそのまま
+    func canonicalToken(_ token: String) -> String {
+        var t = token + ".js"
+        if let a = aliases[t] { t = a }
+        return String(t.dropLast(3))
+    }
+
+    /// その名前の道具（.js）が trusted のリストだけのものか
+    func requiresTrust(_ token: String) -> Bool {
+        content(token + ".js", ext: ".js")?.requiresTrust ?? false
+    }
+
+    func knows(_ token: String) -> Bool { content(token + ".js", ext: ".js") != nil }
+}
+
+// MARK: 入れて選ぶ（StaticExtFilteringHostnameDB と retrieve）
+
+struct ScriptletIndex {
+    /// ターゲット（/ を含まないもの）→ "+[…]" / "-[…]"
+    private var byHostname: [String: [String]] = [:]
+    private struct Matcher { let isRegex: Bool; let hn: String; let pn: String?; var list: [String] }
+    private var matchers: [Matcher] = []
+    private var matcherIndex: [String: Int] = [:]
+    /// ホスト（正規表現なら ""）→ matcher の番号
+    private var hostnameToMatchers: [String: [Int]] = [:]
+    private var seen = Set<String>()
+
+    private(set) var size = 0
+    /// 道具に無い名前 → 数
+    private(set) var unknown: [String: Int] = [:]
+    /// trusted でないリストの requiresTrust の行・ドメイン無しの行（例外でない）・読めないドメイン
+    private(set) var rejectedTrust = 0
+    private(set) var rejectedGeneric = 0
+    private(set) var badTargets = 0
+
+    init() {}
+
+    /// uBO の compile。trusted: 組み込みの信頼するリストから来た行か
+    mutating func add(_ f: ScriptletFilter, trusted: Bool, library: ScriptletLibrary) {
+        var args = f.args
+        if !args.isEmpty { args[0] = library.canonicalToken(args[0]) }
+        badTargets += f.badTargets
+        if !args.isEmpty && !f.isException {
+            if !trusted && library.requiresTrust(args[0]) { rejectedTrust += 1; return }
+            if !library.knows(args[0]) { unknown[args[0], default: 0] += 1 }
+        }
+        let normalized = ScriptletIndex.json(args)
+        if normalized == "[]" && !f.isException { return }
+        if f.targets.isEmpty {
+            if f.isException { store("", "-" + normalized) } else { rejectedGeneric += 1 }
+            return
+        }
+        for t in f.targets {
+            if f.isException && t.not { continue }
+            store(t.value, (f.isException || t.not ? "-" : "+") + normalized)
+        }
+    }
+
+    private mutating func store(_ target: String, _ s: String) {
+        guard seen.insert(target + "\u{0}" + s).inserted else { return }      // 同じもの（uBO: duplicates）
+        size += 1
+        if target.contains("/") {
+            if let i = matcherIndex[target] { matchers[i].list.append(s); return }
+            let isRegex = target.hasPrefix("/")
+            var hn = "", pn: String?
+            if !isRegex {
+                let slash = target.firstIndex(of: "/")!
+                hn = String(target[..<slash]); pn = String(target[slash...])
+            } else if let r = target.range(of: "\\/") {
+                hn = String(target[target.index(after: target.startIndex)..<r.lowerBound]) + "$"
+                pn = "^" + String(target[r.lowerBound..<target.index(before: target.endIndex)])
+            } else {
+                hn = String(target.dropFirst().dropLast())
+            }
+            matchers.append(Matcher(isRegex: isRegex, hn: hn, pn: pn, list: [s]))
+            matcherIndex[target] = matchers.count - 1
+            hostnameToMatchers[isRegex ? "" : hn, default: []].append(matchers.count - 1)
+            return
+        }
+        byHostname[target, default: []].append(s)
+    }
+
+    struct Selection: Equatable {
+        /// 呼び出し（正規化した JSON の引数の並び。例 ["json-prune","a b"]）
+        var calls: [String] = []
+        var exceptions: [String] = []
+        /// #@#+js() でそのサイトの注入を全部止めた
+        var disabled = false
+        var isEmpty: Bool { calls.isEmpty }
+    }
+
+    /// uBO の retrieve。ancestors: 祖先のフレームの URL（近い順。Vela はトップだけ渡す）
+    func retrieve(url: URL, ancestors: [URL] = []) -> Selection {
+        guard size > 0, let hostname = url.host?.lowercased(), !hostname.isEmpty else { return Selection() }
+        var all = Set<String>()
+        retrieveSpecifics(&all, hostname)
+        let entity = ScriptletIndex.entity(hostname)
+        retrieveSpecifics(&all, entity)
+        retrieveSpecificsByRegex(&all, hostname, url.absoluteString)
+        for k in ["", "*"] { all.formUnion(byHostname[k] ?? []) }
+        var visited: [String] = []
+        for a in ancestors {
+            guard let h = a.host?.lowercased(), !visited.contains(h) else { continue }
+            visited.append(h)
+            retrieveSpecifics(&all, h + ">>")
+            let e = ScriptletIndex.entity(h)
+            if !e.isEmpty { retrieveSpecifics(&all, e + ">>") }
+        }
+        if all.isEmpty { return Selection() }
+        if all.contains("-[]") { return Selection(disabled: true) }
+        var sel = Selection()
+        for s in all where s.hasPrefix("+") {
+            let body = String(s.dropFirst())
+            if all.contains("-" + body) { sel.exceptions.append(body) } else { sel.calls.append(body) }
+        }
+        sel.calls.sort()
+        sel.exceptions.sort()
+        return sel
+    }
+
+    private func retrieveSpecifics(_ out: inout Set<String>, _ hostname: String) {
+        var hn = Substring(hostname)
+        if hn.isEmpty { return }
+        while true {
+            if let l = byHostname[String(hn)] { out.formUnion(l) }
+            guard let dot = hn.firstIndex(of: ".") else { break }
+            hn = hn[hn.index(after: dot)...]
+            if hn == "*" { break }
+        }
+    }
+
+    private func retrieveSpecificsByRegex(_ out: inout Set<String>, _ hostname: String, _ url: String) {
+        if matchers.isEmpty { return }
+        let pathname = ScriptletIndex.naivePathname(url) ?? ""
+        var hn = Substring(hostname)
+        while true {
+            test(String(hn), &out, hostname, pathname)
+            guard let dot = hn.firstIndex(of: ".") else { break }
+            hn = hn[hn.index(after: dot)...]
+        }
+        test("", &out, hostname, pathname)
+    }
+
+    private func test(_ key: String, _ out: inout Set<String>, _ hostname: String, _ pathname: String) {
+        for i in hostnameToMatchers[key] ?? [] {
+            let m = matchers[i]
+            let ok: Bool
+            if !m.isRegex {
+                ok = pathname.hasPrefix(m.pn ?? "")
+            } else if !ScriptletIndex.regexTest(m.hn, hostname) {
+                ok = false
+            } else if let pn = m.pn {
+                ok = ScriptletIndex.regexTest(pn, pathname)
+            } else {
+                ok = true
+            }
+            if ok { out.formUnion(m.list) }
+        }
+    }
+
+    static func regexTest(_ pattern: String, _ s: String) -> Bool {
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return false }
+        return re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil
+    }
+
+    /// uBO の naivePathnameFromURL（ホストの後の / から。? や # も含む）
+    static func naivePathname(_ url: String) -> String? {
+        guard let r = url.range(of: "://") else { return nil }
+        guard let slash = url[r.upperBound...].firstIndex(of: "/") else { return nil }
+        return String(url[slash...])
+    }
+
+    /// uBO の entityFromHostname（www.youtube.co.jp → www.youtube.*）
+    static func entity(_ hostname: String) -> String {
+        let domain = SiteUtil.registrableDomain(hostname)
+        guard let dot = domain.firstIndex(of: "."), hostname.hasSuffix(domain) else { return "" }
+        return String(hostname.dropLast(domain.count)) + String(domain[..<dot]) + ".*"
+    }
+
+    /// JSON.stringify(args)
+    static func json(_ args: [String]) -> String {
+        "[" + args.map(jsString).joined(separator: ",") + "]"
+    }
+
+    /// JSON.stringify(文字列) と同じ（" \ と制御文字だけをエスケープ）
+    static func jsString(_ s: String) -> String {
+        var o = "\""
+        for ch in s.unicodeScalars {
+            switch ch {
+            case "\"": o += "\\\""
+            case "\\": o += "\\\\"
+            case "\n": o += "\\n"
+            case "\r": o += "\\r"
+            case "\t": o += "\\t"
+            case "\u{08}": o += "\\b"
+            case "\u{0C}": o += "\\f"
+            default:
+                if ch.value < 0x20 { o += String(format: "\\u%04x", ch.value) } else { o.unicodeScalars.append(ch) }
+            }
+        }
+        return o + "\""
+    }
+
+    static func parseJSONArgs(_ s: String) -> [String] {
+        (try? JSONSerialization.jsonObject(with: Data(s.utf8))) as? [String] ?? []
+    }
+
+    /// uBO の decompile（ログ用。##+js(…) の形に戻す）
+    static func decompile(_ json: String, isException: Bool) -> String {
+        let args = parseJSONArgs(json)
+        func requote(_ s: String) -> String {
+            let needs = s.isEmpty || s.contains(",") || (s.count >= 2 && ["\"", "'", "`"].contains(where: { s.hasPrefix($0) && s.hasSuffix($0) }))
+            if !needs { return s }
+            if !s.contains("'") { return "'\(s)'" }
+            if !s.contains("\"") { return "\"\(s)\"" }
+            if !s.contains("`") { return "`\(s)`" }
+            return "'" + s.replacingOccurrences(of: "'", with: "\\'") + "'"
+        }
+        return (isException ? "#@#" : "##") + "+js(" + args.map(requote).joined(separator: ", ") + ")"
+    }
+}
+
+// MARK: 組み立てる
+
+enum ScriptletAssembler {
+    struct Output: Equatable {
+        /// ページの JS と同じ所（WKContentWorld.page）で動かすもの
+        var main: String
+        /// ページから見えない所（WKContentWorld.defaultClient）で動かすもの
+        var isolated: String
+        /// 入れたルール（ログ用）
+        var filters: [String]
+        var isEmpty: Bool { main.isEmpty && isolated.isEmpty }
+    }
+
+    private struct Entry { let code: String; let priority: Int? }
+
+    /// frames: (ホスト, そのフレームで選んだもの)。同じホストは最初のものだけ
+    static func assemble(_ frames: [(host: String, selection: ScriptletIndex.Selection)], library: ScriptletLibrary) -> Output {
+        var mainDefs: [String: String] = [:], isoDefs: [String: String] = [:]
+        var mainBlocks: [String] = [], isoBlocks: [String] = []
+        var filters: [String] = []
+        var hosts = Set<String>()
+        for (host, sel) in frames where !sel.disabled && hosts.insert(host).inserted {
+            var mainCalls: [String: Entry] = [:], isoCalls: [String: Entry] = [:]
+            for token in sel.calls {
+                lookup(token, library: library, mainDefs: &mainDefs, isoDefs: &isoDefs, mainCalls: &mainCalls, isoCalls: &isoCalls)
+            }
+            if let b = block(host, mainCalls) { mainBlocks.append(b) }
+            if let b = block(host, isoCalls) { isoBlocks.append(b) }
+            filters += sel.calls.map { "\(host)" + ScriptletIndex.decompile($0, isException: false) }
+            filters += sel.exceptions.map { "\(host)" + ScriptletIndex.decompile($0, isException: true) }
+        }
+        return Output(main: wrap(mainDefs, mainBlocks), isolated: wrap(isoDefs, isoBlocks), filters: filters)
+    }
+
+    /// uBO の lookupScriptlet
+    private static func lookup(_ rawToken: String, library: ScriptletLibrary,
+                               mainDefs: inout [String: String], isoDefs: inout [String: String],
+                               mainCalls: inout [String: Entry], isoCalls: inout [String: Entry]) {
+        if mainCalls[rawToken] != nil || isoCalls[rawToken] != nil { return }
+        let args = ScriptletIndex.parseJSONArgs(rawToken)
+        guard let first = args.first else { return }
+        let token = first + ".js"
+        guard let details = library.content(token, ext: ".js") else { return }
+        let isolated = details.world == "ISOLATED"
+        let fname = functionName(details.js)
+        let content = patch(fname, details.js, Array(args.dropFirst()))
+        var defs = isolated ? isoDefs : mainDefs
+        if fname != nil { defs[token] = details.js }
+        var deps = details.dependencies
+        while !deps.isEmpty {
+            let d = deps.removeFirst()
+            if defs[d] != nil { continue }
+            guard let dd = library.content(d, ext: ".fn") ?? library.content(d, ext: ".js") else { continue }
+            defs[d] = dd.js
+            deps += dd.dependencies
+        }
+        let entry = Entry(code: "try {\n\t\(content)\n} catch (e) {\n\n}", priority: details.priority ?? 0)
+        if isolated { isoDefs = defs; isoCalls[rawToken] = entry } else { mainDefs = defs; mainCalls[rawToken] = entry }
+    }
+
+    /// uBO: /^function\s+([^(\s]+)\s*\(/
+    static func functionName(_ js: String) -> String? {
+        guard js.hasPrefix("function") else { return nil }
+        var rest = js.dropFirst("function".count)
+        guard let f = rest.first, f.isWhitespace else { return nil }
+        rest = rest.drop(while: { $0.isWhitespace })
+        let name = rest.prefix(while: { $0 != "(" && !$0.isWhitespace })
+        guard !name.isEmpty else { return nil }
+        let after = rest.dropFirst(name.count).drop(while: { $0.isWhitespace })
+        return after.first == "(" ? String(name) : nil
+    }
+
+    /// uBO の patchScriptlet（名前のある関数なら「名前(引数);」。名前の無いものは {{1}} などを埋める）
+    static func patch(_ fname: String?, _ content: String, _ args: [String]) -> String {
+        var c = content
+        if let fname {
+            c = "\(fname)({{args}});"
+        } else {
+            for (i, a) in args.enumerated() {
+                if let r = c.range(of: "{{\(i + 1)}}") { c.replaceSubrange(r, with: a) }
+            }
+        }
+        let json = ScriptletIndex.json(args)
+        if let r = c.range(of: "{{args}}") { c.replaceSubrange(r, with: String(json.dropFirst().dropLast())) }
+        return c
+    }
+
+    /// uBO の sortedCalls と同じ並べ方（priority の高いもの → 中身の順）
+    private static func block(_ host: String, _ calls: [String: Entry]) -> String? {
+        if calls.isEmpty { return nil }
+        let sorted = calls.values.sorted { a, b in
+            let ap = a.priority ?? 0, bp = b.priority ?? 0
+            return ap == bp ? a.code < b.code : ap > bp
+        }.map { $0.code }
+        return "if (location.hostname === \(ScriptletIndex.jsString(host))) {\n" + sorted.joined(separator: "\n\n") + "\n}"
+    }
+
+    private static func wrap(_ defs: [String: String], _ blocks: [String]) -> String {
+        if blocks.isEmpty { return "" }
+        // 依存の関数（とクラス）を先に。クラスは巻き上げられないので、呼び出しより前に置く
+        let d = defs.values.sorted()
+        return [
+            "(function() {",
+            "// >>>> start of private namespace",
+            "",
+            ";",
+            "",
+            "const scriptletGlobals = {};",
+            "",
+            d.joined(separator: "\n\n"),
+            "",
+            blocks.joined(separator: "\n\n"),
+            "",
+            "// <<<< end of private namespace",
+            "})();",
+        ].joined(separator: "\n")
+    }
+}
+
+// ======================================================================
+// MARK: - ScriptletVerify.swift
+// ======================================================================
+
+// MARK: - 落とした道具（resources/ubo-scriptlets.json）が本物かを確かめる
+//
+// GitHub Actions が uBO のソースから作って Ed25519 で署名したものだけを受け取る（tools/ubo/build_scriptlets.mjs）。
+// 秘密鍵は Actions の Secrets にだけある。公開鍵はここに埋め込む（tools/ubo/keygen.mjs が出したもの）。
+// 署名の後に、形式・大きさ・前より古くないか（ScriptletLibrary.acceptUpdate）も確かめる
+
+enum ScriptletVerify {
+    /// Ed25519 の公開鍵（32 バイトの base64）。tools/ubo/verify.mjs もここを読む
+    static let publicKeyBase64 = "4z7T7t38qr+xB8738lQD+r2cStOVyyumyj8Txk0MPwk="
+
+    /// 署名が合えば true。sig は base64（前後の空白・改行は無視）
+    static func isValidSignature(_ data: Data, signature sig: String) -> Bool {
+        guard let keyData = Data(base64Encoded: publicKeyBase64),
+              let sigData = Data(base64Encoded: sig.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let key = try? Curve25519.Signing.PublicKey(rawRepresentation: keyData) else { return false }
+        return key.isValidSignature(sigData, for: data)
+    }
+
+    /// 署名と中身を確かめて、使える道具を返す。だめなら理由
+    static func verify(_ data: Data, signature sig: String, current: ScriptletLibrary?) -> Result<ScriptletLibrary, ScriptletLibrary.UpdateError> {
+        if data.count > ScriptletLibrary.maxBytes { return .failure(.tooLarge(data.count)) }
+        guard isValidSignature(data, signature: sig) else { return .failure(.badSignature) }
+        return ScriptletLibrary.acceptUpdate(data, current: current)
     }
 }
 
@@ -941,340 +1396,4 @@ enum ContentBlockerCompiler {
         for b in s.utf8 { h ^= UInt64(b); h = h &* 0x100000001b3 }
         return String(h, radix: 16)
     }
-}
-
-// ======================================================================
-// MARK: - Persistence.swift
-// ======================================================================
-
-// MARK: - データのファイル（Application Support/Vela/ の JSON）
-//
-// タブ・ブックマーク・履歴などを Codable の JSON で置く。書き込みはまとめて（delay 秒後に 1 回）、裏のキューで、
-// いったん別の名前に書いてから置き換える（.atomic。書いている途中で落ちても前のものが残る）
-
-enum AppPaths {
-    /// Application Support/Vela（取れなければ一時フォルダの Vela）。フォルダは作らない（作るのは使う側）
-    static var support: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        return base.appendingPathComponent("Vela", isDirectory: true)
-    }
-}
-
-final class JSONFile<Value: Codable>: @unchecked Sendable {
-    let url: URL
-    private let lock = NSLock()
-    private let queue: DispatchQueue
-    private let delay: TimeInterval
-    private var pending: Value?
-    private var scheduled = false
-    /// 読み書きの失敗（開発者向けのログに出す）
-    var log: (@Sendable (String) -> Void)?
-
-    /// name: ファイルの名前（例: "tabs.json"）。directory を省くと Application Support/Vela/
-    init(name: String, directory: URL? = nil, delay: TimeInterval = 1.0) {
-        let dir = directory ?? JSONFile.defaultDirectory()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        url = dir.appendingPathComponent(name)
-        self.delay = delay
-        queue = DispatchQueue(label: "vela-json-\(name)")
-    }
-
-    static func defaultDirectory() -> URL { AppPaths.support }
-
-    /// 読む（無い・壊れているなら nil。壊れていたファイルは .broken に名前を変えて残す）
-    func load() -> Value? {
-        guard let d = try? Data(contentsOf: url) else { return nil }
-        do {
-            return try JSONDecoder().decode(Value.self, from: d)
-        } catch {
-            log?("⚠️ \(url.lastPathComponent) を読めません（\(error)）。.broken として残します")
-            let broken = url.appendingPathExtension("broken")
-            try? FileManager.default.removeItem(at: broken)
-            try? FileManager.default.moveItem(at: url, to: broken)
-            return nil
-        }
-    }
-
-    /// 保存する（delay 秒の間に何度呼んでも、書くのは最後の 1 回）
-    func save(_ v: Value) {
-        lock.lock()
-        pending = v
-        if scheduled { lock.unlock(); return }
-        scheduled = true
-        lock.unlock()
-        queue.asyncAfter(deadline: .now() + delay) { [weak self] in self?.flush() }
-    }
-
-    /// 待っている分をすぐ書く（アプリが裏に回るときなど）。書き終わるまで待つ
-    func saveNow(_ v: Value? = nil) {
-        if let v { lock.lock(); pending = v; lock.unlock() }
-        queue.sync { self.flush() }
-    }
-
-    private func flush() {
-        lock.lock()
-        let v = pending
-        pending = nil
-        scheduled = false
-        lock.unlock()
-        guard let v else { return }
-        do {
-            let d = try JSONEncoder().encode(v)
-            try d.write(to: url, options: .atomic)
-        } catch {
-            log?("⚠️ \(url.lastPathComponent) を書けません（\(error)）")
-        }
-    }
-}
-
-// MARK: - 設定（UserDefaults に置く）
-//
-// 通信まわりの設定は、アプリを起動し直したときに効く（WebView や通信の作りを、起動のときに決めるため）
-
-enum VelaSettings {
-    private static var d: UserDefaults { .standard }
-
-    private static func bool(_ key: String, _ def: Bool) -> Bool {
-        d.object(forKey: key) == nil ? def : d.bool(forKey: key)
-    }
-
-    // MARK: 通信（VNet）
-
-    /// VNet を使わず、標準の通信（WebKit 内蔵）だけで読む
-    static var vnetDisabled: Bool {
-        get { bool("vnet.disabled", false) } set { d.set(newValue, forKey: "vnet.disabled") }
-    }
-    /// 確かめていない iOS の版でも、https の横取り（非公開 API）を試す
-    static var allowUntestedOS: Bool {
-        get { bool("vnet.allowUntestedOS", false) } set { d.set(newValue, forKey: "vnet.allowUntestedOS") }
-    }
-    /// 開発者向け: 横取りできないとき、標準の通信ではなく予備の vnets:// の作りを使う（安全ではない。CSP などを外すため）
-    static var legacyVNetsFallback: Bool {
-        get { bool("vnet.legacyVNets", false) } set { d.set(newValue, forKey: "vnet.legacyVNets") }
-    }
-
-    // MARK: 使い勝手
-
-    /// 検索エンジン
-    static var searchEngine: SearchEngine {
-        get { SearchEngine(rawValue: d.string(forKey: "search.engine") ?? "") ?? .google }
-        set { d.set(newValue.rawValue, forKey: "search.engine") }
-    }
-    /// HTTPS-First: ページを開く http:// を、まず https で試す（だめなら「http のまま開く」を出す）
-    static var httpsFirst: Bool {
-        get { bool("nav.httpsFirst", true) } set { d.set(newValue, forKey: "nav.httpsFirst") }
-    }
-    /// VNet でページを読めなかったら（TLS・つながらない など）、標準の通信に自動で切り替える
-    static var autoFallbackToNative: Bool {
-        get { bool("vnet.autoFallback", false) } set { d.set(newValue, forKey: "vnet.autoFallback") }
-    }
-    /// Mac の Safari の Web インスペクタからつなげるようにする（iOS 16.4 から）
-    static var webInspector: Bool {
-        get { bool("dev.webInspector", false) } set { d.set(newValue, forKey: "dev.webInspector") }
-    }
-
-    /// サイト（ホスト）ごとの文字の大きさ（100% のものは持たない）
-    static func zoom(for host: String?) -> Double {
-        guard let h = host?.lowercased(), let z = (d.dictionary(forKey: "zoom.sites") as? [String: Double])?[h] else { return 1.0 }
-        return z
-    }
-    static func setZoom(_ z: Double, for host: String?) {
-        guard let h = host?.lowercased(), !h.isEmpty else { return }
-        var m = (d.dictionary(forKey: "zoom.sites") as? [String: Double]) ?? [:]
-        m[h] = abs(z - 1.0) < 0.001 ? nil : z
-        if m.count > 500 { m = [h: z] }      // 増えすぎたら覚え直す（めったに起きない）
-        d.set(m, forKey: "zoom.sites")
-    }
-
-    // MARK: プライバシー・守り
-
-    /// サードパーティ Cookie をブロックする
-    static var blockThirdPartyCookies: Bool {
-        get { bool("cookies.blockThirdParty", true) } set { d.set(newValue, forKey: "cookies.blockThirdParty") }
-    }
-    /// SameSite が無い Cookie を Lax として扱う
-    static var cookiesLaxByDefault: Bool {
-        get { bool("cookies.laxByDefault", true) } set { d.set(newValue, forKey: "cookies.laxByDefault") }
-    }
-    /// LAN の保護（公開のサイトから LAN の機器へ届かせない）
-    static var localNetworkProtection: Bool {
-        get { bool("lan.protection", true) } set { d.set(newValue, forKey: "lan.protection") }
-    }
-
-    /// 今の設定から作る Cookie の決まり
-    static var cookiePolicy: CookiePolicy.Settings {
-        var s = CookiePolicy.Settings()
-        s.blockThirdParty = blockThirdPartyCookies
-        s.laxByDefault = cookiesLaxByDefault
-        return s
-    }
-}
-
-// ======================================================================
-// MARK: - DevLog.swift
-// ======================================================================
-
-// MARK: - 開発者向けのログ（どのスレッドからでも書ける）
-//
-// 1 行ずつ「時刻・重さ・種類・タブ・本文」を持って、最新 maxEntries 件まで覚える（古いものから消す）。
-// 今までの log?("…") の文字列も、そのまま add で入れられる（先頭の記号から種類と重さを決める）。
-// 画面へは、必要なときに entries(after:) で差分だけ取り出す（毎回全部を作り直すと重い）
-
-enum LogLevel: Int, Comparable, Sendable, CaseIterable {
-    case debug, info, warning, error
-    static func < (a: LogLevel, b: LogLevel) -> Bool { a.rawValue < b.rawValue }
-    var mark: String {
-        switch self { case .debug: return "·"; case .info: return " "; case .warning: return "⚠"; case .error: return "✕" }
-    }
-}
-
-enum LogCategory: String, Sendable, CaseIterable {
-    case app = "アプリ"
-    case vnet = "VNet"
-    case net = "通信"
-    case nav = "移動"
-    case cookie = "Cookie"
-    case security = "守り"
-    case block = "ブロック"
-    case download = "ダウンロード"
-    case js = "JS"
-}
-
-struct LogEntry: Sendable, Identifiable {
-    let id: Int
-    let time: Date
-    let level: LogLevel
-    let category: LogCategory
-    /// どのタブのものか（タブに関係ないものは nil）
-    let tab: Int?
-    let message: String
-
-    private static let timeFormat: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "HH:mm:ss.SSS"
-        return f
-    }()
-
-    var line: String {
-        "\(LogEntry.timeFormat.string(from: time)) \(level.mark) [\(category.rawValue)\(tab.map { "#\($0)" } ?? "")] \(message)"
-    }
-}
-
-/// 開発者パネルの日時（端末の時刻で「2026-11-03 14:05」）。Cookie や HSTS の期限など、日付も要るもの用
-enum DevDate {
-    private static let lock = NSLock()
-    private static let formatter: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "yyyy-MM-dd HH:mm"
-        return f
-    }()
-
-    static func dateTime(_ d: Date, timeZone: TimeZone = .current) -> String {
-        lock.lock(); defer { lock.unlock() }
-        formatter.timeZone = timeZone
-        return formatter.string(from: d)
-    }
-}
-
-final class DevLog: @unchecked Sendable {
-    static let maxEntries = 5000
-    private let lock = NSLock()
-    private var ring: [LogEntry] = []
-    private var start = 0           // ring の中で一番古いものの位置（いっぱいになってから使う）
-    private var nextID = 1
-    private var dirty = false
-    /// ログを書いた回数（重さごと。開発者パネル用。clear で 0 に戻す）
-    private var counts: [LogLevel: Int] = [:]
-
-    init() {}
-
-    /// 今までの文字列のログ。先頭の記号などから種類と重さを決める
-    func add(_ message: String, tab: Int? = nil) {
-        let (level, category) = DevLog.classify(message)
-        add(message, level: level, category: category, tab: tab)
-    }
-
-    func add(_ message: String, level: LogLevel, category: LogCategory, tab: Int? = nil) {
-        lock.lock()
-        let e = LogEntry(id: nextID, time: Date(), level: level, category: category, tab: tab, message: message)
-        nextID += 1
-        if ring.count < DevLog.maxEntries {
-            ring.append(e)
-        } else {
-            ring[start] = e
-            start = (start + 1) % DevLog.maxEntries
-        }
-        counts[level, default: 0] += 1
-        dirty = true
-        lock.unlock()
-        // 落ちたときのために、すぐファイルにも書く（CrashLog.start の前は何もしない）
-        CrashLog.writeLine(e.line)
-    }
-
-    /// 古い順に全部
-    func all() -> [LogEntry] {
-        lock.lock(); defer { lock.unlock() }
-        return Array(ring[start...] + ring[..<start])
-    }
-
-    /// id より新しいもの（古い順）。画面は最後に見た id を覚えておいて、差分だけもらう
-    func entries(after id: Int) -> [LogEntry] {
-        all().filter { $0.id > id }
-    }
-
-    func count(_ level: LogLevel) -> Int { lock.lock(); defer { lock.unlock() }; return counts[level] ?? 0 }
-
-    /// 変わっていれば、最新 lines 行を 1 つの文字列にして返す（今の簡易のログ表示用）
-    func take(lines: Int = 200) -> String? {
-        lock.lock()
-        if !dirty { lock.unlock(); return nil }
-        dirty = false
-        lock.unlock()
-        return all().suffix(lines).map { $0.message }.joined(separator: "\n")
-    }
-
-    /// 書き出し用（共有・コピー）
-    func export(minLevel: LogLevel = .debug) -> String {
-        all().filter { $0.level >= minLevel }.map { $0.line }.joined(separator: "\n")
-    }
-
-    func clear() {
-        lock.lock(); ring = []; start = 0; counts = [:]; dirty = true; lock.unlock()
-    }
-
-    /// 文字列から種類と重さを決める（今までのログの書き方に合わせる）
-    static func classify(_ m: String) -> (LogLevel, LogCategory) {
-        let level: LogLevel = m.hasPrefix("✕") || m.contains("失敗") ? .error
-            : m.hasPrefix("⚠") ? .warning : .info
-        let category: LogCategory
-        if m.hasPrefix("🍪") { category = .cookie }
-        else if m.hasPrefix("🚫") { category = .block }
-        else if m.hasPrefix("🛡") || m.hasPrefix("🔒") || m.contains("HSTS") || m.contains("横取り") { category = .security }
-        else if m.hasPrefix("✓") || m.hasPrefix("✕") || m.hasPrefix("↪") || m.hasPrefix("――") { category = .net }
-        else if m.hasPrefix("→") || m.hasPrefix("←") || m.contains("TLS") || m.contains("DHCP") || m.contains("カード")
-                    || m.contains("[ネット]") || m.contains("TCP") { category = .vnet }
-        else { category = .app }
-        return (level, category)
-    }
-}
-
-/// 開発者パネルのログ・通信のページの絞り込み（「このタブだけ」と「探す」）。Cookie のページは決まりが違うので使わない
-struct DevQuery {
-    let onlyThisTab: Bool
-    /// 小文字にした「探す」の文字
-    private let q: String
-
-    init(onlyThisTab: Bool, query: String) {
-        self.onlyThisTab = onlyThisTab
-        q = query.lowercased()
-    }
-
-    /// 調べるときに選ばれているタブ（「このタブだけ」でなければ nil = 全部のタブ）
-    func tab(selected: Int?) -> Int? { onlyThisTab ? selected : nil }
-
-    /// 「探す」が空か、text（小文字にして）に含まれるか
-    func matches(_ text: String) -> Bool { q.isEmpty || text.lowercased().contains(q) }
 }

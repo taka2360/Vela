@@ -27,7 +27,9 @@ func adBlockTests() {
         expectEqual(p.title, "テスト")
         expectEqual(p.network.count, 4)
         expectEqual(p.cosmetic.count, 3)
-        expectEqual(p.unsupported, 7)
+        expectEqual(p.unsupported, 6)
+        // ##+js(nobab) はスクリプトレット（Scriptlets.swift）
+        expectEqual(p.scriptlets.map { $0.args }, [["nobab"]])
         let r = p.network[2]
         expectEqual(r.body, "/banner/")
         expectEqual(r.types, [.image])

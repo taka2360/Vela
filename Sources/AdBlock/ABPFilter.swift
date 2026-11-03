@@ -8,7 +8,8 @@ import Foundation
 //         （third-party / first-party、script / image / stylesheet / xmlhttprequest / subdocument / font / media /
 //          websocket / ping / other / document、domain=、match-case、important、~ の打ち消し）
 //   隠す: ##セレクタ（全部のサイト）・a.com,b.com##セレクタ（そのサイト）・#@#（例外）
-// 対応しないもの（数えて読み飛ばす）: /正規表現/、$redirect・$csp・$removeparam など、#?#・#$#・#%#（スクリプト・拡張の書き方）、
+//   スクリプトレット: ##+js(…)・#@#+js(…)（uBO の書き方。Scriptlets.swift）
+// 対応しないもの（数えて読み飛ばす）: /正規表現/、$redirect・$csp・$removeparam など、#?#・#$#・#%#（AdGuard などのスクリプト・拡張の書き方）、
 //   $popup・$elemhide など、:has-text() などの拡張セレクタ
 
 /// 読み込みの種類（ルールの $script などと照らし合わせる）
@@ -46,6 +47,8 @@ struct CosmeticRule: Equatable {
 struct ParsedFilterList {
     var network: [NetworkRule] = []
     var cosmetic: [CosmeticRule] = []
+    /// ##+js(…) / #@#+js(…)（Scriptlets.swift）
+    var scriptlets: [ScriptletFilter] = []
     var unsupported = 0
     /// リストの見出しの「! Title:」
     var title: String?
@@ -70,6 +73,7 @@ enum ABPParser {
                 switch r {
                 case .network(let n): out.network.append(n)
                 case .cosmetic(let c): out.cosmetic.append(c)
+                case .scriptlet(let s): out.scriptlets.append(s)
                 }
             } else {
                 out.unsupported += 1
@@ -78,10 +82,12 @@ enum ABPParser {
         return out
     }
 
-    enum Rule { case network(NetworkRule), cosmetic(CosmeticRule) }
+    enum Rule { case network(NetworkRule), cosmetic(CosmeticRule), scriptlet(ScriptletFilter) }
 
     /// 1 行を読む。対応しない書き方なら nil
     static func parseLine(_ line: String) -> Rule? {
+        // スクリプトレット（uBO の ##+js(…)）
+        if let s = ScriptletParser.parse(line) { return .scriptlet(s) }
         // 隠すルール（## / #@#）。スクリプトや拡張の書き方（#?# #$# #%# #@?# など）は読まない
         if let r = line.range(of: "#@#") ?? line.range(of: "##") {
             let isException = line[r] == "#@#"

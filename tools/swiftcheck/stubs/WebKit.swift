@@ -129,9 +129,19 @@ public protocol WKURLSchemeHandler: NSObjectProtocol {
 
 public enum WKUserScriptInjectionTime: Int { case atDocumentStart, atDocumentEnd }
 
+open class WKContentWorld: NSObject {
+    open class var page: WKContentWorld { WKContentWorld() }
+    open class var defaultClient: WKContentWorld { WKContentWorld() }
+    open class func world(withName name: String) -> WKContentWorld { WKContentWorld() }
+    open var name: String? { nil }
+}
+
 open class WKUserScript: NSObject {
     public init(source: String, injectionTime: WKUserScriptInjectionTime, forMainFrameOnly: Bool) { super.init() }
+    public init(source: String, injectionTime: WKUserScriptInjectionTime, forMainFrameOnly: Bool, in contentWorld: WKContentWorld) { super.init() }
     open var source: String { "" }
+    open var injectionTime: WKUserScriptInjectionTime { .atDocumentStart }
+    open var isForMainFrameOnly: Bool { false }
 }
 
 open class WKScriptMessage: NSObject {
