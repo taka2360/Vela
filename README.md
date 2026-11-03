@@ -1,18 +1,18 @@
 # Vela
 
-**iPad の Swift Playgrounds だけで動く、自前の TCP/IP スタックを積んだ実験ブラウザ**
+**iPad の Swift Playgrounds で動く、自前の TCP/IP スタックを積んだ実験ブラウザ**
 
 Android エミュレータと同じ「仮想 LAN カード（virtio-net）」と「小さなルーター（UserNet）」を使って、ページを読み込んで表示するブラウザです。
 Android の代わりに、Swift で書いた小さな「ドライバ」と「TCP/IP」がカードを動かします。
 
 > [!WARNING]
-> 開発者向けの実験です。WebKit の内部の仕組みや非推奨の SecureTransport に頼っている所があります（[受け入れたリスク](#受け入れたリスク)）。普段使いのブラウザとしては使わないでください。
+> 開発者向けです。WebKit の内部の仕組みや非推奨の SecureTransport に頼っている所があります（[受け入れたリスク](#受け入れたリスク)）。
 
-## しくみ
+## 仕組み
 
 ```text
 ブラウザ（WKWebView）
-  ↓ https://…（読み込みは全部 VNetScheme が引き受ける。だめなときは vnets://…）
+  ↓ https://…（読み込みは全部 VNetScheme が引き受ける。だめな場合は vnets://…）
 VNetScheme → HTTPPool（http を話す。接続の使い回し・gzip・クッキー）→ TLSStream（https の暗号。SecureTransport）
   ↓
 GuestStack（自作の TCP/IP：DHCP・ARP・DNS・TCP）
@@ -32,8 +32,8 @@ UserNet（小さなルーター）→ Network.framework → インターネッ�
 - **ダウンロード**（進み具合・取り消し・共有）
 - **広告・トラッカーのブロック**（EasyList・EasyPrivacy・AdGuard Japanese・uBlock filters）
 - **YouTube などの広告をページの中で消す**（uBlock Origin のスクリプトレット `##+js(…)`。リストと道具は自動で更新するので、YouTube が変わってもコードは直さない）
-- **Cookie の決まり・LAN の保護**などの独自の守り
-- **開発者パネル**（ログ・通信・タブ・Cookie・HSTS・VNet の中身・落ちたときの記録）
+- **Cookie の決まり・LAN の保護**などの独自のセキュリティ
+- **開発者パネル**（ログ・通信・タブ・Cookie・HSTS・VNet の中身・クラッシュ時の記録）
 
 ## 動かし方（Swift Playgrounds）
 
@@ -44,8 +44,8 @@ UserNet（小さなルーター）→ Network.framework → インターネッ�
 
 > [!NOTE]
 > 1 つにまとめた `Playgrounds/VelaAll.swift` もありますが、大きすぎて Playgrounds が
-> 「Timed out waiting for a thunk to build after 30.0 seconds」で止まることがあります。ふつうは `VelaParts` の 11 個を使ってください。
-> `VelaAll.swift` と `VelaParts` を一緒に入れてはいけません。`Sources/` の 58 ファイルをそのまま入れても動きます。
+> 「Timed out waiting for a thunk to build after 30.0 seconds」で止まることがあります。 `VelaParts` の 11 個を使うことを推奨します。
+> `VelaAll.swift` と `VelaParts` を一緒に入れないでください。`Sources/` の 58 ファイルをそのまま入れても動きます。
 
 ## フォルダの構成
 
@@ -64,7 +64,7 @@ Sources/              アプリのソース（ここを直す）
   TCPIP/              TCP/IP: GuestStack / GuestTCP / DNSMessage / Packet
   VirtioNet/          カード: VNetMachine / VNetCore / VNetDriver
   Router/             ルーター: UserNet / UserNetApple
-Playgrounds/          Playgrounds に入れる、まとめたもの（自動生成。手で直さない）
+Playgrounds/          Playgrounds に入れる、まとめたもの（自動生成）
   VelaAll.swift
   VelaParts/Vela1〜11.swift
 resources/            アプリがネットから落とすもの（uBO のスクリプトレットの道具と署名。GitHub Actions が毎日作り直す。resources/README.md）
@@ -81,7 +81,7 @@ tools/
 
 ## 開発（Windows + WSL）
 
-Xcode が無くても、WSL の Ubuntu に入れた Swift 5.8.1（Linux 版）で型チェックとテストができます。
+Xcode が無くても、WSL の Ubuntu に入れた Swift 5.8.1（Linux 版）で型チェックとテスト可能です。
 Swift が入っていなければ、最初の実行で `tools/swiftcheck/setup.sh` が自動で入れます（`~/toolchains`。sudo 不要）。
 
 ```powershell
@@ -151,7 +151,7 @@ Vela 独自の守り（Cookie の判定・LAN の保護）は、VNet を通る�
 WebSocket と標準の通信には、WebKit のルールとページのスクリプトで、できる所まで LAN の保護をかけています
 （ホスト名で LAN に解決されるものは防げません。スクリプトの守りは回避される可能性があります）。
 
-## 守り（[`Sources/Policy/`](Sources/Policy/)）
+## セキュリティ（[`Sources/Policy/`](Sources/Policy/)）
 
 - **CORS**: サーバーの `Access-Control-*` をそのまま渡します（Vela が許可を足すことはしません。OPTIONS もサーバーに送ります）
 - **CSP・X-Frame-Options** はそのまま渡します（予備の `vnets://` の作りだけは外します。この作りは開発者向けの実験で、安全ではありません）
