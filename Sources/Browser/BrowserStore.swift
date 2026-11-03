@@ -346,10 +346,10 @@ final class BrowserStore: ObservableObject {
 
     /// そのタブのダイアログを全部取り消す（タブを閉じたとき）
     func cancelDialogs(for tab: BrowserTab) {
-        let mine = dialogQueue.filter { $0.origin.hasPrefix("#\(tab.id) ") }
-        dialogQueue.removeAll { $0.origin.hasPrefix("#\(tab.id) ") }
+        let mine = dialogQueue.filter { $0.tabID == tab.id }
+        dialogQueue.removeAll { $0.tabID == tab.id }
         for d in mine { d.respond(false, nil) }
-        if let d = dialog, d.origin.hasPrefix("#\(tab.id) ") { answerDialog(ok: false) }
+        if let d = dialog, d.tabID == tab.id { answerDialog(ok: false) }
     }
 
     // MARK: WebKit のルール

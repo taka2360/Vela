@@ -401,8 +401,7 @@ struct DialogModifier: ViewModifier {
     }
 
     private var title: String {
-        guard let d = store.dialog else { return "" }
-        return String(d.origin.drop(while: { $0 != " " }).dropFirst()) + " より"
+        store.dialog?.title ?? ""
     }
 
     private var shown: Binding<Bool> {
@@ -2398,9 +2397,20 @@ struct JSDialog: Identifiable {
     let id = UUID()
     let kind: Kind
     let message: String
-    let origin: String
+    /// 出したタブ（タブを閉じたとき、そのタブのものを取り消すのに使う）
+    let tabID: Int
+    /// 出したページのホスト（見出しの「〇〇 より」）。頼まれたときに決め、後で URL が変わっても変えない
+    let host: String
     /// (OK か, prompt の入力)
     let respond: (Bool, String?) -> Void
+
+    /// 見出し（host が空なら「 より」）
+    var title: String { host + " より" }
+
+    /// ホストの決め方: フレームのオリジンのホスト。空なら、そのときのタブの URL のホスト。それも無ければ空（小文字にはしない）
+    static func originHost(frameHost: String, tabURL: URL?) -> String {
+        frameHost.isEmpty ? (tabURL?.host ?? "") : frameHost
+    }
 }
 
 /// 保存するタブ
@@ -2772,10 +2782,10 @@ final class BrowserStore: ObservableObject {
 
     /// そのタブのダイアログを全部取り消す（タブを閉じたとき）
     func cancelDialogs(for tab: BrowserTab) {
-        let mine = dialogQueue.filter { $0.origin.hasPrefix("#\(tab.id) ") }
-        dialogQueue.removeAll { $0.origin.hasPrefix("#\(tab.id) ") }
+        let mine = dialogQueue.filter { $0.tabID == tab.id }
+        dialogQueue.removeAll { $0.tabID == tab.id }
         for d in mine { d.respond(false, nil) }
-        if let d = dialog, d.origin.hasPrefix("#\(tab.id) ") { answerDialog(ok: false) }
+        if let d = dialog, d.tabID == tab.id { answerDialog(ok: false) }
     }
 
     // MARK: WebKit のルール
@@ -3434,9 +3444,8 @@ final class BrowserTab: ObservableObject, Identifiable {
     }
 
     func presentDialog(_ kind: JSDialog.Kind, message: String, frame: WKFrameInfo, respond: @escaping (Bool, String?) -> Void) {
-        let o = frame.securityOrigin
-        let origin = "#\(id) \(o.host.isEmpty ? (url?.host ?? "") : o.host)"
-        store?.presentDialog(JSDialog(kind: kind, message: message, origin: origin, respond: respond))
+        let host = JSDialog.originHost(frameHost: frame.securityOrigin.host, tabURL: url)
+        store?.presentDialog(JSDialog(kind: kind, message: message, tabID: id, host: host, respond: respond))
     }
 
     /// エラーページのボタン・守りのスクリプトからの知らせ

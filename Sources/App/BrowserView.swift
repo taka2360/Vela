@@ -369,8 +369,7 @@ struct DialogModifier: ViewModifier {
     }
 
     private var title: String {
-        guard let d = store.dialog else { return "" }
-        return String(d.origin.drop(while: { $0 != " " }).dropFirst()) + " より"
+        store.dialog?.title ?? ""
     }
 
     private var shown: Binding<Bool> {

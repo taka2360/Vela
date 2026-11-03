@@ -364,10 +364,10 @@ final class BrowserStore: ObservableObject {
 
     /// そのタブのダイアログを全部取り消す（タブを閉じたとき）
     func cancelDialogs(for tab: BrowserTab) {
-        let mine = dialogQueue.filter { $0.origin.hasPrefix("#\(tab.id) ") }
-        dialogQueue.removeAll { $0.origin.hasPrefix("#\(tab.id) ") }
+        let mine = dialogQueue.filter { $0.tabID == tab.id }
+        dialogQueue.removeAll { $0.tabID == tab.id }
         for d in mine { d.respond(false, nil) }
-        if let d = dialog, d.origin.hasPrefix("#\(tab.id) ") { answerDialog(ok: false) }
+        if let d = dialog, d.tabID == tab.id { answerDialog(ok: false) }
     }
 
     // MARK: WebKit のルール
@@ -1026,9 +1026,8 @@ final class BrowserTab: ObservableObject, Identifiable {
     }
 
     func presentDialog(_ kind: JSDialog.Kind, message: String, frame: WKFrameInfo, respond: @escaping (Bool, String?) -> Void) {
-        let o = frame.securityOrigin
-        let origin = "#\(id) \(o.host.isEmpty ? (url?.host ?? "") : o.host)"
-        store?.presentDialog(JSDialog(kind: kind, message: message, origin: origin, respond: respond))
+        let host = JSDialog.originHost(frameHost: frame.securityOrigin.host, tabURL: url)
+        store?.presentDialog(JSDialog(kind: kind, message: message, tabID: id, host: host, respond: respond))
     }
 
     /// エラーページのボタン・守りのスクリプトからの知らせ

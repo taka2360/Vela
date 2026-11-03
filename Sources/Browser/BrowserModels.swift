@@ -23,9 +23,20 @@ struct JSDialog: Identifiable {
     let id = UUID()
     let kind: Kind
     let message: String
-    let origin: String
+    /// 出したタブ（タブを閉じたとき、そのタブのものを取り消すのに使う）
+    let tabID: Int
+    /// 出したページのホスト（見出しの「〇〇 より」）。頼まれたときに決め、後で URL が変わっても変えない
+    let host: String
     /// (OK か, prompt の入力)
     let respond: (Bool, String?) -> Void
+
+    /// 見出し（host が空なら「 より」）
+    var title: String { host + " より" }
+
+    /// ホストの決め方: フレームのオリジンのホスト。空なら、そのときのタブの URL のホスト。それも無ければ空（小文字にはしない）
+    static func originHost(frameHost: String, tabURL: URL?) -> String {
+        frameHost.isEmpty ? (tabURL?.host ?? "") : frameHost
+    }
 }
 
 /// 保存するタブ

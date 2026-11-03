@@ -552,9 +552,8 @@ final class BrowserTab: ObservableObject, Identifiable {
     }
 
     func presentDialog(_ kind: JSDialog.Kind, message: String, frame: WKFrameInfo, respond: @escaping (Bool, String?) -> Void) {
-        let o = frame.securityOrigin
-        let origin = "#\(id) \(o.host.isEmpty ? (url?.host ?? "") : o.host)"
-        store?.presentDialog(JSDialog(kind: kind, message: message, origin: origin, respond: respond))
+        let host = JSDialog.originHost(frameHost: frame.securityOrigin.host, tabURL: url)
+        store?.presentDialog(JSDialog(kind: kind, message: message, tabID: id, host: host, respond: respond))
     }
 
     /// エラーページのボタン・守りのスクリプトからの知らせ
