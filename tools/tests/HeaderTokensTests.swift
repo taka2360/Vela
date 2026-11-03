@@ -29,6 +29,16 @@ private func streamOutcome(_ enc: String) -> String {
 
 func headerTokenTests() {
     print("カンマ区切りのヘッダ")
+    test("HeaderTokens.list: 空の要素も残す・前後の空白を取る・lowercase") {
+        expectEqual(HeaderTokens.list("", lowercase: true), [""])
+        expectEqual(HeaderTokens.list(" , ", lowercase: true), ["", ""])
+        expectEqual(HeaderTokens.list(",gzip,,", lowercase: true), ["", "gzip", "", ""])
+        expectEqual(HeaderTokens.list("GZIP,\tbr", lowercase: true), ["gzip", "br"])
+        expectEqual(HeaderTokens.list("GZIP,\tbr", lowercase: false), ["GZIP", "br"])
+        expectEqual(HeaderTokens.list("5, 5", lowercase: false), ["5", "5"])
+        expectEqual(HeaderTokens.list("5,", lowercase: false), ["5", ""])
+        expectEqual(HeaderTokens.list("a\nb, c", lowercase: false), ["a\nb", "c"], "改行は取らない")
+    }
     test("Content-Encoding（一括）: 空・空白・identity は飛ばし、知らないものはそれ（小文字・空白を取った形）で失敗") {
         expectEqual(encodingOutcome(""), "ok:3")
         expectEqual(encodingOutcome(" , ,"), "ok:3")

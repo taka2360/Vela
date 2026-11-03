@@ -8944,7 +8944,7 @@ final class ResponseParser {
         var length: Int?
         if !cls.isEmpty {
             var values = Set<String>()
-            for v in cls { for p in v.split(separator: ",", omittingEmptySubsequences: false) { values.insert(p.trimmingCharacters(in: .whitespaces)) } }
+            for v in cls { for p in HeaderTokens.list(v, lowercase: false) { values.insert(p) } }      // 空の要素も残す（"5," は不正）
             guard values.count == 1, let v = values.first, !v.isEmpty, v.count <= 18, v.allSatisfy({ $0.isASCII && $0.isNumber }), let n = Int(v) else {
                 fail(.malformed("Content-Length が不正: \(cls.joined(separator: " / ").prefix(60))")); return
             }
@@ -8953,7 +8953,7 @@ final class ResponseParser {
         if isHead || status == 204 || status == 304 { complete = true; return }
         streaming = decideStreaming?() ?? false
         if !te.isEmpty {
-            let codings = te.joined(separator: ",").lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            let codings = HeaderTokens.list(te.joined(separator: ","), lowercase: true).filter { !$0.isEmpty }
             if codings.last == "chunked" { mode = .chunked }
             else { mode = .untilClose; keepAlive = false }          // chunked で終わらないなら、閉じるまで（RFC 9112 6.3）
         } else if let n = length {
@@ -9052,6 +9052,17 @@ extension Array where Element == (String, String) {
     }
 }
 
+// MARK: カンマ区切りのヘッダの値
+
+enum HeaderTokens {
+    /// "a, b ,,c" → ["a", "b", "", "c"]。lowercase なら先に全体を小文字にする。カンマで分け（空の要素も残す）、
+    /// 各要素の前後の空白（.whitespaces。改行は含まない）を取る。空の要素をどうするかは呼ぶ側が決める
+    static func list(_ s: String, lowercase: Bool) -> [String] {
+        (lowercase ? s.lowercased() : s).split(separator: ",", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+}
+
 // MARK: gzip・zlib の頭（純 Swift。一括と流す形の両方が使う）
 
 enum GzipHeader {
@@ -9120,7 +9131,7 @@ enum ContentDecoding {
     static func decode(_ d: Data, encoding: String, maxOutput: Int = 32 << 20) -> Result<Data, Failure> {
         // "gzip, br" のように重ねてあるときは、後ろから戻す
         var out = d
-        for e in encoding.lowercased().split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }).reversed() {
+        for e in HeaderTokens.list(encoding, lowercase: true).reversed() {         // 空の要素は下の case "" で飛ばす
             let r: Result<Data, Failure>
             switch e {
             case "", "identity": continue
@@ -9212,7 +9223,7 @@ final class StreamDecoder {
 
     /// 縮め方から作る。縮めていない（identity）なら nil。流す形で戻せないものは失敗
     static func make(encoding: String) -> Result<StreamDecoder?, ContentDecoding.Failure> {
-        let list = encoding.lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty && $0 != "identity" }
+        let list = HeaderTokens.list(encoding, lowercase: true).filter { !$0.isEmpty && $0 != "identity" }
         if list.isEmpty { return .success(nil) }
         guard list.count == 1 else { return .failure(.unsupported(encoding)) }
         let kind: Kind

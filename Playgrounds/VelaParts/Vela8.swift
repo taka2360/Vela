@@ -955,7 +955,7 @@ final class ResponseParser {
         var length: Int?
         if !cls.isEmpty {
             var values = Set<String>()
-            for v in cls { for p in v.split(separator: ",", omittingEmptySubsequences: false) { values.insert(p.trimmingCharacters(in: .whitespaces)) } }
+            for v in cls { for p in HeaderTokens.list(v, lowercase: false) { values.insert(p) } }      // 空の要素も残す（"5," は不正）
             guard values.count == 1, let v = values.first, !v.isEmpty, v.count <= 18, v.allSatisfy({ $0.isASCII && $0.isNumber }), let n = Int(v) else {
                 fail(.malformed("Content-Length が不正: \(cls.joined(separator: " / ").prefix(60))")); return
             }
@@ -964,7 +964,7 @@ final class ResponseParser {
         if isHead || status == 204 || status == 304 { complete = true; return }
         streaming = decideStreaming?() ?? false
         if !te.isEmpty {
-            let codings = te.joined(separator: ",").lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            let codings = HeaderTokens.list(te.joined(separator: ","), lowercase: true).filter { !$0.isEmpty }
             if codings.last == "chunked" { mode = .chunked }
             else { mode = .untilClose; keepAlive = false }          // chunked で終わらないなら、閉じるまで（RFC 9112 6.3）
         } else if let n = length {
