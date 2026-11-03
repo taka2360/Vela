@@ -26,6 +26,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\swiftcheck\swiftcheck.
 - `#if os(iOS)` は iOS 側として読む（コピーの上で `os(iOS)` → `true` に置き換えてから調べる）
 - Swift が入っていなければ自動で `tools/swiftcheck/setup.sh` が入れる（WSL の `~/toolchains`。sudo 不要）
 
+## まとめて確かめる
+
+`powershell -NoProfile -ExecutionPolicy Bypass -File tools\checkall.ps1` で merge・swiftcheck（Sources・VelaAll・VelaParts）・単体テストを全部動かす。最後の行が `ALL OK` なら全部通った（終了コード 0）。
+
 ## 単体テスト（UI・WebKit に頼らない部品）
 
 ```powershell
