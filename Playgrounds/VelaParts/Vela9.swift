@@ -17,371 +17,6 @@ import Security
 #endif
 
 // ======================================================================
-// MARK: - HTTPSupport.swift
-// ======================================================================
-
-// MARK: - http の小さな道具（ヘッダ・gzip・ブラウザらしさ）
-//
-// Cookie は CookieJar.swift（WebKit の置き場の写し）と Cookies.swift の CookiePolicy に移した
-
-/// ヘッダ（名前, 値）の並び。名前の大文字小文字は区別しない
-extension Array where Element == (String, String) {
-    func value(for name: String) -> String? {
-        let n = name.lowercased()
-        return first { $0.0.lowercased() == n }?.1
-    }
-
-    func values(for name: String) -> [String] {
-        let n = name.lowercased()
-        return filter { $0.0.lowercased() == n }.map { $0.1 }
-    }
-
-    /// names は小文字で渡す
-    mutating func removeAll(named names: Set<String>) {
-        removeAll { names.contains($0.0.lowercased()) }
-    }
-}
-
-// MARK: カンマ区切りのヘッダの値
-
-enum HeaderTokens {
-    /// "a, b ,,c" → ["a", "b", "", "c"]。lowercase なら先に全体を小文字にする。カンマで分け（空の要素も残す）、
-    /// 各要素の前後の空白（.whitespaces。改行は含まない）を取る。空の要素をどうするかは呼ぶ側が決める
-    static func list(_ s: String, lowercase: Bool) -> [String] {
-        (lowercase ? s.lowercased() : s).split(separator: ",", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-    }
-}
-
-enum HeaderParams {
-    /// 「key=value」の属性 1 つを分ける（Set-Cookie の属性・Strict-Transport-Security の指示）。
-    /// part は前後の空白を取った、空でないもの（呼ぶ側が trim して空を飛ばす）。最初の = で分け、
-    /// キーは前後の空白を取って小文字、値は前後の空白を取る。= が無ければ（全体を小文字, ""）。引用符は外さない
-    static func splitAttribute(_ part: String) -> (key: String, value: String) {
-        guard let eq = part.firstIndex(of: "=") else { return (part.lowercased(), "") }
-        return (part[..<eq].trimmingCharacters(in: .whitespaces).lowercased(),
-                part[part.index(after: eq)...].trimmingCharacters(in: .whitespaces))
-    }
-}
-
-// MARK: gzip・zlib の頭（純 Swift。一括と流す形の両方が使う）
-
-enum GzipHeader {
-    enum Outcome: Equatable {
-        /// 頭がまだ全部届いていない（一括なら壊れている扱い、流す形なら続きを待つ。決めるのは呼ぶ側）
-        case needMore
-        case bad(String)
-        /// 頭の長さ（ここから後ろが deflate）。length <= 渡したバイト数
-        case length(Int)
-    }
-
-    /// gzip の頭を読む。見るのはマジック・CM=8・FEXTRA・FNAME・FCOMMENT・FHCRC（予約フラグ・CRC は見ない。長さの上限も無い）
-    static func parse(_ b: [UInt8]) -> Outcome {
-        if b.count < 10 { return .needMore }
-        guard b[0] == 0x1F, b[1] == 0x8B, b[2] == 8 else { return .bad("gzip の頭が違います") }
-        let flags = b[3]
-        var p = 10
-        if flags & 4 != 0 {                                         // FEXTRA
-            guard p + 2 <= b.count else { return .needMore }
-            p += 2 + (Int(b[p]) | Int(b[p + 1]) << 8)
-        }
-        for flag in [UInt8(8), 16] where flags & flag != 0 {        // FNAME・FCOMMENT（0 で終わる）
-            guard let z = b[min(p, b.count)...].firstIndex(of: 0) else { return .needMore }
-            p = z + 1
-        }
-        if flags & 2 != 0 { p += 2 }                                 // FHCRC
-        if p > b.count { return .needMore }
-        return .length(p)
-    }
-
-    /// zlib の包み（2 バイト）か: CM=8 で、2 バイトを 16 ビットとして見ると 31 の倍数
-    static func isZlib(_ b0: UInt8, _ b1: UInt8) -> Bool { b0 & 0x0F == 8 && (Int(b0) << 8 | Int(b1)) % 31 == 0 }
-}
-
-// MARK: 縮めた中身を戻す（gzip・deflate・br）
-
-enum ContentDecoding {
-    /// 送る Accept-Encoding（Safari と同じ。br は iOS 15 から）
-    static var acceptEncoding: String {
-        #if canImport(Compression)
-        if #available(iOS 15.0, macOS 12.0, *) { return "gzip, deflate, br" }
-        return "gzip, deflate"
-        #else
-        return "identity"
-        #endif
-    }
-
-    enum Failure: Error, Equatable {
-        /// 知らない縮め方（この環境で戻せないものも）
-        case unsupported(String)
-        /// 壊れている・途中で切れている
-        case corrupt(String)
-        /// 戻した大きさが上限を超えた（圧縮爆弾など）
-        case tooLarge(Int)
-
-        var description: String {
-            switch self {
-            case .unsupported(let e): return "戻せない縮め方です（\(e)）"
-            case .corrupt(let e): return "縮めた中身（\(e)）が壊れています"
-            case .tooLarge(let n): return "戻した中身が \(n >> 20)MB を超えます"
-            }
-        }
-    }
-
-    /// Content-Encoding に従って戻す。戻した大きさは maxOutput まで
-    static func decode(_ d: Data, encoding: String, maxOutput: Int = 32 << 20) -> Result<Data, Failure> {
-        // "gzip, br" のように重ねてあるときは、後ろから戻す
-        var out = d
-        for e in HeaderTokens.list(encoding, lowercase: true).reversed() {         // 空の要素は下の case "" で飛ばす
-            let r: Result<Data, Failure>
-            switch e {
-            case "", "identity": continue
-            case "gzip", "x-gzip": r = gunzip(out, maxOutput: maxOutput)
-            case "deflate": r = inflateZlib(out, maxOutput: maxOutput)
-            case "br": r = brotli(out, maxOutput: maxOutput)
-            default: return .failure(.unsupported(e))
-            }
-            switch r {
-            case .success(let g): out = g
-            case .failure(let f): return .failure(f)
-            }
-        }
-        return .success(out)
-    }
-
-    /// gzip: 前（10 バイト〜）と後ろ（8 バイト）を外して、生の deflate として戻す
-    static func gunzip(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
-        let b = [UInt8](d)
-        guard b.count >= 18, b[0] == 0x1F, b[1] == 0x8B, b[2] == 8 else { return .failure(.corrupt("gzip の頭が違います")) }
-        // 一括では、頭が途中までしか無い（needMore）・頭の後ろに 1 バイトも無い、はどちらも壊れている扱い
-        switch GzipHeader.parse(b) {
-        case .needMore: return .failure(.corrupt("gzip"))
-        case .bad(let why): return .failure(.corrupt(why))
-        case .length(let p):
-            guard p < b.count else { return .failure(.corrupt("gzip")) }
-            return inflateRaw(b[p...], name: "gzip", maxOutput: maxOutput)
-        }
-    }
-
-    /// deflate: 本当は zlib の包み（2 バイト＋後ろ 4 バイト）付き。包みの無い生の deflate を送るサーバーもあるので両方受ける
-    static func inflateZlib(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
-        let b = [UInt8](d)
-        if b.count >= 2 && GzipHeader.isZlib(b[0], b[1]) { return inflateRaw(b[2...], name: "deflate", maxOutput: maxOutput) }
-        return inflateRaw(b[...], name: "deflate", maxOutput: maxOutput)
-    }
-
-    static func inflateRaw(_ b: ArraySlice<UInt8>, name: String, maxOutput: Int) -> Result<Data, Failure> {
-        #if canImport(Compression)
-        return stream(b, COMPRESSION_ZLIB, name: name, maxOutput: maxOutput)      // Apple の ZLIB は「生の deflate」
-        #else
-        return .failure(.unsupported(name))
-        #endif
-    }
-
-    static func brotli(_ d: Data, maxOutput: Int) -> Result<Data, Failure> {
-        #if canImport(Compression)
-        if #available(iOS 15.0, macOS 12.0, *) { return stream([UInt8](d)[...], COMPRESSION_BROTLI, name: "br", maxOutput: maxOutput) }
-        #endif
-        return .failure(.unsupported("br"))
-    }
-
-    #if canImport(Compression)
-    /// 元の大きさが分からなくても戻せるよう、少しずつ戻す。最後まで戻せなかったら壊れている扱い
-    private static func stream(_ src: ArraySlice<UInt8>, _ algorithm: compression_algorithm, name: String, maxOutput: Int) -> Result<Data, Failure> {
-        if src.isEmpty { return .success(Data()) }
-        let chunk = 1 << 16
-        let out = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
-        defer { out.deallocate() }
-        var s = compression_stream(dst_ptr: out, dst_size: 0, src_ptr: UnsafePointer(out), src_size: 0, state: nil)
-        guard compression_stream_init(&s, COMPRESSION_STREAM_DECODE, algorithm) == COMPRESSION_STATUS_OK else { return .failure(.unsupported(name)) }
-        defer { compression_stream_destroy(&s) }
-        var result = Data()
-        return src.withUnsafeBufferPointer { sb -> Result<Data, Failure> in
-            guard let base = sb.baseAddress else { return .failure(.corrupt(name)) }
-            s.src_ptr = base
-            s.src_size = sb.count
-            while true {
-                s.dst_ptr = out
-                s.dst_size = chunk
-                let st = compression_stream_process(&s, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
-                let produced = chunk - s.dst_size
-                if result.count + produced > maxOutput { return .failure(.tooLarge(maxOutput)) }
-                if produced > 0 { result.append(out, count: produced) }
-                if st == COMPRESSION_STATUS_END { return .success(result) }
-                if st != COMPRESSION_STATUS_OK { return .failure(.corrupt(name)) }
-                if produced == 0 && s.src_size == 0 { return .failure(.corrupt("\(name)・途中で切れています")) }
-            }
-        }
-    }
-    #endif
-}
-
-// MARK: 少しずつ届く縮めた中身を、少しずつ戻す（流す形のとき）
-
-/// 流す形の返事の Content-Encoding を、届いた分ずつ戻す。1 種類の縮め方だけ（重ねてあるものは流さずに貯める形で読む）
-final class StreamDecoder {
-    enum Kind { case gzip, deflate, br }
-
-    /// 縮め方から作る。縮めていない（identity）なら nil。流す形で戻せないものは失敗
-    static func make(encoding: String) -> Result<StreamDecoder?, ContentDecoding.Failure> {
-        let list = HeaderTokens.list(encoding, lowercase: true).filter { !$0.isEmpty && $0 != "identity" }
-        if list.isEmpty { return .success(nil) }
-        guard list.count == 1 else { return .failure(.unsupported(encoding)) }
-        let kind: Kind
-        switch list[0] {
-        case "gzip", "x-gzip": kind = .gzip
-        case "deflate": kind = .deflate
-        case "br": kind = .br
-        default: return .failure(.unsupported(list[0]))
-        }
-        #if canImport(Compression)
-        if kind == .br, #unavailable(iOS 15.0, macOS 12.0) { return .failure(.unsupported("br")) }
-        guard let d = StreamDecoder(kind: kind) else { return .failure(.unsupported(list[0])) }
-        return .success(d)
-        #else
-        return .failure(.unsupported(list[0]))
-        #endif
-    }
-
-    let kind: Kind
-    let maxOutput: Int
-    private(set) var produced = 0
-    /// 頭（gzip の 10 バイト〜・zlib の 2 バイト）を読み終えるまで貯めておく
-    private var head = [UInt8]()
-    private var headDone = false
-    private var ended = false
-
-    #if canImport(Compression)
-    private var stream: compression_stream
-    private var started = false
-
-    private init?(kind: Kind, maxOutput: Int = Int.max) {
-        self.kind = kind
-        self.maxOutput = maxOutput
-        let dummy = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
-        defer { dummy.deallocate() }
-        stream = compression_stream(dst_ptr: dummy, dst_size: 0, src_ptr: UnsafePointer(dummy), src_size: 0, state: nil)
-        let algorithm: compression_algorithm
-        if kind == .br {
-            if #available(iOS 15.0, macOS 12.0, *) { algorithm = COMPRESSION_BROTLI } else { return nil }
-        } else {
-            algorithm = COMPRESSION_ZLIB      // Apple の ZLIB は「生の deflate」
-        }
-        guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, algorithm) == COMPRESSION_STATUS_OK else { return nil }
-        started = true
-    }
-
-    deinit { if started { compression_stream_destroy(&stream) } }
-    #else
-    private init?(kind: Kind, maxOutput: Int = Int.max) { return nil }
-    #endif
-
-    /// 届いた分を戻す
-    func feed(_ d: Data) -> Result<Data, ContentDecoding.Failure> {
-        if ended { return .success(Data()) }          // 終わった後のもの（gzip の後ろの 8 バイトなど）は捨てる
-        var bytes = [UInt8](d)
-        if !headDone {
-            head += bytes
-            switch skipHead() {
-            case .needMore: return .success(Data())
-            case .bad(let why): return .failure(.corrupt(why))
-            case .done(let rest): headDone = true; bytes = rest; head = []
-            }
-        }
-        return process(bytes, finalize: false)
-    }
-
-    /// 最後まで届いた
-    func finish() -> Result<Data, ContentDecoding.Failure> {
-        if ended { return .success(Data()) }
-        if !headDone { return .failure(.corrupt("頭の途中で終わりました")) }
-        return process([], finalize: true)
-    }
-
-    private enum HeadResult { case needMore, bad(String), done([UInt8]) }
-
-    private func skipHead() -> HeadResult {
-        let b = head
-        switch kind {
-        case .br:
-            return .done(b)
-        case .deflate:
-            // zlib の包み（2 バイト）があれば外す。無いもの（生の deflate）も受ける
-            if b.count < 2 { return .needMore }
-            if GzipHeader.isZlib(b[0], b[1]) { return .done(Array(b[2...])) }
-            return .done(b)
-        case .gzip:
-            // 流す形では、頭が途中までなら続きを待つ（最後まで来ても足りなければ finish が「頭の途中で終わりました」）
-            switch GzipHeader.parse(b) {
-            case .needMore: return .needMore
-            case .bad(let why): return .bad(why)
-            case .length(let p): return .done(Array(b[p...]))
-            }
-        }
-    }
-
-    private func process(_ src: [UInt8], finalize: Bool) -> Result<Data, ContentDecoding.Failure> {
-        #if canImport(Compression)
-        let chunk = 1 << 16
-        let out = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
-        defer { out.deallocate() }
-        var result = Data()
-        let name = "\(kind)"
-        return src.withUnsafeBufferPointer { sb -> Result<Data, ContentDecoding.Failure> in
-            let empty: [UInt8] = [0]
-            return empty.withUnsafeBufferPointer { eb -> Result<Data, ContentDecoding.Failure> in
-                stream.src_ptr = sb.baseAddress ?? eb.baseAddress!
-                stream.src_size = sb.count
-                while true {
-                    stream.dst_ptr = out
-                    stream.dst_size = chunk
-                    let flags = finalize ? Int32(COMPRESSION_STREAM_FINALIZE.rawValue) : 0
-                    let st = compression_stream_process(&stream, flags)
-                    let n = chunk - stream.dst_size
-                    if produced + n > maxOutput { return .failure(.tooLarge(maxOutput)) }
-                    if n > 0 { result.append(out, count: n); produced += n }
-                    if st == COMPRESSION_STATUS_END { ended = true; return .success(result) }
-                    if st != COMPRESSION_STATUS_OK { return .failure(.corrupt(name)) }
-                    // 入れたものを全部使い切って、出てくるものも無くなったら、次の分を待つ
-                    if stream.src_size == 0 && n < chunk {
-                        if finalize && n == 0 { return .failure(.corrupt("\(name)・途中で切れています")) }
-                        if !finalize { return .success(result) }
-                    }
-                }
-            }
-        }
-        #else
-        return .failure(.unsupported("\(kind)"))
-        #endif
-    }
-}
-
-// MARK: ブラウザらしさ（User-Agent・言語）
-
-enum BrowserIdentity {
-    /// iPad の Safari（デスクトップ用の表示。iPad の Safari の初期設定と同じ）の User-Agent。
-    /// WKWebView の初期値は「Version/… Safari/…」が無く、アプリの中のブラウザやロボットだと思われやすい
-    static let userAgent: String = {
-        let v = ProcessInfo.processInfo.operatingSystemVersion
-        return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/\(v.majorVersion).\(v.minorVersion) Safari/605.1.15"
-    }()
-
-    /// Accept-Language（端末の言語の順。例: "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7"）
-    static let acceptLanguage: String = {
-        var langs: [String] = []
-        for l in Locale.preferredLanguages.prefix(3) {
-            let tag = l.replacingOccurrences(of: "_", with: "-")
-            if !langs.contains(tag) { langs.append(tag) }
-            if let base = tag.split(separator: "-").first.map(String.init), base != tag, !langs.contains(base) { langs.append(base) }
-        }
-        if langs.isEmpty { langs = ["ja-JP", "ja"] }
-        return langs.prefix(6).enumerated().map { i, l in
-            i == 0 ? l : "\(l);q=\(String(format: "%.1f", max(0.1, 1.0 - Double(i) * 0.1)))"
-        }.joined(separator: ",")
-    }()
-}
-
-// ======================================================================
 // MARK: - TLSClient.swift
 // ======================================================================
 
@@ -1135,5 +770,526 @@ enum DNSMessage {
             r += [0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4] + a   // 名前は質問を指す・A・IN・60 秒・4 バイト
         }
         return r
+    }
+}
+
+// ======================================================================
+// MARK: - Packet.swift
+// ======================================================================
+
+// MARK: - パケットを組み立てる・読むための共通の部品
+//
+// ゲスト側（GuestStack・GuestTCP）とルーター側（UserNet）の両方が使う。
+// 数はすべてネットワークの順（ビッグエンディアン）。IP アドレスは 4 バイト、MAC アドレスは 6 バイトの [UInt8]
+
+/// この小さなネットワークの決まった値（QEMU の SLIRP と同じ）
+enum Net {
+    static let guestIP: [UInt8] = [10, 0, 2, 15]
+    static let gateway: [UInt8] = [10, 0, 2, 2]
+    static let dns: [UInt8] = [10, 0, 2, 3]
+    static let zeroIP: [UInt8] = [0, 0, 0, 0]
+    static let broadcastIP: [UInt8] = [255, 255, 255, 255]
+    /// ゲスト（仮想 LAN カード）の MAC アドレス（QEMU と同じ）
+    static let guestMAC: [UInt8] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]
+    /// ルーターの MAC アドレス
+    static let routerMAC: [UInt8] = [0x52, 0x55, 0x0A, 0x00, 0x02, 0x02]
+    static let zeroMAC: [UInt8] = [0, 0, 0, 0, 0, 0]
+    static let broadcastMAC: [UInt8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+    /// 10.0.2.x（ルーターが自分で答える範囲）
+    static func isLocal(_ ip: [UInt8]) -> Bool { ip.count == 4 && ip[0] == 10 && ip[1] == 0 && ip[2] == 2 }
+}
+
+enum EtherType {
+    static let ipv4: UInt16 = 0x0800
+    static let arp: UInt16 = 0x0806
+}
+
+enum IPProto {
+    static let icmp: UInt8 = 1
+    static let tcp: UInt8 = 6
+    static let udp: UInt8 = 17
+}
+
+// MARK: バイト列の読み書き
+
+extension Array where Element == UInt8 {
+    func be16(at i: Int) -> UInt16 { UInt16(self[i]) << 8 | UInt16(self[i + 1]) }
+    func be32(at i: Int) -> UInt32 { UInt32(be16(at: i)) << 16 | UInt32(be16(at: i + 2)) }
+    mutating func appendBE16(_ v: UInt16) { append(UInt8(v >> 8)); append(UInt8(v & 0xFF)) }
+    mutating func appendBE32(_ v: UInt32) { appendBE16(UInt16(v >> 16)); appendBE16(UInt16(v & 0xFFFF)) }
+    mutating func setBE16(_ v: UInt16, at i: Int) { self[i] = UInt8(v >> 8); self[i + 1] = UInt8(v & 0xFF) }
+    mutating func setBE32(_ v: UInt32, at i: Int) { setBE16(UInt16(v >> 16), at: i); setBE16(UInt16(v & 0xFFFF), at: i + 2) }
+
+    /// 10.0.2.15 の形
+    var ipString: String { map { String($0) }.joined(separator: ".") }
+    /// 52:54:00:12:34:56 の形
+    var macString: String { map { String(format: "%02x", $0) }.joined(separator: ":") }
+}
+
+// MARK: 読み位置付きのバイトの列
+
+/// 前から読んでいくバイトの列（UserNet の TCP の送り待ち・GuestTCP の送り待ち・TLS の受け取り待ちで使う）。
+/// 先頭を消すと毎回全部ずらすことになって遅いので、読み位置（pos）で覚えて、ときどき詰める。
+/// いつも 0 <= pos <= buf.count。読める並びは buf[pos...]。詰めるのは compact を呼んだときだけ（呼ぶ時点は使う側が決める）
+struct ByteQueue {
+    private(set) var buf: [UInt8] = []
+    private(set) var pos = 0
+
+    var count: Int { buf.count - pos }
+    var isEmpty: Bool { pos >= buf.count }
+
+    mutating func append<S: Sequence>(contentsOf s: S) where S.Element == UInt8 { buf.append(contentsOf: s) }
+
+    /// 読める並びの at から count バイト（コピーしない）。0 <= at、0 <= count、at + count <= self.count であること
+    func slice(at: Int, count n: Int) -> ArraySlice<UInt8> {
+        precondition(at >= 0 && n >= 0 && at <= count && n <= count - at, "ByteQueue.slice の範囲外")
+        return buf[(pos + at)..<(pos + at + n)]
+    }
+
+    /// 先頭の n バイト（足りなければある分だけ）
+    func prefix(_ n: Int) -> ArraySlice<UInt8> { buf[pos..<(pos + min(max(n, 0), count))] }
+
+    /// 先頭の n バイトを p に写す（読み位置は動かさない）。0 <= n <= count。p に n バイトの場所があるのは呼ぶ側の責任
+    func copy(into p: UnsafeMutableRawPointer, count n: Int) {
+        precondition(n >= 0 && n <= count, "ByteQueue.copy の範囲外")
+        if n == 0 { return }
+        buf.withUnsafeBytes { p.copyMemory(from: $0.baseAddress! + pos, byteCount: n) }
+    }
+
+    /// 先頭の n バイトを読んだことにする（n <= 0 なら何もしない。n <= count であること）。詰めはしない
+    mutating func consume(_ n: Int) {
+        guard n > 0 else { return }
+        precondition(n <= count, "ByteQueue.consume の範囲外")
+        pos += n
+    }
+
+    /// 詰める。空で resetWhenEmpty なら中身を消す（場所は取っておく）。そうでなく pos > above かつ pos * 2 > buf.count なら、読んだ所を消す
+    mutating func compact(above: Int, resetWhenEmpty: Bool) {
+        if resetWhenEmpty && pos == buf.count { buf.removeAll(keepingCapacity: true); pos = 0 }
+        else if pos > above && pos * 2 > buf.count { buf.removeFirst(pos); pos = 0 }
+    }
+}
+
+// MARK: 確認用の値（チェックサム）
+
+enum Checksum {
+    /// IP などで使う 16 ビットの 1 の補数の和
+    static func internet(_ b: [UInt8], initial: UInt32 = 0) -> UInt16 {
+        var s = initial
+        var i = 0
+        while i + 1 < b.count { s &+= UInt32(b[i]) << 8 | UInt32(b[i + 1]); i += 2 }
+        if i < b.count { s &+= UInt32(b[i]) << 8 }
+        while s >> 16 != 0 { s = (s & 0xFFFF) &+ (s >> 16) }
+        return ~UInt16(s)
+    }
+
+    /// TCP / UDP 用（疑似ヘッダ込み）
+    static func l4(proto: UInt8, src: [UInt8], dst: [UInt8], _ seg: [UInt8]) -> UInt16 {
+        var s = UInt32(src.be16(at: 0)) &+ UInt32(src.be16(at: 2))
+        s &+= UInt32(dst.be16(at: 0)) &+ UInt32(dst.be16(at: 2))
+        s &+= UInt32(proto) &+ UInt32(seg.count)
+        return internet(seg, initial: s)
+    }
+}
+
+// MARK: イーサネット・ARP
+
+enum Ethernet {
+    static let headerSize = 14
+    static func frame(dst: [UInt8], src: [UInt8], type: UInt16, _ payload: [UInt8]) -> [UInt8] {
+        var f = dst + src
+        f.appendBE16(type)
+        return f + payload
+    }
+}
+
+/// 届いたイーサネットのフレームを読む（短すぎれば nil）
+struct EthernetFrame {
+    let raw: [UInt8]
+    init?(_ f: [UInt8]) {
+        guard f.count >= Ethernet.headerSize else { return nil }
+        raw = f
+    }
+    var type: UInt16 { raw.be16(at: 12) }
+    var src: [UInt8] { Array(raw[6..<12]) }
+    /// ブロードキャスト・マルチキャストでない送り元か（送り元の先頭のバイトの一番下のビットが 0）
+    var srcIsUnicast: Bool { raw[6] & 1 == 0 }
+    var body: [UInt8] { Array(raw[Ethernet.headerSize...]) }
+}
+
+/// 届いた ARP を読む（イーサネット・IPv4 用。短すぎれば nil）
+struct ARPPacket {
+    let op: UInt16
+    let senderMAC: [UInt8]
+    let senderIP: [UInt8]
+    let targetIP: [UInt8]
+    init?(_ p: [UInt8]) {
+        guard p.count >= 28 else { return nil }
+        op = p.be16(at: 6)
+        senderMAC = Array(p[8..<14])
+        senderIP = Array(p[14..<18])
+        targetIP = Array(p[24..<28])
+    }
+}
+
+enum ARP {
+    static let request: UInt16 = 1
+    static let reply: UInt16 = 2
+    /// ARP の中身（イーサネット・IPv4 用）
+    static func packet(op: UInt16, senderMAC: [UInt8], senderIP: [UInt8], targetMAC: [UInt8], targetIP: [UInt8]) -> [UInt8] {
+        var a: [UInt8] = [0, 1, 8, 0, 6, 4]
+        a.appendBE16(op)
+        return a + senderMAC + senderIP + targetMAC + targetIP
+    }
+}
+
+// MARK: IPv4
+
+struct IPv4Packet {
+    let proto: UInt8
+    let src: [UInt8]
+    let dst: [UInt8]
+    let body: [UInt8]
+    /// 分割されたもの（フラグメント）か
+    let isFragment: Bool
+
+    /// 読む（形が変なら nil）
+    init?(_ p: [UInt8]) {
+        guard p.count >= 20, p[0] >> 4 == 4 else { return nil }
+        let ihl = Int(p[0] & 15) * 4
+        let total = min(Int(p.be16(at: 2)), p.count)
+        guard ihl >= 20, total >= ihl else { return nil }
+        proto = p[9]
+        src = Array(p[12..<16])
+        dst = Array(p[16..<20])
+        body = Array(p[ihl..<total])
+        isFragment = p.be16(at: 6) & 0x3FFF != 0
+    }
+
+    /// 組み立てる（オプション無し・TTL 64）
+    static func build(proto: UInt8, id: UInt16, src: [UInt8], dst: [UInt8], dontFragment: Bool = true, _ body: [UInt8]) -> [UInt8] {
+        var h: [UInt8] = [0x45, 0]
+        h.appendBE16(UInt16(20 + body.count))
+        h.appendBE16(id)
+        h += [dontFragment ? 0x40 : 0, 0, 64, proto, 0, 0]
+        h += src + dst
+        h.setBE16(Checksum.internet(h), at: 10)
+        return h + body
+    }
+}
+
+// MARK: UDP
+
+struct UDPDatagram {
+    let sport: UInt16
+    let dport: UInt16
+    let payload: [UInt8]
+
+    init?(_ b: [UInt8]) {
+        guard b.count >= 8 else { return nil }
+        let len = min(Int(b.be16(at: 4)), b.count)
+        guard len >= 8 else { return nil }
+        sport = b.be16(at: 0)
+        dport = b.be16(at: 2)
+        payload = Array(b[8..<len])
+    }
+
+    /// 組み立てる（チェックサム込み。0 になったら 0xFFFF にする決まり）
+    static func build(src: [UInt8], dst: [UInt8], sport: UInt16, dport: UInt16, _ payload: [UInt8]) -> [UInt8] {
+        var u: [UInt8] = []
+        u.appendBE16(sport)
+        u.appendBE16(dport)
+        u.appendBE16(UInt16(8 + payload.count))
+        u += [0, 0]
+        u += payload
+        let c = Checksum.l4(proto: IPProto.udp, src: src, dst: dst, u)
+        u.setBE16(c == 0 ? 0xFFFF : c, at: 6)
+        return u
+    }
+}
+
+// MARK: TCP
+
+/// TCP の番号（32 ビットで一周する）の計算。GuestTCP と UserNet の同じ式
+enum TCPSeq {
+    /// ACK で新しく受け取ってもらえた量。`ack &- una` と `nxt &- una` を UInt32 のまま（符号なしで）比べ、
+    /// 0 より大きく、送った分（inFlight）以下ならその量。そうでなければ nil
+    static func acked(ack: UInt32, una: UInt32, nxt: UInt32) -> UInt32? {
+        let a = ack &- una
+        let inFlight = nxt &- una
+        return a > 0 && a <= inFlight ? a : nil
+    }
+
+    /// x が y からいくつ先か（負なら前）。差がちょうど 2^31 のときは Int32.min（負）
+    static func offset(_ x: UInt32, from y: UInt32) -> Int32 { Int32(bitPattern: x &- y) }
+
+    /// seq から count バイト（データだけ。FIN の 1 は入れない）が、ちょうど rcvNxt で終わるか
+    static func endsAt(seq: UInt32, count: Int, rcvNxt: UInt32) -> Bool { seq &+ UInt32(count) == rcvNxt }
+}
+
+struct TCPFlags: OptionSet {
+    let rawValue: UInt8
+    static let fin = TCPFlags(rawValue: 1)
+    static let syn = TCPFlags(rawValue: 2)
+    static let rst = TCPFlags(rawValue: 4)
+    static let psh = TCPFlags(rawValue: 8)
+    static let ack = TCPFlags(rawValue: 16)
+}
+
+struct TCPHeader {
+    let sport: UInt16
+    let dport: UInt16
+    let seq: UInt32
+    let ack: UInt32
+    /// ヘッダの長さ（オプション込み）。中身はここから
+    let headerLength: Int
+    let flags: TCPFlags
+    let window: UInt16
+
+    init?(_ b: [UInt8]) {
+        guard b.count >= 20 else { return nil }
+        let off = Int(b[12] >> 4) * 4
+        guard off >= 20, off <= b.count else { return nil }
+        sport = b.be16(at: 0)
+        dport = b.be16(at: 2)
+        seq = b.be32(at: 4)
+        ack = b.be32(at: 8)
+        headerLength = off
+        flags = TCPFlags(rawValue: b[13])
+        window = b.be16(at: 14)
+    }
+
+    /// オプションの MSS（無ければ nil）
+    static func mss(_ b: [UInt8], headerLength off: Int) -> Int? {
+        var i = 20
+        while i < off {
+            let kind = b[i]
+            if kind == 0 { break }
+            if kind == 1 { i += 1; continue }
+            guard i + 1 < off else { break }
+            let l = Int(b[i + 1])
+            if kind == 2, l == 4, i + 3 < off { return Int(b.be16(at: i + 2)) }
+            i += max(2, l)
+        }
+        return nil
+    }
+}
+
+enum TCPSegment {
+    /// TCP のセグメントを組み立てる（チェックサム込み）。mss = true なら MSS 1460 のオプションを付ける
+    static func build(src: [UInt8], dst: [UInt8], sport: UInt16, dport: UInt16, seq: UInt32, ack: UInt32,
+                      flags: TCPFlags, window: UInt16 = 0xFFFF, mss: Bool = false,
+                      payload: ArraySlice<UInt8> = []) -> [UInt8] {
+        let hlen = mss ? 24 : 20
+        var t: [UInt8] = []
+        t.appendBE16(sport)
+        t.appendBE16(dport)
+        t.appendBE32(seq)
+        t.appendBE32(ack)
+        t += [UInt8(hlen / 4) << 4, flags.rawValue]
+        t.appendBE16(window)
+        t += [0, 0, 0, 0]                              // チェックサム・緊急ポインタ
+        if mss { t += [2, 4, 0x05, 0xB4] }
+        t += payload
+        t.setBE16(Checksum.l4(proto: IPProto.tcp, src: src, dst: dst, t), at: 16)
+        return t
+    }
+}
+
+// MARK: DHCP
+
+/// よく使うポート番号
+enum Port {
+    static let dns: UInt16 = 53
+    static let dhcpServer: UInt16 = 67
+    static let dhcpClient: UInt16 = 68
+}
+
+enum DHCP {
+    static let magicCookie: [UInt8] = [99, 130, 83, 99]
+    /// オプションの番号（RFC 2132）
+    enum Opt {
+        static let subnetMask: UInt8 = 1
+        static let router: UInt8 = 3
+        static let dnsServer: UInt8 = 6
+        static let mtu: UInt8 = 26
+        static let requestedIP: UInt8 = 50
+        static let leaseTime: UInt8 = 51
+        static let messageType: UInt8 = 53
+        static let serverID: UInt8 = 54
+        static let paramList: UInt8 = 55
+        static let end: UInt8 = 255
+    }
+    static let discover: UInt8 = 1
+    static let offer: UInt8 = 2
+    static let request: UInt8 = 3
+    static let ack: UInt8 = 5
+
+    /// DHCP（BOOTP）の 1 通を組み立てる（クライアントの問い合わせ・サーバーの返事の両方）。
+    /// xid は 4 バイト・flags は 2 バイト・chaddr は 16 バイト（MAC の後ろは 0）。options は並べた順に積み、最後に 255 を付ける
+    static func message(op: UInt8, xid: [UInt8], flags: [UInt8], yiaddr: [UInt8] = Net.zeroIP, siaddr: [UInt8] = Net.zeroIP,
+                        chaddr: [UInt8], options: [(UInt8, [UInt8])]) -> [UInt8] {
+        precondition(xid.count == 4 && flags.count == 2 && yiaddr.count == 4 && siaddr.count == 4 && chaddr.count == 16,
+                     "DHCP.message の長さが違う")
+        var m = [UInt8](repeating: 0, count: 236)
+        m[0] = op; m[1] = 1; m[2] = 6                      // 1 = 問い合わせ / 2 = 返事・イーサネット・MAC は 6 バイト
+        m.replaceSubrange(4..<8, with: xid)
+        m.replaceSubrange(10..<12, with: flags)
+        m.replaceSubrange(16..<20, with: yiaddr)
+        m.replaceSubrange(20..<24, with: siaddr)
+        m.replaceSubrange(28..<44, with: chaddr)
+        m.append(contentsOf: magicCookie)
+        // 配列を + でつなぐと型チェックがとても遅いので、1 つずつ足す
+        for (code, value) in options {
+            m.append(code)
+            m.append(UInt8(value.count))
+            m.append(contentsOf: value)
+        }
+        m.append(Opt.end)
+        return m
+    }
+
+    /// オプション（番号 → 中身）。240 バイト目から読む
+    static func options(_ p: [UInt8]) -> [UInt8: [UInt8]] {
+        var out: [UInt8: [UInt8]] = [:]
+        var i = 240
+        while i + 1 < p.count {
+            let code = p[i]
+            if code == 255 { break }
+            if code == 0 { i += 1; continue }
+            let l = Int(p[i + 1])
+            guard i + 2 + l <= p.count else { break }
+            out[code] = Array(p[(i + 2)..<(i + 2 + l)])
+            i += 2 + l
+        }
+        return out
+    }
+}
+
+// ======================================================================
+// MARK: - VNetMachine.swift
+// ======================================================================
+
+// MARK: - 全部をつなぐ
+//
+//  [ゲスト側]  HTTPPool（http・https）→ GuestStack → VirtioNetDriver
+//                                         ↓ ↑（RAM の中のキューと、レジスタ）
+//  [カード]                             VirtioNet
+//                                         ↓ onTransmit      ↑ receive
+//  [ルーター]                           UserNet（小さなルーター）→ iPad の通信 → インターネット
+//
+// ゲスト側とカードは queue の上で動く。ルーターは自分のキューで動き、フレームを渡すときだけ行き来する
+
+final class VNetMachine: @unchecked Sendable {
+    let queue = DispatchQueue(label: "vnet-guest")
+    let ram = GuestRAM(megabytes: 4)
+    let card: VirtioNet
+    let driver: VirtioNetDriver
+    let stack: GuestStack
+    let router: UserNet
+    let pool: HTTPPool
+    /// ログ（どのスレッドからも呼ばれる）
+    var log: (@Sendable (String) -> Void)?
+    private var ready = false
+    private var waiting: [() -> Void] = []
+    /// 統計: カードを通ったフレームの数とバイト数
+    private var framesOut = 0, framesIn = 0, bytesOut = 0, bytesIn = 0
+
+    init(factory: UserNetSocketFactory) {
+        card = VirtioNet(memory: ram)
+        driver = VirtioNetDriver(dev: card, ram: ram)
+        stack = GuestStack(queue: queue)
+        router = UserNet(factory: factory)
+        pool = HTTPPool(stack: stack)
+        // ゲスト → カード → ルーター
+        stack.output = { [unowned self] f in self.driver.send(f) }
+        card.onTransmit = { [unowned self] f in
+            self.framesOut += 1; self.bytesOut += f.count
+            self.router.input(f)
+        }
+        // ルーター → カード → ゲスト（カードとゲストは queue の上で触る）
+        router.onFrame = { [weak self] f in
+            guard let self else { return }
+            self.queue.async {
+                self.framesIn += 1; self.bytesIn += f.count
+                self.card.receive(f)
+                self.driver.poll()          // 割り込みを見て、届いたフレームを取り出す
+            }
+        }
+        driver.onReceive = { [unowned self] f in self.stack.input(f) }
+        stack.trace = { [weak self] s in self?.log?(s) }
+        router.log = { [weak self] s in self?.log?(s) }
+    }
+
+    /// カードを準備して DHCP で IP アドレスをもらう
+    func boot() {
+        queue.async {
+            do {
+                try self.driver.start()
+                self.stack.mac = self.driver.mac
+                self.log?("カードの準備ができました（MAC \(self.driver.mac.macString)）")
+            } catch {
+                self.log?("カードを準備できません: \(error)")
+                return
+            }
+            self.stack.start {
+                self.ready = true
+                let w = self.waiting
+                self.waiting = []
+                for f in w { f() }
+            }
+        }
+    }
+
+    /// 送って返事を受け取る（結果は done に、queue の上で返る）
+    /// followRedirects: false なら 3xx もそのまま返す（移動はブラウザに任せる）
+    func send(_ req: HTTPRequest, followRedirects: Bool = true, _ done: @escaping @Sendable (Result<HTTPResult, FetchError>) -> Void) {
+        queue.async {
+            let go = { self.pool.send(req, followRedirects: followRedirects) { r in done(r) } }
+            if self.ready { go() } else { self.waiting.append(go) }
+        }
+    }
+
+    /// ブラウザの User-Agent を使う
+    func setUserAgent(_ ua: String) { queue.async { self.pool.userAgent = ua } }
+
+    /// 守りの決まり（Cookie の写し・HSTS・LAN の保護）を渡す。pool は queue の上でしか触らない
+    func configurePolicies(cookieJar: CookieJar, hsts: HSTSStore, localNetworkProtection: Bool) {
+        queue.async {
+            self.pool.cookieJar = cookieJar
+            self.pool.hsts = hsts
+            self.pool.localNetworkProtection = localNetworkProtection
+            self.pool.policyLog = { [weak self] s in self?.log?(s) }
+        }
+    }
+
+    /// 開発者向けの数字のスナップショット
+    struct Stats: Sendable, Equatable {
+        var framesOut = 0, framesIn = 0, bytesOut = 0, bytesIn = 0
+        var pool = PoolStats()
+        var droppedRx = 0
+        var tcpRetransmits = 0
+        /// 順番を飛ばして届き、取っておいたセグメント
+        var tcpReordered = 0
+        /// IP アドレスをもらえたか・もらった IP
+        var ready = false
+        var ip = ""
+
+        var summary: String {
+            "フレーム 送 \(framesOut)（\(bytesOut / 1024)KB）・受 \(framesIn)（\(bytesIn / 1024)KB）・接続 新 \(pool.opened) 使い回し \(pool.reused)"
+                + "・使用中 \(pool.busy) 待ち \(pool.waiting)" + (pool.bufferedBytes > 0 ? "・読み途中 \(pool.bufferedBytes / 1024)KB" : "")
+                + (droppedRx > 0 ? "・捨てたフレーム \(droppedRx)" : "") + (tcpRetransmits > 0 ? "・TCP 送り直し \(tcpRetransmits)" : "")
+        }
+    }
+
+    /// 数字を queue の上で集めて、done に渡す（画面のスレッドから直接読むと、値を書き換えている途中とぶつかるため）
+    func stats(_ done: @escaping @Sendable (Stats) -> Void) {
+        queue.async {
+            let s = Stats(framesOut: self.framesOut, framesIn: self.framesIn, bytesOut: self.bytesOut, bytesIn: self.bytesIn,
+                          pool: self.pool.stats(), droppedRx: self.card.droppedRx, tcpRetransmits: self.stack.retransmits,
+                          tcpReordered: self.stack.reordered,
+                          ready: self.stack.ready, ip: self.stack.ready ? self.stack.ip.ipString : "")
+            done(s)
+        }
     }
 }

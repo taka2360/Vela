@@ -52,9 +52,13 @@ struct ParsedFilterList {
 }
 
 enum ABPParser {
-    static func parse(_ text: String) -> ParsedFilterList {
+    /// env: !#if の判定に使う値（FilterPreparser.env）。既定は uBO の拡張と同じ（ext_ublock だけ真）
+    static func parse(_ text: String, env: [String] = ["ublock"]) -> ParsedFilterList {
         var out = ParsedFilterList()
+        let splitter = FilterPreparser.Splitter(env: env)
         text.enumerateLines { raw, _ in
+            // !#if で捨てる枝の行は読まない（uBO の preparser と同じ）
+            guard splitter.keep(Substring(raw)) else { return }
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.isEmpty { return }
             if line.hasPrefix("!") {

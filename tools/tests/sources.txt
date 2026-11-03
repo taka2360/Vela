@@ -27,6 +27,7 @@ Sources/Browser/ErrorPages.swift
 Sources/Browser/DownloadFiles.swift
 Sources/Browser/CrashLog.swift
 Sources/Browser/LibraryModel.swift
+Sources/AdBlock/FilterPreparser.swift
 Sources/AdBlock/ABPFilter.swift
 Sources/AdBlock/BlockEngine.swift
 Sources/AdBlock/ContentBlocker.swift
