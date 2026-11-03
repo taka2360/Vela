@@ -38,6 +38,34 @@ func packetTests() {
         expectEqual(Checksum.internet(Array(ip[0..<20])), 0)       // 正しいヘッダーは 0 になる
     }
 
+    test("TCPSeq: acked（符号なしで比べる・一周をまたぐ）") {
+        // una=0xFFFFFFF0, nxt=0x10 → 送った分 0x20
+        expect(TCPSeq.acked(ack: 0xFFFF_FFF0, una: 0xFFFF_FFF0, nxt: 0x10) == nil, "0 は進んでいない")
+        expectEqual(TCPSeq.acked(ack: 0xFFFF_FFF1, una: 0xFFFF_FFF0, nxt: 0x10), 1)
+        expectEqual(TCPSeq.acked(ack: 0x10, una: 0xFFFF_FFF0, nxt: 0x10), 0x20)
+        expect(TCPSeq.acked(ack: 0x11, una: 0xFFFF_FFF0, nxt: 0x10) == nil, "送った分より先")
+        expect(TCPSeq.acked(ack: 0xFFFF_FFEF, una: 0xFFFF_FFF0, nxt: 0x10) == nil, "前の番号")
+        expect(TCPSeq.acked(ack: 5, una: 5, nxt: 5) == nil, "送った分が 0")
+        expect(TCPSeq.acked(ack: 6, una: 5, nxt: 5) == nil, "送った分が 0 なら何も進まない")
+        // 送った分が 2^31 以上でも、符号なしのまま比べる
+        expectEqual(TCPSeq.acked(ack: 0x8000_0000, una: 0, nxt: 0x9000_0000), 0x8000_0000)
+        expectEqual(TCPSeq.acked(ack: 0x9000_0000, una: 0, nxt: 0x9000_0000), 0x9000_0000)
+        expect(TCPSeq.acked(ack: 0x9000_0001, una: 0, nxt: 0x9000_0000) == nil)
+    }
+    test("TCPSeq: offset（Int32 の符号。差が 2^31 なら負）・endsAt") {
+        expectEqual(TCPSeq.offset(10, from: 9), 1)
+        expectEqual(TCPSeq.offset(9, from: 10), -1)
+        expectEqual(TCPSeq.offset(7, from: 7), 0)
+        expectEqual(TCPSeq.offset(0x7FFF_FFFF, from: 0), Int32.max)
+        expectEqual(TCPSeq.offset(0x8000_0000, from: 0), Int32.min)
+        expectEqual(TCPSeq.offset(0, from: 0x8000_0000), Int32.min)
+        expectEqual(TCPSeq.offset(0x8000_0001, from: 0), Int32.min + 1)
+        expectEqual(TCPSeq.offset(2, from: 0xFFFF_FFFE), 4)       // 一周をまたぐ
+        expectEqual(TCPSeq.offset(0xFFFF_FFFE, from: 2), -4)
+        expect(TCPSeq.endsAt(seq: 0xFFFF_FFFE, count: 4, rcvNxt: 2))
+        expect(!TCPSeq.endsAt(seq: 0xFFFF_FFFE, count: 3, rcvNxt: 2))
+        expect(TCPSeq.endsAt(seq: 9, count: 0, rcvNxt: 9), "データが無い FIN")
+    }
     test("EthernetFrame・ARPPacket を読む") {
         let mac: [UInt8] = [2, 0, 0, 0, 0, 9]
         let f = arpFrame(op: ARP.request, srcMAC: mac, senderIP: [10, 0, 2, 9], targetIP: Net.dns)

@@ -9865,9 +9865,7 @@ final class GuestTCP: @unchecked Sendable {
         }
         guard state == .established else { return }
         if h.flags.contains(.ack) {
-            let acked = h.ack &- sndUna
-            let inFlight = sndNxt &- sndUna
-            if acked > 0 && acked <= inFlight {
+            if let acked = TCPSeq.acked(ack: h.ack, una: sndUna, nxt: sndNxt) {
                 var n = Int(acked)
                 if finSent && h.ack == sndNxt { n -= 1 }        // FIN の分
                 if n > 0 { sendBuf.removeFirst(min(n, sendBuf.count)) }
@@ -9882,7 +9880,7 @@ final class GuestTCP: @unchecked Sendable {
             if state == .closed { return }
             needAck = true
         }
-        if h.flags.contains(.fin) && h.seq &+ UInt32(payload.count) == rcvNxt && !gotFIN {
+        if h.flags.contains(.fin) && TCPSeq.endsAt(seq: h.seq, count: payload.count, rcvNxt: rcvNxt) && !gotFIN {
             gotFIN = true
             rcvNxt &+= 1
             needAck = true
@@ -9900,7 +9898,7 @@ final class GuestTCP: @unchecked Sendable {
     private func deliver(seq start: UInt32, _ bytes: [UInt8]) {
         var seq = start
         var data = bytes
-        let before = Int32(bitPattern: rcvNxt &- seq)       // > 0: rcvNxt より前から始まる（送り直しの重なり）
+        let before = TCPSeq.offset(rcvNxt, from: seq)       // > 0: rcvNxt より前から始まる（送り直しの重なり）
         if before > 0 {
             if Int(before) >= data.count { return }         // 全部受け取り済み
             data.removeFirst(Int(before))
@@ -9908,7 +9906,7 @@ final class GuestTCP: @unchecked Sendable {
         }
         if seq != rcvNxt {
             // 先の分: 窓の中で、置き場に余裕があれば取っておく
-            let ahead = Int(Int32(bitPattern: seq &- rcvNxt))
+            let ahead = Int(TCPSeq.offset(seq, from: rcvNxt))
             if ahead > 0 && ahead < GuestTCP.reorderLimit && oooBytes + data.count <= GuestTCP.reorderLimit && ooo[seq] == nil {
                 ooo[seq] = data
                 oooBytes += data.count
@@ -9919,10 +9917,10 @@ final class GuestTCP: @unchecked Sendable {
         rcvNxt &+= UInt32(data.count)
         handler.data(Data(data))
         // 取っておいた先の分が続いていれば渡す
-        while state != .closed, let (k, v) = ooo.first(where: { Int32(bitPattern: rcvNxt &- $0.key) >= 0 }) {
+        while state != .closed, let (k, v) = ooo.first(where: { TCPSeq.offset(rcvNxt, from: $0.key) >= 0 }) {
             ooo[k] = nil
             oooBytes -= v.count
-            let skip = Int(Int32(bitPattern: rcvNxt &- k))
+            let skip = Int(TCPSeq.offset(rcvNxt, from: k))
             if skip < v.count {
                 let rest = v[skip...]
                 rcvNxt &+= UInt32(rest.count)
@@ -10240,6 +10238,23 @@ struct UDPDatagram {
 }
 
 // MARK: TCP
+
+/// TCP の番号（32 ビットで一周する）の計算。GuestTCP と UserNet の同じ式
+enum TCPSeq {
+    /// ACK で新しく受け取ってもらえた量。`ack &- una` と `nxt &- una` を UInt32 のまま（符号なしで）比べ、
+    /// 0 より大きく、送った分（inFlight）以下ならその量。そうでなければ nil
+    static func acked(ack: UInt32, una: UInt32, nxt: UInt32) -> UInt32? {
+        let a = ack &- una
+        let inFlight = nxt &- una
+        return a > 0 && a <= inFlight ? a : nil
+    }
+
+    /// x が y からいくつ先か（負なら前）。差がちょうど 2^31 のときは Int32.min（負）
+    static func offset(_ x: UInt32, from y: UInt32) -> Int32 { Int32(bitPattern: x &- y) }
+
+    /// seq から count バイト（データだけ。FIN の 1 は入れない）が、ちょうど rcvNxt で終わるか
+    static func endsAt(seq: UInt32, count: Int, rcvNxt: UInt32) -> Bool { seq &+ UInt32(count) == rcvNxt }
+}
 
 struct TCPFlags: OptionSet {
     let rawValue: UInt8
@@ -11382,9 +11397,7 @@ final class UserNet: @unchecked Sendable {
             return
         }
         if h.flags.contains(.ack) {
-            let acked = h.ack &- c.sndUna
-            let inFlight = c.sndNxt &- c.sndUna
-            if acked > 0 && acked <= inFlight {
+            if let acked = TCPSeq.acked(ack: h.ack, una: c.sndUna, nxt: c.sndNxt) {
                 var n = Int(acked)
                 if c.state == .synSent { c.state = .established; n -= 1 }     // SYN の分
                 c.dropAcked(min(n, c.pending))
@@ -11400,7 +11413,7 @@ final class UserNet: @unchecked Sendable {
         var needAck = false
         if !payload.isEmpty {
             // 送り直しで前の分と重なっていたら、新しい所だけ外へ送る（先の分は捨てて、送り直してもらう）
-            let before = Int32(bitPattern: c.rcvNxt &- h.seq)
+            let before = TCPSeq.offset(c.rcvNxt, from: h.seq)
             if before >= 0 && Int(before) < payload.count {
                 let rest = payload.dropFirst(Int(before))
                 c.sock?.send(Data(rest))
@@ -11408,7 +11421,7 @@ final class UserNet: @unchecked Sendable {
             }
             needAck = true
         }
-        if h.flags.contains(.fin) && h.seq &+ UInt32(payload.count) == c.rcvNxt && !c.guestFIN {
+        if h.flags.contains(.fin) && TCPSeq.endsAt(seq: h.seq, count: payload.count, rcvNxt: c.rcvNxt) && !c.guestFIN {
             c.guestFIN = true
             c.rcvNxt &+= 1
             c.sock?.finish()

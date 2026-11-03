@@ -914,9 +914,7 @@ final class UserNet: @unchecked Sendable {
             return
         }
         if h.flags.contains(.ack) {
-            let acked = h.ack &- c.sndUna
-            let inFlight = c.sndNxt &- c.sndUna
-            if acked > 0 && acked <= inFlight {
+            if let acked = TCPSeq.acked(ack: h.ack, una: c.sndUna, nxt: c.sndNxt) {
                 var n = Int(acked)
                 if c.state == .synSent { c.state = .established; n -= 1 }     // SYN の分
                 c.dropAcked(min(n, c.pending))
@@ -932,7 +930,7 @@ final class UserNet: @unchecked Sendable {
         var needAck = false
         if !payload.isEmpty {
             // 送り直しで前の分と重なっていたら、新しい所だけ外へ送る（先の分は捨てて、送り直してもらう）
-            let before = Int32(bitPattern: c.rcvNxt &- h.seq)
+            let before = TCPSeq.offset(c.rcvNxt, from: h.seq)
             if before >= 0 && Int(before) < payload.count {
                 let rest = payload.dropFirst(Int(before))
                 c.sock?.send(Data(rest))
@@ -940,7 +938,7 @@ final class UserNet: @unchecked Sendable {
             }
             needAck = true
         }
-        if h.flags.contains(.fin) && h.seq &+ UInt32(payload.count) == c.rcvNxt && !c.guestFIN {
+        if h.flags.contains(.fin) && TCPSeq.endsAt(seq: h.seq, count: payload.count, rcvNxt: c.rcvNxt) && !c.guestFIN {
             c.guestFIN = true
             c.rcvNxt &+= 1
             c.sock?.finish()

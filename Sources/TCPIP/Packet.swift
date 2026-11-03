@@ -189,6 +189,23 @@ struct UDPDatagram {
 
 // MARK: TCP
 
+/// TCP の番号（32 ビットで一周する）の計算。GuestTCP と UserNet の同じ式
+enum TCPSeq {
+    /// ACK で新しく受け取ってもらえた量。`ack &- una` と `nxt &- una` を UInt32 のまま（符号なしで）比べ、
+    /// 0 より大きく、送った分（inFlight）以下ならその量。そうでなければ nil
+    static func acked(ack: UInt32, una: UInt32, nxt: UInt32) -> UInt32? {
+        let a = ack &- una
+        let inFlight = nxt &- una
+        return a > 0 && a <= inFlight ? a : nil
+    }
+
+    /// x が y からいくつ先か（負なら前）。差がちょうど 2^31 のときは Int32.min（負）
+    static func offset(_ x: UInt32, from y: UInt32) -> Int32 { Int32(bitPattern: x &- y) }
+
+    /// seq から count バイト（データだけ。FIN の 1 は入れない）が、ちょうど rcvNxt で終わるか
+    static func endsAt(seq: UInt32, count: Int, rcvNxt: UInt32) -> Bool { seq &+ UInt32(count) == rcvNxt }
+}
+
 struct TCPFlags: OptionSet {
     let rawValue: UInt8
     static let fin = TCPFlags(rawValue: 1)
