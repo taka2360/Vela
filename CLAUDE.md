@@ -3,7 +3,7 @@
 iPad の Swift Playgrounds（App、Swift 5.8）で動かす実験ブラウザ。ソースは `Sources/<役割>/*.swift`（App・Browser・WebKitBridge・Policy・AdBlock・HTTP・TCPIP・VirtioNet・Router）。
 `Playgrounds/VelaAll.swift` は `tools/merge_swift.py` でそれらを 1 つにまとめたもの（手で直さず、直したら `python tools/merge_swift.py` で作り直す）。
 新しい .swift を足したら、合うフォルダに置き、`tools/merge_swift.py` の ORDER と README.md のファイル一覧にも足す（ファイル名は Sources 全体で重ならないこと）。
-`merge_swift.py` は同じ中身を 10 個に分けた `Playgrounds/VelaParts/Vela1〜10.swift` も作る（1 つ 1,500 行くらいまでが目安）。ユーザーは Playgrounds にこちらを入れる
+`merge_swift.py` は同じ中身を 11 個に分けた `Playgrounds/VelaParts/Vela1〜11.swift` も作る（1 つ 1,500 行くらいまでが目安）。ユーザーは Playgrounds にこちらを入れる
 （VelaAll.swift 1 つ（今は 1 万行を超える）だと「Timed out waiting for a thunk to build after 30.0 seconds」で止まる）。
 1 つの部品が大きくなってきたら `--parts` を増やす。チェックは `swiftcheck.ps1 Playgrounds\VelaParts`。
 

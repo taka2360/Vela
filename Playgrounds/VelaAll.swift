@@ -1,5 +1,5 @@
 // このファイルは merge_swift.py で自動生成したものです（直接編集しないでください）
-// 元ファイル: MyApp.swift, BrowserView.swift, BrowserControls.swift, TabViews.swift, LibraryView.swift, DevPanel.swift, DevPanelPages.swift, SettingsView.swift, AdBlockView.swift, Downloads.swift, SharedViews.swift, DownloadManager.swift, DownloadFiles.swift, BrowserModels.swift, BrowserStore.swift, BrowserTab.swift, TabWebDelegate.swift, Library.swift, LibraryModel.swift, AddressInput.swift, ErrorPages.swift, NetLog.swift, FilterLists.swift, FilterCatalog.swift, FilterPreparser.swift, ABPFilter.swift, Scriptlets.swift, ScriptletVerify.swift, BlockEngine.swift, ContentBlocker.swift, Persistence.swift, DevLog.swift, CrashLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, SiteUtil.swift, Cookies.swift, RedirectPolicy.swift, LocalNetworkPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPRequestBytes.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
+// 元ファイル: MyApp.swift, BrowserView.swift, BrowserControls.swift, TabViews.swift, LibraryView.swift, DevPanel.swift, DevPanelPages.swift, SettingsView.swift, AdBlockView.swift, ScriptletSelfTest.swift, Downloads.swift, SharedViews.swift, DownloadManager.swift, DownloadFiles.swift, BrowserModels.swift, BrowserStore.swift, BrowserTab.swift, TabWebDelegate.swift, Library.swift, LibraryModel.swift, AddressInput.swift, ErrorPages.swift, NetLog.swift, FilterLists.swift, FilterCatalog.swift, FilterPreparser.swift, ABPFilter.swift, Scriptlets.swift, ScriptletVerify.swift, BlockEngine.swift, ContentBlocker.swift, Persistence.swift, DevLog.swift, CrashLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, SiteUtil.swift, Cookies.swift, RedirectPolicy.swift, LocalNetworkPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPRequestBytes.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
 
 import SwiftUI
 import WebKit
@@ -1465,10 +1465,13 @@ struct DevAdBlockPage: View {
                 DevLine("状態: \(adblock.enabled ? "使う" : "止めている")・\(adblock.status)")
                 DevLine("VNet 用のルール \(adblock.ruleCount) 個・起動してから止めた数 \(adblock.totalBlocked)")
                 DevLine("止めているサイト: \(adblock.disabledSites.isEmpty ? "なし" : adblock.disabledSites.sorted().joined(separator: ", "))")
+                DevLine("スクリプトレット: \(adblock.scriptletRuleCount) 個・道具 \(adblock.scriptletStatus)")
                 ForEach(adblock.lists) { l in
-                    DevLine("\(l.enabled ? "●" : "○") \(l.name): 通信 \(l.networkRules)・隠す \(l.cosmeticRules)・対応外 \(l.unsupported)"
+                    DevLine("\(l.enabled ? "●" : "○") \(l.name): 通信 \(l.networkRules)・隠す \(l.cosmeticRules)・スクリプト \(l.scriptletRules ?? 0)・対応外 \(l.unsupported)"
                             + "・WebKit \(l.netID == nil ? "なし" : "通信あり")/\(l.cosID == nil ? "なし" : "隠すあり")\(l.lastError.map { "・⚠️ \($0)" } ?? "")")
                 }
+                Divider().padding(.vertical, 6)
+                ScriptletSelfTestView(adblock: adblock)
                 Divider().padding(.vertical, 6)
                 Text("最近止めたもの").font(.subheadline)
                 ForEach(store.netLog.recent(limit: 100) { if case .blocked = $0.outcome { return true } else { return false } }) { r in
@@ -1846,6 +1849,114 @@ struct ScriptletStatusRow: View {
                 }
             }
             .disabled(checking)
+        }
+    }
+}
+
+// ======================================================================
+// MARK: - ScriptletSelfTest.swift
+// ======================================================================
+
+// MARK: - スクリプトレットの自己テスト（開発者パネルの「広告ブロック」から）
+//
+// 本物の WKWebView に、今の道具（uBO から作った JSON）とテスト用のルールで組み立てたスクリプトを、タブと同じ形で入れる
+// （main は WKContentWorld.page・isolated は .defaultClient・atDocumentStart・全フレーム）。
+// https://vela-selftest.invalid/ として HTML を開き、ページの中で道具が効いたかを確かめて知らせてもらう。
+// node のテスト（tools/ubo/test_assembled.mjs）では確かめられない XHR・DOM・world の違いを、iPad の WebKit で見るためのもの。
+// 通信はしない（fetch・XHR は blob: の URL に向ける）
+
+@MainActor
+final class ScriptletSelfTest: ObservableObject {
+    struct Result: Identifiable, Equatable {
+        let id = UUID()
+        let name: String
+        let ok: Bool
+        let detail: String
+        static func == (a: Result, b: Result) -> Bool { a.name == b.name && a.ok == b.ok && a.detail == b.detail }
+    }
+
+    @Published private(set) var running = false
+    @Published private(set) var results: [Result] = []
+    @Published private(set) var summary = "まだ動かしていません"
+
+    private var webView: WKWebView?
+    private var bridge: SelfTestBridge?
+    private var timeout: Task<Void, Never>?
+
+    func run(library: ScriptletLibrary?) {
+        guard !running else { return }
+        guard let library, !library.isEmpty else {
+            summary = "道具がありません（広告ブロックの画面で「道具を確かめる」）"
+            return
+        }
+        let (out, unknown) = ScriptletSelfTestPage.assemble(library: library)
+        var notes: [String] = []
+        if !unknown.isEmpty { notes.append("道具に無い: \(unknown.keys.sorted().joined(separator: ", "))") }
+
+        running = true
+        results = []
+        summary = "動かしています…（uBO \(library.ubo)・ルール \(out.filters.count) 個）"
+        let config = WKWebViewConfiguration()
+        let content = config.userContentController
+        if !out.main.isEmpty { content.addUserScript(WKUserScript(source: out.main, injectionTime: .atDocumentStart, forMainFrameOnly: false, in: .page)) }
+        if !out.isolated.isEmpty { content.addUserScript(WKUserScript(source: out.isolated, injectionTime: .atDocumentStart, forMainFrameOnly: false, in: .defaultClient)) }
+        let b = SelfTestBridge()
+        b.onResults = { [weak self] list in
+            let me = self
+            Task { @MainActor in me?.finish(list, notes: notes) }
+        }
+        content.add(b, name: "velaSelfTest")
+        bridge = b
+        let wv = WKWebView(frame: CGRect(x: 0, y: 0, width: 320, height: 240), configuration: config)
+        webView = wv
+        wv.loadHTMLString(ScriptletSelfTestPage.page, baseURL: URL(string: "https://\(ScriptletSelfTestPage.host)/"))
+        timeout = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard let self, self.running else { return }
+            self.finish([], notes: notes + ["15 秒たっても結果が来ません"])
+        }
+    }
+
+    private func finish(_ list: [[String: Any]], notes: [String]) {
+        guard running else { return }
+        timeout?.cancel()
+        results = list.map { Result(name: $0["name"] as? String ?? "?", ok: $0["ok"] as? Bool ?? false, detail: $0["detail"] as? String ?? "") }
+        let ng = results.filter { !$0.ok }.count
+        summary = (results.isEmpty ? "結果がありません" : ng == 0 ? "全部 ○（\(results.count) 個）" : "× が \(ng) 個（\(results.count) 個中）")
+            + (notes.isEmpty ? "" : "・" + notes.joined(separator: "・"))
+        webView?.configuration.userContentController.removeScriptMessageHandler(forName: "velaSelfTest")
+        webView = nil
+        bridge = nil
+        running = false
+    }
+}
+
+final class SelfTestBridge: NSObject, WKScriptMessageHandler {
+    var onResults: (([[String: Any]]) -> Void)?
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        onResults?(message.body as? [[String: Any]] ?? [])
+    }
+}
+
+@MainActor
+struct ScriptletSelfTestView: View {
+    let adblock: AdBlocker
+    @StateObject private var test = ScriptletSelfTest()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("スクリプトレットの自己テスト").font(.subheadline)
+                Spacer()
+                if test.running { ProgressView() }
+                Button("動かす") { test.run(library: adblock.currentScriptletLibrary) }
+                    .disabled(test.running)
+            }
+            DevLine(test.summary)
+            ForEach(test.results) { r in
+                DevLine("\(r.ok ? "○" : "×") \(r.name)\(r.ok || r.detail.isEmpty ? "" : "  [\(r.detail.prefix(200))]")")
+                    .foregroundColor(r.ok ? nil : .red)
+            }
         }
     }
 }
@@ -6358,6 +6469,104 @@ enum ScriptletAssembler {
             "// <<<< end of private namespace",
             "})();",
         ].joined(separator: "\n")
+    }
+}
+
+// MARK: 自己テストのページ（開発者パネルの ScriptletSelfTest が WKWebView で、単体テストが Chrome で開く）
+
+enum ScriptletSelfTestPage {
+    static let host = "vela-selftest.invalid"
+
+    /// テスト用のルール（このテストの中だけ信頼する）
+    static let rules = """
+    vela-selftest.invalid##+js(json-prune, adPlacements playerAds)
+    vela-selftest.invalid##+js(set, ytInitialPlayerResponse.adSlots, undefined)
+    vela-selftest.invalid##+js(trusted-edit-inbound-object, JSON.stringify, 0, [?.context].context.client+={"clientScreen":"CHANNEL"})
+    vela-selftest.invalid##+js(trusted-rpfr, '"fetchAdSlots"', '"no_ads"', blob:)
+    vela-selftest.invalid##+js(json-prune-fetch-response, fetchAdPlacements, , propsToMatch, blob:)
+    vela-selftest.invalid##+js(trusted-replace-xhr-response, '"xhrAdSlots"', '"no_ads"', blob:)
+    vela-selftest.invalid##+js(json-prune-xhr-response, xhrAdPlacements, , propsToMatch, blob:)
+    vela-selftest.invalid##+js(rmnt, script, VELA_RMNT_MARK)
+    vela-selftest.invalid##+js(rpnt, script, __velaRpnt = 1, __velaRpnt = 2)
+    vela-selftest.invalid##+js(trusted-prevent-dom-bypass, Node.prototype.appendChild, fetch)
+    """
+
+    /// ページの中のテスト（結果は velaSelfTest に送る）
+    static let page = #"""
+    <!doctype html><html><head><meta charset="utf-8">
+    <script>window.__velaRmnt = 1; /* VELA_RMNT_MARK */</script>
+    <script>window.__velaRpnt = 1;</script>
+    </head><body>
+    <script>
+    (async function () {
+      const out = [];
+      const t = (name, ok, detail) => out.push({ name, ok: !!ok, detail: String(detail ?? '') });
+      const blobURL = (obj) => URL.createObjectURL(new Blob([JSON.stringify(obj)], { type: 'application/json' }));
+      const xhr = (u, type) => new Promise((res) => {
+        const x = new XMLHttpRequest();
+        x.open('GET', u);
+        if (type) x.responseType = type;
+        x.onload = () => res(type === 'json' ? x.response : x.responseText);
+        x.onerror = () => res(null);
+        x.send();
+      });
+      try {
+        const p = JSON.parse('{"adPlacements":[1],"playerAds":[2],"keep":1}');
+        t('json-prune（JSON.parse）', p.adPlacements === undefined && p.playerAds === undefined && p.keep === 1, JSON.stringify(p));
+      } catch (e) { t('json-prune（JSON.parse）', false, e); }
+      try {
+        window.ytInitialPlayerResponse = { adSlots: [1], keep: 1 };
+        const y = window.ytInitialPlayerResponse;
+        t('set-constant（後から入れたオブジェクトの中）', y && y.adSlots === undefined && y.keep === 1, JSON.stringify(y));
+      } catch (e) { t('set-constant', false, e); }
+      try {
+        const s = JSON.stringify({ context: { client: { clientName: 'WEB' } } });
+        t('trusted-edit-inbound-object（送る JSON を変える）', s.includes('"clientScreen":"CHANNEL"'), s);
+      } catch (e) { t('trusted-edit-inbound-object', false, e); }
+      try {
+        const txt = await (await fetch(blobURL({ fetchAdSlots: [1], keep: 1 }))).text();
+        t('trusted-replace-fetch-response（fetch の中身）', txt.includes('"no_ads"') && !txt.includes('"fetchAdSlots"'), txt);
+      } catch (e) { t('trusted-replace-fetch-response', false, e); }
+      try {
+        const j = await (await fetch(blobURL({ fetchAdPlacements: [1], keep: 1 }))).json();
+        t('json-prune-fetch-response（Response.json）', j.fetchAdPlacements === undefined && j.keep === 1, JSON.stringify(j));
+      } catch (e) { t('json-prune-fetch-response', false, e); }
+      try {
+        const txt = await xhr(blobURL({ xhrAdSlots: [1], keep: 1 }), '');
+        t('trusted-replace-xhr-response（XHR の文字）', txt && txt.includes('"no_ads"') && !txt.includes('"xhrAdSlots"'), txt);
+      } catch (e) { t('trusted-replace-xhr-response', false, e); }
+      try {
+        const j = await xhr(blobURL({ xhrAdPlacements: [1], keep: 1 }), 'json');
+        t('json-prune-xhr-response（XHR の json）', j && j.xhrAdPlacements === undefined && j.keep === 1, JSON.stringify(j));
+      } catch (e) { t('json-prune-xhr-response', false, e); }
+      t('remove-node-text（isolated world・script の中を消す）', window.__velaRmnt === undefined, window.__velaRmnt);
+      t('trusted-replace-node-text（isolated world・script の中を書き換える）', window.__velaRpnt === 2, window.__velaRpnt);
+      try {
+        const f = document.createElement('iframe');
+        document.body.appendChild(f);
+        t('trusted-prevent-dom-bypass（iframe から元の fetch を取らせない）', f.contentWindow.fetch === window.fetch, '');
+        f.remove();
+      } catch (e) { t('trusted-prevent-dom-bypass', false, e); }
+      t('道具の中の関数がページから見えない（private namespace）', typeof window.jsonPrune === 'undefined' && typeof window.safeSelf === 'undefined', '');
+      window.webkit.messageHandlers.velaSelfTest.postMessage(out);
+    })();
+    </script></body></html>
+    """#
+
+    /// テスト用のルールを今の道具で組み立てる
+    static func assemble(library: ScriptletLibrary) -> (output: ScriptletAssembler.Output, unknown: [String: Int]) {
+        var idx = ScriptletIndex()
+        for f in ABPParser.parse(rules).scriptlets { idx.add(f, trusted: true, library: library) }
+        let sel = idx.retrieve(url: URL(string: "https://\(host)/")!)
+        return (ScriptletAssembler.assemble([(host, sel)], library: library), idx.unknown)
+    }
+
+    /// Chrome で開く形（world が無いので、両方ともページの先頭に入れる。結果は #vela-result に書く）。tools/ubo/test_assembled.mjs が使う
+    static func chromeHarness(_ out: ScriptletAssembler.Output) -> String {
+        let harness = "<script>window.webkit={messageHandlers:{velaSelfTest:{postMessage:function(r){var p=document.createElement('pre');p.id='vela-result';p.textContent=JSON.stringify(r);document.documentElement.appendChild(p);}}}};</script>"
+        func tag(_ js: String) -> String { js.isEmpty ? "" : "<script>" + js.replacingOccurrences(of: "</script", with: "<\\/script") + "</script>" }
+        let head = "<head><meta charset=\"utf-8\">"
+        return page.replacingOccurrences(of: head, with: head + harness + tag(out.main) + tag(out.isolated))
     }
 }
 

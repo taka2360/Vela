@@ -3,7 +3,7 @@
 
 使い方（プロジェクトのルートで）:
   python tools/merge_swift.py              # → Playgrounds/VelaAll.swift（@main 付き。Playgrounds の「App」用）
-                                           #   と Playgrounds/VelaParts/Vela1〜10.swift（同じ中身を 10 個に分けたもの）
+                                           #   と Playgrounds/VelaParts/Vela1〜11.swift（同じ中身を 11 個に分けたもの）
   python tools/merge_swift.py --parts 8    # 分ける数を変える（0 なら分けたものは作らない）
   python tools/merge_swift.py -o out.swift # 出力先を変える（Playgrounds/ からの相対）
   python tools/merge_swift.py --playground # @main を外し、PlaygroundSupport のライブビューで動かす版
@@ -21,7 +21,7 @@ from pathlib import Path
 
 # つなげる順（ここに無いファイルは警告を出して、最後に名前順で足す）
 ORDER = [
-    "MyApp", "BrowserView", "BrowserControls", "TabViews", "LibraryView", "DevPanel", "DevPanelPages", "SettingsView", "AdBlockView", "Downloads", "SharedViews", "DownloadManager", "DownloadFiles", "BrowserModels", "BrowserStore", "BrowserTab", "TabWebDelegate", "Library", "LibraryModel", "AddressInput", "ErrorPages", "NetLog", "FilterLists", "FilterCatalog", "FilterPreparser", "ABPFilter", "Scriptlets", "ScriptletVerify", "BlockEngine", "ContentBlocker", "Persistence", "DevLog", "CrashLog", "VNetScheme", "HTTPSTakeover", "PageScripts",
+    "MyApp", "BrowserView", "BrowserControls", "TabViews", "LibraryView", "DevPanel", "DevPanelPages", "SettingsView", "AdBlockView", "ScriptletSelfTest", "Downloads", "SharedViews", "DownloadManager", "DownloadFiles", "BrowserModels", "BrowserStore", "BrowserTab", "TabWebDelegate", "Library", "LibraryModel", "AddressInput", "ErrorPages", "NetLog", "FilterLists", "FilterCatalog", "FilterPreparser", "ABPFilter", "Scriptlets", "ScriptletVerify", "BlockEngine", "ContentBlocker", "Persistence", "DevLog", "CrashLog", "VNetScheme", "HTTPSTakeover", "PageScripts",
     "NetPolicy", "SiteUtil", "Cookies", "RedirectPolicy", "LocalNetworkPolicy", "CookieJar", "HSTSStore",
     "HTTPClient", "HTTPRequestBytes", "HTTPResponseParser", "HTTPSupport", "TLSClient",
     "GuestStack", "GuestTCP", "DNSMessage", "Packet",
@@ -88,7 +88,7 @@ def main():
     ap.add_argument("-d", "--dir", default=project / "Sources", type=Path, help="入力フォルダ（サブフォルダも読む）")
     ap.add_argument("--out-dir", default=project / "Playgrounds", type=Path, help="出力フォルダ")
     ap.add_argument("-o", "--output", default="VelaAll.swift", help="出力ファイル名（出力フォルダからの相対）")
-    ap.add_argument("--parts", type=int, default=10,
+    ap.add_argument("--parts", type=int, default=11,
                     help="VelaParts/ に、同じ中身をこの数のファイルに分けたものも作る（0 で作らない）。"
                          "Playgrounds は 1 つのファイルが大きいと、作るのが 30 秒を超えて止まる（thunk の時間切れ）ため")
     ap.add_argument("--playground", action="store_true",

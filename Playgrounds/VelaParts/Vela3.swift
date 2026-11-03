@@ -1,5 +1,5 @@
 // このファイルは merge_swift.py で自動生成したものです（直接編集しないでください）
-// VelaParts の 3 / 10。全部まとめて Playgrounds に入れる（VelaAll.swift とは一緒に入れない）
+// VelaParts の 3 / 11。全部まとめて Playgrounds に入れる（VelaAll.swift とは一緒に入れない）
 
 import SwiftUI
 import WebKit
@@ -16,6 +16,115 @@ import Compression
 #if canImport(Security)
 import Security
 #endif
+
+// ======================================================================
+// MARK: - BrowserModels.swift
+// ======================================================================
+
+// MARK: - アプリ全体で使う小さな型（通信の作り・JS のダイアログ・保存するタブ・セッション）
+
+/// 通信の作り（タブごと）
+enum NetMode: String, Codable {
+    /// https・http をそのまま VNetScheme が引き受ける（アドレスは本物の https://…）
+    case vnetDirect = "VNet"
+    /// 予備の vnets://… の作り（開発者向けの実験。CSP などを外すので安全ではない）
+    case vnetsLegacy = "VNet（vnets://・実験）"
+    /// 標準の通信（WebKit 内蔵）
+    case native = "標準"
+
+    var usesVNet: Bool { self != .native }
+    var short: String {
+        switch self { case .vnetDirect: return "VNet"; case .vnetsLegacy: return "vnets"; case .native: return "標準" }
+    }
+}
+
+/// ページの JavaScript からのダイアログ（alert・confirm・prompt）
+struct JSDialog: Identifiable {
+    enum Kind { case alert, confirm, prompt(String) }
+    let id = UUID()
+    let kind: Kind
+    let message: String
+    /// 出したタブ（タブを閉じたとき、そのタブのものを取り消すのに使う）
+    let tabID: Int
+    /// 出したページのホスト（見出しの「〇〇 より」）。頼まれたときに決め、後で URL が変わっても変えない
+    let host: String
+    /// (OK か, prompt の入力)
+    let respond: (Bool, String?) -> Void
+
+    /// 見出し（host が空なら「 より」）
+    var title: String { host + " より" }
+
+    /// ホストの決め方: フレームのオリジンのホスト。空なら、そのときのタブの URL のホスト。それも無ければ空（小文字にはしない）
+    static func originHost(frameHost: String, tabURL: URL?) -> String {
+        frameHost.isEmpty ? (tabURL?.host ?? "") : frameHost
+    }
+}
+
+/// JavaScript のダイアログの順番待ち（決まりは全部ここ。画面のスレッドだけで使う）。
+/// ・出すのは 1 つだけ（current）。残りは全部のタブで 1 本の列に、来た順で並ぶ
+/// ・答えたとき: ①今のを外す ②その respond を (ok, ok ? 入力 : nil) で呼ぶ ③列の先頭を出す
+///   （入力欄は、prompt ならその既定値、それ以外は ""）
+/// ・タブを閉じたとき: ①列の中のそのタブのものを、並び順に (false, nil) で答えて外す
+///   ②出しているものがそのタブのものなら、「答えたとき」と同じ手順を false で行う（次はほかのタブのものでもよい）
+/// ・どのダイアログの respond も、ちょうど 1 回だけ呼ぶ（WebKit の完了を 2 回呼ぶと落ちるため）
+final class DialogQueue {
+    /// いま出しているダイアログ
+    private(set) var current: JSDialog? { willSet { willChange?() } }
+    /// prompt の入力欄
+    var input = "" { willSet { willChange?() } }
+    /// 順番待ち（変わっても willChange は呼ばない。画面に出ないため）
+    private var waiting: [JSDialog] = []
+    /// current・input が変わる直前に呼ぶ（画面に知らせる）
+    var willChange: (() -> Void)?
+
+    var waitingCount: Int { waiting.count }
+
+    func present(_ d: JSDialog) {
+        if current == nil { show(d) } else { waiting.append(d) }
+    }
+
+    private func show(_ d: JSDialog) {
+        if case .prompt(let def) = d.kind { input = def } else { input = "" }
+        current = d
+    }
+
+    /// 出しているダイアログを閉じる（ok: OK を押したか）。何も出ていなければ何もしない
+    func answer(ok: Bool) {
+        guard let d = current else { return }
+        current = nil
+        d.respond(ok, ok ? input : nil)
+        if !waiting.isEmpty { show(waiting.removeFirst()) }
+    }
+
+    /// そのタブのダイアログを全部取り消す（タブを閉じたとき）
+    func cancel(tabID: Int) {
+        let mine = waiting.filter { $0.tabID == tabID }
+        waiting.removeAll { $0.tabID == tabID }
+        for d in mine { d.respond(false, nil) }
+        if let d = current, d.tabID == tabID { answer(ok: false) }
+    }
+}
+
+/// 保存するタブ
+struct SavedTab: Codable {
+    var id: Int
+    var url: String?
+    var title: String
+    var mode: NetMode
+    /// WebKit の戻る/進むの履歴（WKWebView.interactionState）
+    var state: Data?
+}
+
+/// ブックマーク・履歴の画面のどちらを見せるか
+enum LibraryPage: String, CaseIterable, Hashable {
+    case bookmarks = "ブックマーク"
+    case history = "履歴"
+}
+
+struct SessionData: Codable {
+    var tabs: [SavedTab]
+    var selected: Int?
+}
 
 // ======================================================================
 // MARK: - BrowserStore.swift
@@ -1138,163 +1247,5 @@ final class BrowserTab: ObservableObject, Identifiable {
         default:
             break
         }
-    }
-}
-
-// ======================================================================
-// MARK: - TabWebDelegate.swift
-// ======================================================================
-
-// MARK: - WebKit のデリゲート（タブ 1 枚に 1 つ）
-
-@MainActor
-final class TabWebDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
-    weak var tab: BrowserTab?
-
-    init(tab: BrowserTab) {
-        self.tab = tab
-        super.init()
-    }
-
-    // リンクを押したとき: ダウンロードの指定（<a download>）・HTTPS-First（標準の通信）・vnets:// の作りの読み替え
-    // Objective-C の名前を明示する（Playgrounds のプレビューは関数名を __preview_ に変えるので、2 つの async 版が同じ名前になってぶつかる）
-    @objc(webView:decidePolicyForNavigationAction:decisionHandler:)
-    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
-        guard let tab else { return .allow }
-        if navigationAction.shouldPerformDownload {
-            // VNet のタブの http(s) は、WebKit のダウンロードにしない（落ちるため）。VNet で読んでファイルに書く
-            if tab.mode.usesVNet, let u = navigationAction.request.url, let s = u.scheme?.lowercased(), s == "http" || s == "https" {
-                tab.startDownload(VNetURL.toReal(u) ?? u)
-                return .cancel
-            }
-            return .download
-        }
-        let main = navigationAction.targetFrame?.isMainFrame ?? true
-        if main, let u = navigationAction.request.url { tab.applyAdBlock(for: VNetURL.toReal(u) ?? u) }
-        // サブフレーム: 読み込む前にそのホストのスクリプトレットを足す（uBO もフレームのホストごとに選ぶ）
-        if !main, let u = navigationAction.request.url { tab.noteSubframe(u) }
-        if main, let u = navigationAction.request.url, let up = tab.httpsFirstUpgrade(u) {
-            webView.load(URLRequest(url: up))
-            return .cancel
-        }
-        guard tab.mode == .vnetsLegacy else { return .allow }
-        if let u = navigationAction.request.url, let s = u.scheme?.lowercased(), s == "http" || s == "https",
-           navigationAction.targetFrame?.isMainFrame ?? true, let v = VNetURL.toVNet(u) {
-            webView.load(URLRequest(url: v))
-            return .cancel
-        }
-        return .allow
-    }
-
-    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-        tab?.didStartNavigation()
-        tab?.navigationEvent("読み込み開始: \(webView.url?.absoluteString ?? "")")
-    }
-
-    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-        tab?.didCommitNavigation()
-    }
-
-    /// 表示できない種類（zip・PDF の一部など）や「添付ファイル」の指定なら、ダウンロードにする
-    @objc(webView:decidePolicyForNavigationResponse:decisionHandler:)
-    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse) async -> WKNavigationResponsePolicy {
-        var attachment = false
-        if let http = navigationResponse.response as? HTTPURLResponse {
-            // 204 No Content: 移動しない（VNet がダウンロードに変えたときにも返す。ここでダウンロードを始めると二重になる）
-            if http.statusCode == 204 { return .cancel }
-            let cd = http.allHeaderFields.first { ($0.key as? String)?.lowercased() == "content-disposition" }?.value as? String
-            if let cd, cd.lowercased().hasPrefix("attachment") { attachment = true }
-        }
-        guard attachment || !navigationResponse.canShowMIMEType else { return .allow }
-        // VNet のタブ: WebKit のダウンロードにはしない（VNetScheme の読み込みを変えると落ちる）。止めて、VNet で読み直してファイルに書く
-        if let tab, tab.mode.usesVNet, let u = navigationResponse.response.url {
-            tab.startDownload(VNetURL.toReal(u) ?? u)
-            return .cancel
-        }
-        return .download
-    }
-
-    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
-        tab?.adoptDownload(download, source: navigationAction.request.url)
-    }
-
-    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
-        tab?.adoptDownload(download, source: navigationResponse.response.url)
-    }
-
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        tab?.navigationEvent("読み込み完了: \(webView.title ?? "")")
-        tab?.didFinish()
-    }
-
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        tab?.navigationEvent("✕ 読み込みに失敗: \(error.localizedDescription)", level: .error)
-        tab?.syncFromWebView()
-    }
-
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        tab?.navigationEvent("✕ 読み込みに失敗: \(error.localizedDescription)", level: .error)
-        tab?.showLoadError(error)
-        tab?.syncFromWebView()
-    }
-
-    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        tab?.processTerminated()
-    }
-
-    // MARK: WKUIDelegate
-
-    /// target=_blank・window.open: 新しいタブにする
-    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
-                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        tab?.popup(configuration: configuration)
-    }
-
-    func webViewDidClose(_ webView: WKWebView) {
-        tab?.closeByPage()
-    }
-
-    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async {
-        guard let tab else { return }
-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-            tab.presentDialog(.alert, message: message, frame: frame) { _, _ in c.resume() }
-        }
-    }
-
-    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async -> Bool {
-        guard let tab else { return false }
-        return await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
-            tab.presentDialog(.confirm, message: message, frame: frame) { ok, _ in c.resume(returning: ok) }
-        }
-    }
-
-    func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?,
-                 initiatedByFrame frame: WKFrameInfo) async -> String? {
-        guard let tab else { return nil }
-        return await withCheckedContinuation { (c: CheckedContinuation<String?, Never>) in
-            tab.presentDialog(.prompt(defaultText ?? ""), message: prompt, frame: frame) { ok, text in c.resume(returning: ok ? (text ?? "") : nil) }
-        }
-    }
-
-    /// リンクの長押しメニュー: 「新しいタブで開く」などを足す（WebKit の元のメニューも残す）
-    func webView(_ webView: WKWebView, contextMenuConfigurationForElement elementInfo: WKContextMenuElementInfo,
-                 completionHandler: @escaping (UIContextMenuConfiguration?) -> Void) {
-        guard let link = elementInfo.linkURL else { completionHandler(nil); return }
-        let real = VNetURL.toReal(link) ?? link
-        let config = UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] suggested in
-            let open = UIAction(title: "新しいタブで開く", image: UIImage(systemName: "plus.square.on.square")) { _ in
-                let d = self
-                Task { @MainActor in d?.tab?.openInNewTab(real, select: true) }
-            }
-            let back = UIAction(title: "裏のタブで開く", image: UIImage(systemName: "square.on.square")) { _ in
-                let d = self
-                Task { @MainActor in d?.tab?.openInNewTab(real, select: false) }
-            }
-            let copy = UIAction(title: "リンクをコピー", image: UIImage(systemName: "doc.on.doc")) { _ in
-                UIPasteboard.general.url = real
-            }
-            return UIMenu(title: real.absoluteString, children: [open, back, copy] + suggested)
-        }
-        completionHandler(config)
     }
 }

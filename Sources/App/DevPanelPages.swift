@@ -174,10 +174,13 @@ struct DevAdBlockPage: View {
                 DevLine("状態: \(adblock.enabled ? "使う" : "止めている")・\(adblock.status)")
                 DevLine("VNet 用のルール \(adblock.ruleCount) 個・起動してから止めた数 \(adblock.totalBlocked)")
                 DevLine("止めているサイト: \(adblock.disabledSites.isEmpty ? "なし" : adblock.disabledSites.sorted().joined(separator: ", "))")
+                DevLine("スクリプトレット: \(adblock.scriptletRuleCount) 個・道具 \(adblock.scriptletStatus)")
                 ForEach(adblock.lists) { l in
-                    DevLine("\(l.enabled ? "●" : "○") \(l.name): 通信 \(l.networkRules)・隠す \(l.cosmeticRules)・対応外 \(l.unsupported)"
+                    DevLine("\(l.enabled ? "●" : "○") \(l.name): 通信 \(l.networkRules)・隠す \(l.cosmeticRules)・スクリプト \(l.scriptletRules ?? 0)・対応外 \(l.unsupported)"
                             + "・WebKit \(l.netID == nil ? "なし" : "通信あり")/\(l.cosID == nil ? "なし" : "隠すあり")\(l.lastError.map { "・⚠️ \($0)" } ?? "")")
                 }
+                Divider().padding(.vertical, 6)
+                ScriptletSelfTestView(adblock: adblock)
                 Divider().padding(.vertical, 6)
                 Text("最近止めたもの").font(.subheadline)
                 ForEach(store.netLog.recent(limit: 100) { if case .blocked = $0.outcome { return true } else { return false } }) { r in

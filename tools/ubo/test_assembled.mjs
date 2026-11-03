@@ -3,8 +3,13 @@
 // ・main.js / isolated.js が JS として正しいこと（両方とも (function(){…})(); で、読み込んだだけで動くこと）
 // ・テスト用のホスト（vela-selftest.invalid）で、JSON.parse・fetch・JSON.stringify・set-constant の道具が本当に効くこと
 // ・www.youtube.com の本物の行を入れても、道具を仕掛ける所で例外が出ないこと（出たら数を出す）
-// XHR・DOM・WKWebView の world の違いは、アプリの自己テスト（開発者パネル）で確かめる
+// ・Chrome（headless）があれば、自己テストのページ（selftest.html）を開き、XHR・DOM（script の中の書き換え）・iframe まで確かめる
+// WKWebView の world の違い（isolated）は、アプリの自己テスト（開発者パネル）で確かめる
 import { readFileSync, existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import http from 'node:http';
+import * as child from 'node:child_process';
+const require_child = () => child;
 import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
@@ -136,6 +141,38 @@ for (const [label, code] of [['main.js', main], ['isolated.js', isolated]]) {
     const errs = [...ctx.__errors, ...ictx.__errors];
     // 偽のページでは DOM が足りないので、仕掛ける所の例外は数だけ出す（失敗にしない）
     console.log(`  （www.youtube.com: 道具を仕掛ける所の例外 ${errs.length} 個${errs.length ? ': ' + errs.map(x => x.split('\n')[0]).slice(0, 3).join(' / ') : ''}）`);
+}
+
+// 5. 自己テストのページを headless の Chrome で
+const chrome = [process.env.CHROME, 'C:/Program Files/Google/Chrome/Application/chrome.exe',
+    'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', '/usr/bin/google-chrome', '/usr/bin/chromium-browser', '/usr/bin/chromium']
+    .find(p => p && existsSync(p));
+const selftest = path.join(out, 'selftest.html');
+if (!chrome || !existsSync(selftest)) {
+    console.log(`  （Chrome ${chrome ? 'はある' : 'が無い'}・selftest.html ${existsSync(selftest) ? 'はある' : 'が無い'}: 自己テストのページは飛ばします）`);
+} else {
+    const html = readFileSync(selftest);
+    const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(html); });
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    const port = server.address().port;
+    let dom = '';
+    try {
+        dom = await new Promise((resolve) => {
+            const { execFile } = require_child();
+            execFile(chrome, ['--headless=new', '--disable-gpu', '--no-sandbox', '--no-first-run', '--virtual-time-budget=8000',
+                `--host-resolver-rules=MAP vela-selftest.invalid 127.0.0.1`, '--dump-dom', `http://vela-selftest.invalid:${port}/`],
+                { timeout: 60000, maxBuffer: 16 << 20 }, (err, stdout) => resolve(String(stdout || '')));
+        });
+    } finally {
+        server.close();
+    }
+    const m = /<pre id="vela-result">([\s\S]*?)<\/pre>/.exec(dom);
+    if (!m) {
+        check('自己テストのページ（Chrome）が結果を書く', false, dom.slice(0, 300));
+    } else {
+        const text = m[1].replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+        for (const r of JSON.parse(text)) check(`Chrome: ${r.name}`, r.ok, r.detail);
+    }
 }
 
 console.log(failed === 0 ? '結果: OK' : `結果: NG（${failed} 個）`);

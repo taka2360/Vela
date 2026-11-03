@@ -1,5 +1,5 @@
 // このファイルは merge_swift.py で自動生成したものです（直接編集しないでください）
-// VelaParts の 4 / 10。全部まとめて Playgrounds に入れる（VelaAll.swift とは一緒に入れない）
+// VelaParts の 4 / 11。全部まとめて Playgrounds に入れる（VelaAll.swift とは一緒に入れない）
 
 import SwiftUI
 import WebKit
@@ -16,6 +16,164 @@ import Compression
 #if canImport(Security)
 import Security
 #endif
+
+// ======================================================================
+// MARK: - TabWebDelegate.swift
+// ======================================================================
+
+// MARK: - WebKit のデリゲート（タブ 1 枚に 1 つ）
+
+@MainActor
+final class TabWebDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
+    weak var tab: BrowserTab?
+
+    init(tab: BrowserTab) {
+        self.tab = tab
+        super.init()
+    }
+
+    // リンクを押したとき: ダウンロードの指定（<a download>）・HTTPS-First（標準の通信）・vnets:// の作りの読み替え
+    // Objective-C の名前を明示する（Playgrounds のプレビューは関数名を __preview_ に変えるので、2 つの async 版が同じ名前になってぶつかる）
+    @objc(webView:decidePolicyForNavigationAction:decisionHandler:)
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
+        guard let tab else { return .allow }
+        if navigationAction.shouldPerformDownload {
+            // VNet のタブの http(s) は、WebKit のダウンロードにしない（落ちるため）。VNet で読んでファイルに書く
+            if tab.mode.usesVNet, let u = navigationAction.request.url, let s = u.scheme?.lowercased(), s == "http" || s == "https" {
+                tab.startDownload(VNetURL.toReal(u) ?? u)
+                return .cancel
+            }
+            return .download
+        }
+        let main = navigationAction.targetFrame?.isMainFrame ?? true
+        if main, let u = navigationAction.request.url { tab.applyAdBlock(for: VNetURL.toReal(u) ?? u) }
+        // サブフレーム: 読み込む前にそのホストのスクリプトレットを足す（uBO もフレームのホストごとに選ぶ）
+        if !main, let u = navigationAction.request.url { tab.noteSubframe(u) }
+        if main, let u = navigationAction.request.url, let up = tab.httpsFirstUpgrade(u) {
+            webView.load(URLRequest(url: up))
+            return .cancel
+        }
+        guard tab.mode == .vnetsLegacy else { return .allow }
+        if let u = navigationAction.request.url, let s = u.scheme?.lowercased(), s == "http" || s == "https",
+           navigationAction.targetFrame?.isMainFrame ?? true, let v = VNetURL.toVNet(u) {
+            webView.load(URLRequest(url: v))
+            return .cancel
+        }
+        return .allow
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        tab?.didStartNavigation()
+        tab?.navigationEvent("読み込み開始: \(webView.url?.absoluteString ?? "")")
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        tab?.didCommitNavigation()
+    }
+
+    /// 表示できない種類（zip・PDF の一部など）や「添付ファイル」の指定なら、ダウンロードにする
+    @objc(webView:decidePolicyForNavigationResponse:decisionHandler:)
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse) async -> WKNavigationResponsePolicy {
+        var attachment = false
+        if let http = navigationResponse.response as? HTTPURLResponse {
+            // 204 No Content: 移動しない（VNet がダウンロードに変えたときにも返す。ここでダウンロードを始めると二重になる）
+            if http.statusCode == 204 { return .cancel }
+            let cd = http.allHeaderFields.first { ($0.key as? String)?.lowercased() == "content-disposition" }?.value as? String
+            if let cd, cd.lowercased().hasPrefix("attachment") { attachment = true }
+        }
+        guard attachment || !navigationResponse.canShowMIMEType else { return .allow }
+        // VNet のタブ: WebKit のダウンロードにはしない（VNetScheme の読み込みを変えると落ちる）。止めて、VNet で読み直してファイルに書く
+        if let tab, tab.mode.usesVNet, let u = navigationResponse.response.url {
+            tab.startDownload(VNetURL.toReal(u) ?? u)
+            return .cancel
+        }
+        return .download
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        tab?.adoptDownload(download, source: navigationAction.request.url)
+    }
+
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        tab?.adoptDownload(download, source: navigationResponse.response.url)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        tab?.navigationEvent("読み込み完了: \(webView.title ?? "")")
+        tab?.didFinish()
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        tab?.navigationEvent("✕ 読み込みに失敗: \(error.localizedDescription)", level: .error)
+        tab?.syncFromWebView()
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        tab?.navigationEvent("✕ 読み込みに失敗: \(error.localizedDescription)", level: .error)
+        tab?.showLoadError(error)
+        tab?.syncFromWebView()
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        tab?.processTerminated()
+    }
+
+    // MARK: WKUIDelegate
+
+    /// target=_blank・window.open: 新しいタブにする
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        tab?.popup(configuration: configuration)
+    }
+
+    func webViewDidClose(_ webView: WKWebView) {
+        tab?.closeByPage()
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async {
+        guard let tab else { return }
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            tab.presentDialog(.alert, message: message, frame: frame) { _, _ in c.resume() }
+        }
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async -> Bool {
+        guard let tab else { return false }
+        return await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
+            tab.presentDialog(.confirm, message: message, frame: frame) { ok, _ in c.resume(returning: ok) }
+        }
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?,
+                 initiatedByFrame frame: WKFrameInfo) async -> String? {
+        guard let tab else { return nil }
+        return await withCheckedContinuation { (c: CheckedContinuation<String?, Never>) in
+            tab.presentDialog(.prompt(defaultText ?? ""), message: prompt, frame: frame) { ok, text in c.resume(returning: ok ? (text ?? "") : nil) }
+        }
+    }
+
+    /// リンクの長押しメニュー: 「新しいタブで開く」などを足す（WebKit の元のメニューも残す）
+    func webView(_ webView: WKWebView, contextMenuConfigurationForElement elementInfo: WKContextMenuElementInfo,
+                 completionHandler: @escaping (UIContextMenuConfiguration?) -> Void) {
+        guard let link = elementInfo.linkURL else { completionHandler(nil); return }
+        let real = VNetURL.toReal(link) ?? link
+        let config = UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] suggested in
+            let open = UIAction(title: "新しいタブで開く", image: UIImage(systemName: "plus.square.on.square")) { _ in
+                let d = self
+                Task { @MainActor in d?.tab?.openInNewTab(real, select: true) }
+            }
+            let back = UIAction(title: "裏のタブで開く", image: UIImage(systemName: "square.on.square")) { _ in
+                let d = self
+                Task { @MainActor in d?.tab?.openInNewTab(real, select: false) }
+            }
+            let copy = UIAction(title: "リンクをコピー", image: UIImage(systemName: "doc.on.doc")) { _ in
+                UIPasteboard.general.url = real
+            }
+            return UIMenu(title: real.absoluteString, children: [open, back, copy] + suggested)
+        }
+        completionHandler(config)
+    }
+}
 
 // ======================================================================
 // MARK: - Library.swift
@@ -1298,79 +1456,5 @@ final class AdBlocker: ObservableObject {
 
     private func saveState() {
         stateFile.save(AdBlockState(lists: lists, lastAutoUpdate: lastAutoUpdate, scriptletsChecked: scriptletsChecked))
-    }
-}
-
-// ======================================================================
-// MARK: - FilterCatalog.swift
-// ======================================================================
-
-// MARK: - 広告ブロックのリストの一覧（組み込みのもの）と、保存する形
-// UI・WebKit に頼らない（テストできるように FilterLists.swift から分けた）
-
-struct FilterListInfo: Codable, Identifiable, Equatable {
-    var id: String
-    var name: String
-    var url: String
-    var enabled: Bool
-    var builtIn: Bool
-    var lastUpdated: Date?
-    var networkRules = 0
-    var cosmeticRules = 0
-    var unsupported = 0
-    var lastError: String?
-    /// スクリプトレットの行の数・リストの「! Expires:」（時間）。古い adblock.json には無いので Optional
-    var scriptletRules: Int?
-    var expiresHours: Int?
-    /// コンパイル済みの WebKit のルールの名前
-    var netID: String?
-    var cosID: String?
-}
-
-struct AdBlockState: Codable {
-    var lists: [FilterListInfo]
-    var lastAutoUpdate: Date?
-    /// スクリプトレットの道具を最後に確かめた時
-    var scriptletsChecked: Date?
-}
-
-/// タブに入れるスクリプトレット（ScriptletAssembler の結果と、入れ替えの判定に使う印）
-struct ScriptletInjection: Equatable {
-    var key: String
-    var main: String
-    var isolated: String
-    var filters: [String]
-}
-
-enum FilterCatalog {
-    static let lists: [FilterListInfo] = [
-        FilterListInfo(id: "easylist", name: "EasyList（広告）", url: "https://easylist.to/easylist/easylist.txt", enabled: true, builtIn: true),
-        FilterListInfo(id: "easyprivacy", name: "EasyPrivacy（トラッカー）", url: "https://easylist.to/easylist/easyprivacy.txt", enabled: true, builtIn: true),
-        FilterListInfo(id: "adguard-ja", name: "AdGuard Japanese（日本の広告）", url: "https://filters.adtidy.org/extension/ublock/filters/7.txt", enabled: true, builtIn: true),
-        FilterListInfo(id: "ublock-filters", name: "uBlock filters（YouTube など）", url: "https://ublockorigin.github.io/uAssets/filters/filters.txt", enabled: true, builtIn: true),
-        FilterListInfo(id: "ublock-quick-fixes", name: "uBlock filters – Quick fixes（すぐの直し）", url: "https://ublockorigin.github.io/uAssets/filters/quick-fixes.txt", enabled: true, builtIn: true),
-    ]
-    /// trusted の道具（trusted-*・rpnt など）を使ってよいリスト。uBO も自分のリスト（ublock-）だけを信頼する
-    static let trustedIDs: Set<String> = ["ublock-filters", "ublock-quick-fixes"]
-
-    /// そのリストの行が trusted の道具を使ってよいか（組み込みの一覧にあって、URL も一覧と同じもの。保存ファイルの id だけでは信じない）
-    static func isTrusted(_ l: FilterListInfo) -> Bool {
-        trustedIDs.contains(l.id) && lists.contains { $0.id == l.id && $0.url == l.url }
-    }
-
-    /// 保存してあった一覧と組み込みの一覧を合わせる。組み込みのものは名前と URL を一覧のもので上書きする（保存ファイルで偽れないように）。
-    /// 一覧に無いのに「組み込み」になっているものは、自分で足したものとして扱う
-    static func merge(saved: [FilterListInfo]) -> [FilterListInfo] {
-        var merged = saved.map { l -> FilterListInfo in
-            var l = l
-            if let c = lists.first(where: { $0.id == l.id }) {
-                l.name = c.name; l.url = c.url; l.builtIn = true
-            } else {
-                l.builtIn = false
-            }
-            return l
-        }
-        for c in lists where !merged.contains(where: { $0.id == c.id }) { merged.append(c) }
-        return merged
     }
 }

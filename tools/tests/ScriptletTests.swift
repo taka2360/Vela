@@ -248,6 +248,20 @@ func scriptletTests() {
         expectEqual(st.scriptletsChecked, nil)
     }
 
+    test("自己テストのページ: ルールが全部読めて、Chrome で開く形を書く") {
+        let parsed = ABPParser.parse(ScriptletSelfTestPage.rules)
+        expectEqual(parsed.unsupported, 0)
+        let (out, unknown) = ScriptletSelfTestPage.assemble(library: lib)
+        expectEqual(unknown, [:])
+        expectEqual(out.filters.count, parsed.scriptlets.count)
+        expect(!out.main.isEmpty && !out.isolated.isEmpty)
+        let html = ScriptletSelfTestPage.chromeHarness(out)
+        expect(html.contains("vela-result") && html.contains(out.main.prefix(40)))
+        let dir = projectRoot.appendingPathComponent("tools/ubo/.out", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? Data(html.utf8).write(to: dir.appendingPathComponent("selftest.html"))
+    }
+
     test("decompile（ログの形）") {
         expectEqual(ScriptletIndex.decompile(#"["json-prune","a b",""]"#, isException: false), "##+js(json-prune, a b, '')")
         expectEqual(ScriptletIndex.decompile(#"["x","a,b"]"#, isException: true), "#@#+js(x, 'a,b')")

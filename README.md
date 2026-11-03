@@ -30,7 +30,8 @@ UserNet（小さなルーター）→ Network.framework → インターネッ�
 - **HTTPS-First** と **HSTS**
 - **ストリーミング読み込み**（ヘッダが来たらすぐ渡し、中身は届いた分ずつ。大きいファイル・動画でもメモリにためない）
 - **ダウンロード**（進み具合・取り消し・共有）
-- **広告・トラッカーのブロック**（EasyList・EasyPrivacy・AdGuard Japanese）
+- **広告・トラッカーのブロック**（EasyList・EasyPrivacy・AdGuard Japanese・uBlock filters）
+- **YouTube などの広告をページの中で消す**（uBlock Origin のスクリプトレット `##+js(…)`。リストと道具は自動で更新するので、YouTube が変わってもコードは直さない）
 - **Cookie の決まり・LAN の保護**などの独自の守り
 - **開発者パネル**（ログ・通信・タブ・Cookie・HSTS・VNet の中身・落ちたときの記録）
 
@@ -38,20 +39,20 @@ UserNet（小さなルーター）→ Network.framework → インターネッ�
 
 1. iPad の Swift Playgrounds で、新しい「App」を作る
 2. 最初からある `ContentView.swift` と `MyApp.swift` を消す
-3. [`Playgrounds/VelaParts/`](Playgrounds/VelaParts) の `Vela1.swift`〜`Vela10.swift` を**全部**入れる
+3. [`Playgrounds/VelaParts/`](Playgrounds/VelaParts) の `Vela1.swift`〜`Vela11.swift` を**全部**入れる
 4. 実行して、アドレスに `https://example.com/` などを入れて「開く」
 
 > [!NOTE]
 > 1 つにまとめた `Playgrounds/VelaAll.swift` もありますが、大きすぎて Playgrounds が
-> 「Timed out waiting for a thunk to build after 30.0 seconds」で止まることがあります。ふつうは `VelaParts` の 10 個を使ってください。
-> `VelaAll.swift` と `VelaParts` を一緒に入れてはいけません。`Sources/` の 57 ファイルをそのまま入れても動きます。
+> 「Timed out waiting for a thunk to build after 30.0 seconds」で止まることがあります。ふつうは `VelaParts` の 11 個を使ってください。
+> `VelaAll.swift` と `VelaParts` を一緒に入れてはいけません。`Sources/` の 58 ファイルをそのまま入れても動きます。
 
 ## フォルダの構成
 
 ```text
 Sources/              アプリのソース（ここを直す）
   App/                画面: MyApp / BrowserView / BrowserControls / TabViews / LibraryView /
-                            DevPanel / DevPanelPages / SettingsView / AdBlockView / Downloads / SharedViews
+                            DevPanel / DevPanelPages / SettingsView / AdBlockView / ScriptletSelfTest / Downloads / SharedViews
   Browser/            ブラウザの中身: BrowserModels / BrowserStore / BrowserTab / TabWebDelegate / Library /
                             LibraryModel / AddressInput / ErrorPages / DownloadManager / DownloadFiles / NetLog / Persistence /
                             DevLog / CrashLog
@@ -65,14 +66,17 @@ Sources/              アプリのソース（ここを直す）
   Router/             ルーター: UserNet / UserNetApple
 Playgrounds/          Playgrounds に入れる、まとめたもの（自動生成。手で直さない）
   VelaAll.swift
-  VelaParts/Vela1〜10.swift
+  VelaParts/Vela1〜11.swift
+resources/            アプリがネットから落とすもの（uBO のスクリプトレットの道具と署名。GitHub Actions が毎日作り直す。resources/README.md）
+.github/workflows/    ubo-scriptlets.yml（上を作り直す）
 tools/
   merge_swift.py      Sources → Playgrounds を作る
-  checkall.ps1        merge・swiftcheck（3 つ）・単体テストをまとめて動かす（最後の行が ALL OK なら全部通った）
+  checkall.ps1        merge・swiftcheck（3 つ）・単体テスト・uBO の道具の署名と動作（node）をまとめて動かす（最後の行が ALL OK なら全部通った）
   swiftenv.sh         swiftcheck と tests が使う Swift 5.8.1 の場所（無ければ入れる）
   wsl.ps1             Windows のパス → WSL のパス（swiftcheck.ps1・runtests.ps1 が使う）
   swiftcheck/         Windows（WSL）で Swift 5.8 の型チェック
   tests/              単体テスト
+  ubo/                uBO のスクリプトレットを JSON にして署名する・リストとのずれを調べる・組み立てた JS を node と Chrome で確かめる
 ```
 
 ## 開発（Windows + WSL）
@@ -166,3 +170,11 @@ WebSocket と標準の通信には、WebKit のルールとページのスクリ
 - https の横取り（`HTTPSTakeover`）は、WebKit の中の作り（`handlesURLScheme` の差し替えと `_willPerformRedirection:`）に頼っています。
   WebKit が変われば動かなくなる・落ちる可能性があります。確かめた iOS の版（16〜26）だけで使い、確認に失敗したら元に戻して標準の通信にします
 - SecureTransport は 2019 年から非推奨です（技術的負債）。将来 TLS エンジンを移すかは、別の課題です
+- YouTube などの広告を消すスクリプトレットは、uBlock Origin の道具（JS）を Vela の GitHub から毎日落として、全部のページの中で動かします。
+  署名（Ed25519。鍵は GitHub Actions の Secrets）を確かめたものだけ使いますが、GitHub のアカウントが乗っ取られると、署名した悪い道具を配れてしまいます
+- YouTube がサーバー側で動画に広告を混ぜる所は、スクリプトレットでも消せません（uBlock Origin も同じ）
+
+## ライセンス
+
+GNU General Public License v3（[`LICENSE`](LICENSE)）。YouTube などの広告を消す道具に、uBlock Origin（Raymond Hill。GPLv3 またはそれ以降）の関数をそのまま使っているため
+（[`resources/README.md`](resources/README.md)）。uBlock Origin のフィルターのリスト（uAssets）は、Vela は配らず、利用者の端末が直接落とします。

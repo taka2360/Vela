@@ -1,7 +1,7 @@
 import Foundation
 
 // Actions 用: Vela の組み立て（Scriptlets.swift）で、tools/ubo/fixtures の行から tools/ubo/.out/{main,isolated}.js を作る。
-// ローカルでは Swift の単体テスト（ScriptletTests）が同じものを書くので、これは使わなくてよい。
+// selftest.html（自己テストのページを Chrome で開く形）も書く。ローカルでは Swift の単体テスト（ScriptletTests）が同じものを書くので、これは使わなくてよい。
 //   swiftc -O Sources/Policy/SiteUtil.swift Sources/AdBlock/FilterPreparser.swift Sources/AdBlock/ABPFilter.swift \
 //          Sources/AdBlock/Scriptlets.swift tools/ubo/assemble/main.swift -o assemble && ./assemble
 
@@ -21,4 +21,5 @@ let dir = root.appendingPathComponent("tools/ubo/.out", isDirectory: true)
 try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 try! Data(out.main.utf8).write(to: dir.appendingPathComponent("main.js"))
 try! Data(out.isolated.utf8).write(to: dir.appendingPathComponent("isolated.js"))
+try! Data(ScriptletSelfTestPage.chromeHarness(ScriptletSelfTestPage.assemble(library: lib).output).utf8).write(to: dir.appendingPathComponent("selftest.html"))
 print("書きました: tools/ubo/.out（ルール \(out.filters.count) 個・uBO \(lib.ubo)）")

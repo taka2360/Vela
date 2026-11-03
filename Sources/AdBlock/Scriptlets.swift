@@ -654,3 +654,101 @@ enum ScriptletAssembler {
         ].joined(separator: "\n")
     }
 }
+
+// MARK: 自己テストのページ（開発者パネルの ScriptletSelfTest が WKWebView で、単体テストが Chrome で開く）
+
+enum ScriptletSelfTestPage {
+    static let host = "vela-selftest.invalid"
+
+    /// テスト用のルール（このテストの中だけ信頼する）
+    static let rules = """
+    vela-selftest.invalid##+js(json-prune, adPlacements playerAds)
+    vela-selftest.invalid##+js(set, ytInitialPlayerResponse.adSlots, undefined)
+    vela-selftest.invalid##+js(trusted-edit-inbound-object, JSON.stringify, 0, [?.context].context.client+={"clientScreen":"CHANNEL"})
+    vela-selftest.invalid##+js(trusted-rpfr, '"fetchAdSlots"', '"no_ads"', blob:)
+    vela-selftest.invalid##+js(json-prune-fetch-response, fetchAdPlacements, , propsToMatch, blob:)
+    vela-selftest.invalid##+js(trusted-replace-xhr-response, '"xhrAdSlots"', '"no_ads"', blob:)
+    vela-selftest.invalid##+js(json-prune-xhr-response, xhrAdPlacements, , propsToMatch, blob:)
+    vela-selftest.invalid##+js(rmnt, script, VELA_RMNT_MARK)
+    vela-selftest.invalid##+js(rpnt, script, __velaRpnt = 1, __velaRpnt = 2)
+    vela-selftest.invalid##+js(trusted-prevent-dom-bypass, Node.prototype.appendChild, fetch)
+    """
+
+    /// ページの中のテスト（結果は velaSelfTest に送る）
+    static let page = #"""
+    <!doctype html><html><head><meta charset="utf-8">
+    <script>window.__velaRmnt = 1; /* VELA_RMNT_MARK */</script>
+    <script>window.__velaRpnt = 1;</script>
+    </head><body>
+    <script>
+    (async function () {
+      const out = [];
+      const t = (name, ok, detail) => out.push({ name, ok: !!ok, detail: String(detail ?? '') });
+      const blobURL = (obj) => URL.createObjectURL(new Blob([JSON.stringify(obj)], { type: 'application/json' }));
+      const xhr = (u, type) => new Promise((res) => {
+        const x = new XMLHttpRequest();
+        x.open('GET', u);
+        if (type) x.responseType = type;
+        x.onload = () => res(type === 'json' ? x.response : x.responseText);
+        x.onerror = () => res(null);
+        x.send();
+      });
+      try {
+        const p = JSON.parse('{"adPlacements":[1],"playerAds":[2],"keep":1}');
+        t('json-prune（JSON.parse）', p.adPlacements === undefined && p.playerAds === undefined && p.keep === 1, JSON.stringify(p));
+      } catch (e) { t('json-prune（JSON.parse）', false, e); }
+      try {
+        window.ytInitialPlayerResponse = { adSlots: [1], keep: 1 };
+        const y = window.ytInitialPlayerResponse;
+        t('set-constant（後から入れたオブジェクトの中）', y && y.adSlots === undefined && y.keep === 1, JSON.stringify(y));
+      } catch (e) { t('set-constant', false, e); }
+      try {
+        const s = JSON.stringify({ context: { client: { clientName: 'WEB' } } });
+        t('trusted-edit-inbound-object（送る JSON を変える）', s.includes('"clientScreen":"CHANNEL"'), s);
+      } catch (e) { t('trusted-edit-inbound-object', false, e); }
+      try {
+        const txt = await (await fetch(blobURL({ fetchAdSlots: [1], keep: 1 }))).text();
+        t('trusted-replace-fetch-response（fetch の中身）', txt.includes('"no_ads"') && !txt.includes('"fetchAdSlots"'), txt);
+      } catch (e) { t('trusted-replace-fetch-response', false, e); }
+      try {
+        const j = await (await fetch(blobURL({ fetchAdPlacements: [1], keep: 1 }))).json();
+        t('json-prune-fetch-response（Response.json）', j.fetchAdPlacements === undefined && j.keep === 1, JSON.stringify(j));
+      } catch (e) { t('json-prune-fetch-response', false, e); }
+      try {
+        const txt = await xhr(blobURL({ xhrAdSlots: [1], keep: 1 }), '');
+        t('trusted-replace-xhr-response（XHR の文字）', txt && txt.includes('"no_ads"') && !txt.includes('"xhrAdSlots"'), txt);
+      } catch (e) { t('trusted-replace-xhr-response', false, e); }
+      try {
+        const j = await xhr(blobURL({ xhrAdPlacements: [1], keep: 1 }), 'json');
+        t('json-prune-xhr-response（XHR の json）', j && j.xhrAdPlacements === undefined && j.keep === 1, JSON.stringify(j));
+      } catch (e) { t('json-prune-xhr-response', false, e); }
+      t('remove-node-text（isolated world・script の中を消す）', window.__velaRmnt === undefined, window.__velaRmnt);
+      t('trusted-replace-node-text（isolated world・script の中を書き換える）', window.__velaRpnt === 2, window.__velaRpnt);
+      try {
+        const f = document.createElement('iframe');
+        document.body.appendChild(f);
+        t('trusted-prevent-dom-bypass（iframe から元の fetch を取らせない）', f.contentWindow.fetch === window.fetch, '');
+        f.remove();
+      } catch (e) { t('trusted-prevent-dom-bypass', false, e); }
+      t('道具の中の関数がページから見えない（private namespace）', typeof window.jsonPrune === 'undefined' && typeof window.safeSelf === 'undefined', '');
+      window.webkit.messageHandlers.velaSelfTest.postMessage(out);
+    })();
+    </script></body></html>
+    """#
+
+    /// テスト用のルールを今の道具で組み立てる
+    static func assemble(library: ScriptletLibrary) -> (output: ScriptletAssembler.Output, unknown: [String: Int]) {
+        var idx = ScriptletIndex()
+        for f in ABPParser.parse(rules).scriptlets { idx.add(f, trusted: true, library: library) }
+        let sel = idx.retrieve(url: URL(string: "https://\(host)/")!)
+        return (ScriptletAssembler.assemble([(host, sel)], library: library), idx.unknown)
+    }
+
+    /// Chrome で開く形（world が無いので、両方ともページの先頭に入れる。結果は #vela-result に書く）。tools/ubo/test_assembled.mjs が使う
+    static func chromeHarness(_ out: ScriptletAssembler.Output) -> String {
+        let harness = "<script>window.webkit={messageHandlers:{velaSelfTest:{postMessage:function(r){var p=document.createElement('pre');p.id='vela-result';p.textContent=JSON.stringify(r);document.documentElement.appendChild(p);}}}};</script>"
+        func tag(_ js: String) -> String { js.isEmpty ? "" : "<script>" + js.replacingOccurrences(of: "</script", with: "<\\/script") + "</script>" }
+        let head = "<head><meta charset=\"utf-8\">"
+        return page.replacingOccurrences(of: head, with: head + harness + tag(out.main) + tag(out.isolated))
+    }
+}
