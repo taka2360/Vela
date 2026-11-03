@@ -41,9 +41,8 @@ final class TLSStream: @unchecked Sendable {
     let host: String
     private let ctx: SSLContext
     private var tcp: GuestTCP?
-    /// TCP から届いて、まだ TLS に渡していないもの（inbox[inboxPos...]）。先頭を消すと遅いので、位置で覚える
-    private var inbox = [UInt8]()
-    private var inboxPos = 0
+    /// TCP から届いて、まだ TLS に渡していないもの。詰めるのは届いたとき（足す前）だけ
+    private var inbox = ByteQueue()
     private var tcpEnded = false
     private var handshaking = true
     private var pendingWrite = Data()
@@ -85,7 +84,7 @@ final class TLSStream: @unchecked Sendable {
 
     /// TCP から届いたもの
     func tcpData(_ d: Data) {
-        if inboxPos > 65536 && inboxPos * 2 > inbox.count { inbox.removeFirst(inboxPos); inboxPos = 0 }
+        inbox.compact(above: 65536, resetWhenEmpty: false)
         inbox.append(contentsOf: d)
         drive()
     }
@@ -151,7 +150,7 @@ final class TLSStream: @unchecked Sendable {
             var n = 0
             let st = buf.withUnsafeMutableBytes { SSLRead(ctx, $0.baseAddress!, $0.count, &n) }
             if n > 0 { onData?(Data(buf[0..<n])) }
-            if st == errSSLWouldBlock { if tcpEnded && inboxPos >= inbox.count { finish(nil) }; return }
+            if st == errSSLWouldBlock { if tcpEnded && inbox.isEmpty { finish(nil) }; return }
             if st == errSSLClosedGraceful || st == errSSLClosedNoNotify || st == errSSLClosedAbort { finish(nil); return }
             if st != errSecSuccess { finish("TLS の読み込みに失敗（\(st)）"); return }
         }
@@ -159,11 +158,11 @@ final class TLSStream: @unchecked Sendable {
 
     // SecureTransport から呼ばれる「読む・書く」
     fileprivate func readInto(_ p: UnsafeMutableRawPointer, _ want: Int) -> (Int, OSStatus) {
-        let avail = inbox.count - inboxPos
+        let avail = inbox.count
         if avail <= 0 { return (0, tcpEnded ? errSSLClosedNoNotify : errSSLWouldBlock) }
         let n = min(want, avail)
-        inbox.withUnsafeBytes { p.copyMemory(from: $0.baseAddress! + inboxPos, byteCount: n) }
-        inboxPos += n
+        inbox.copy(into: p, count: n)        // p には want バイトの場所がある（SecureTransport がくれたもの）
+        inbox.consume(n)
         return (n, n < want ? errSSLWouldBlock : errSecSuccess)
     }
 
