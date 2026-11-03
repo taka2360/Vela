@@ -45,7 +45,6 @@ final class BrowserTab: ObservableObject, Identifiable {
     private var observations: [NSKeyValueObservation] = []
     private let cookies = CookieBridge()
     private let actions = PageActionBridge()
-    private var refresh: UIRefreshControl?
     /// 休止中のときの、戻る/進むの履歴（WKWebView.interactionState）と開く URL
     private var savedState: Data?
     private var pendingURL: URL?
@@ -126,14 +125,13 @@ final class BrowserTab: ObservableObject, Identifiable {
         wv.navigationDelegate = d
         wv.uiDelegate = d
         delegate = d
-        // 引っ張って再読み込み
+        // 引っ張って再読み込み（持っているのは scrollView.refreshControl だけ。捨てるときにそこから外す）
         let rc = UIRefreshControl()
         rc.addAction(UIAction { [weak self, weak rc] _ in
             self?.webView?.reload()
             rc?.endRefreshing()
         }, for: .valueChanged)
         wv.scrollView.refreshControl = rc
-        refresh = rc
         observe(wv)
         webView = wv
         adRuleLists = []
@@ -289,7 +287,6 @@ final class BrowserTab: ObservableObject, Identifiable {
         wv.removeFromSuperview()
         webView = nil
         delegate = nil
-        refresh = nil
         scheme = nil
         isLoading = false
         progress = 0
