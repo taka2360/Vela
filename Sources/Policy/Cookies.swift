@@ -191,22 +191,50 @@ enum CookiePolicy {
     }
 
     /// 1 つの Cookie を送るか。送らないなら理由
-    static func sendDecision(_ c: CookieRecord, url: URL, method: String, ctx: RequestContext,
-                             settings: Settings, now: Date = Date()) -> String? {
-        if !ctx.cookiesAllowed { return "Cookie を扱わない要求" }
-        if c.isExpired(now) { return "期限切れ" }
-        guard let host = SiteUtil.host(of: url), c.domainMatches(host) else { return "ドメインが合わない" }
+    /// Cookie を送らない理由（確かめる順番もこの並び。先に当てはまったものが理由になる）
+    enum SendSkip: CaseIterable {
+        case notAllowed, expired, domain, path, insecure, thirdParty, strict, lax, unspecified
+
+        var text: String {
+            switch self {
+            case .notAllowed: return "Cookie を扱わない要求"
+            case .expired: return "期限切れ"
+            case .domain: return "ドメインが合わない"
+            case .path: return "パスが合わない"
+            case .insecure: return "Secure なのに https でない"
+            case .thirdParty: return "サードパーティ Cookie をブロック"
+            case .strict: return "SameSite=Strict でクロスサイト"
+            case .lax: return "SameSite=Lax でクロスサイト"
+            case .unspecified: return "SameSite なし（Lax 扱い）でクロスサイト"
+            }
+        }
+
+        /// 開発者向けのログに出すか（期限切れ・ドメイン・パスは関係ない Cookie なので出さない）
+        var isLogged: Bool {
+            switch self {
+            case .expired, .domain, .path: return false
+            default: return true
+            }
+        }
+    }
+
+    /// 送らない理由（送ってよければ nil）
+    static func sendSkip(_ c: CookieRecord, url: URL, method: String, ctx: RequestContext,
+                         settings: Settings, now: Date = Date()) -> SendSkip? {
+        if !ctx.cookiesAllowed { return .notAllowed }
+        if c.isExpired(now) { return .expired }
+        guard let host = SiteUtil.host(of: url), c.domainMatches(host) else { return .domain }
         let path = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? url.path
-        if !c.pathMatches(path) { return "パスが合わない" }
-        if c.secure && !SiteUtil.isSecureScheme(url) { return "Secure なのに https でない" }
-        if settings.blockThirdParty && isThirdParty(url, ctx: ctx) { return "サードパーティ Cookie をブロック" }
+        if !c.pathMatches(path) { return .path }
+        if c.secure && !SiteUtil.isSecureScheme(url) { return .insecure }
+        if settings.blockThirdParty && isThirdParty(url, ctx: ctx) { return .thirdParty }
         guard isCrossSite(url, method: method, ctx: ctx) else { return nil }
         let topLevelSafe = ctx.isTopLevel && safeMethods.contains(method.uppercased())
         switch c.sameSite {
         case .strict:
-            return "SameSite=Strict でクロスサイト"
+            return .strict
         case .lax:
-            return topLevelSafe ? nil : "SameSite=Lax でクロスサイト"
+            return topLevelSafe ? nil : .lax
         case .none:
             return nil
         case .unspecified:
@@ -214,8 +242,14 @@ enum CookiePolicy {
             if topLevelSafe { return nil }
             if ctx.isTopLevel && method.uppercased() == "POST" && settings.laxPostGrace > 0
                 && now.timeIntervalSince(c.created) <= settings.laxPostGrace { return nil }
-            return "SameSite なし（Lax 扱い）でクロスサイト"
+            return .unspecified
         }
+    }
+
+    /// 送らない理由の文言（送ってよければ nil）
+    static func sendDecision(_ c: CookieRecord, url: URL, method: String, ctx: RequestContext,
+                             settings: Settings, now: Date = Date()) -> String? {
+        sendSkip(c, url: url, method: method, ctx: ctx, settings: settings, now: now)?.text
     }
 
     /// 送る Cookie を順番に並べる（パスが長い順 → 作られた順）
@@ -224,9 +258,8 @@ enum CookiePolicy {
         var send: [CookieRecord] = []
         var skipped: [(String, String)] = []
         for c in jar {
-            if let why = sendDecision(c, url: url, method: method, ctx: ctx, settings: settings, now: now) {
-                // ドメイン・パスが合わないものはログに出さない（関係ない Cookie なので）
-                if why != "ドメインが合わない" && why != "パスが合わない" && why != "期限切れ" { skipped.append((c.name, why)) }
+            if let why = sendSkip(c, url: url, method: method, ctx: ctx, settings: settings, now: now) {
+                if why.isLogged { skipped.append((c.name, why.text)) }
             } else {
                 send.append(c)
             }

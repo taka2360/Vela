@@ -44,6 +44,11 @@ func cookieSkipTests() {
             expectEqual(logged(c, u, ctx, st), isLogged ? [text] : [], "ログ: \(text)")
         }
     }
+    test("SendSkip: 9 種類・文言・isLogged") {
+        expectEqual(CookiePolicy.SendSkip.allCases.count, 9)
+        expectEqual(CookiePolicy.SendSkip.allCases.filter { !$0.isLogged }, [.expired, .domain, .path])
+        expectEqual(Set(CookiePolicy.SendSkip.allCases.map { $0.text }).count, 9, "文言は全部違う")
+    }
     test("理由が重なったら先の方（順番で隣り合う 8 組）") {
         expectEqual(why(rec(expired: true), "https://example.com/", notAllowed), "Cookie を扱わない要求")
         expectEqual(why(rec(expired: true), "https://other.test/", sameTop), "期限切れ")
