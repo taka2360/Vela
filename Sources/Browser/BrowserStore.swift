@@ -160,12 +160,19 @@ final class BrowserStore: ObservableObject {
 
     // MARK: タブ
 
+    /// 新しい番号でタブを作って並びに入れる（after の後ろ。after が無い・見つからなければ最後）。
+    /// 読み込み・選ぶ・保存は呼ぶ側がする。セッションの復元は保存された番号を使うので、これを使わない
+    private func makeTab(mode: NetMode, after: BrowserTab?) -> BrowserTab {
+        let tab = BrowserTab(id: nextTabID, store: self, mode: mode)
+        nextTabID += 1
+        if let after, let i = tabs.firstIndex(where: { $0 === after }) { tabs.insert(tab, at: i + 1) } else { tabs.append(tab) }
+        return tab
+    }
+
     /// 新しいタブ（url が nil なら空のタブ）。select: すぐ見るか
     @discardableResult
     func newTab(url: URL?, select: Bool = true, mode: NetMode? = nil, after: BrowserTab? = nil) -> BrowserTab {
-        let tab = BrowserTab(id: nextTabID, store: self, mode: mode ?? defaultMode)
-        nextTabID += 1
-        if let after, let i = tabs.firstIndex(where: { $0 === after }) { tabs.insert(tab, at: i + 1) } else { tabs.append(tab) }
+        let tab = makeTab(mode: mode ?? defaultMode, after: after)
         if let url { tab.load(url, userInitiated: true) }
         if select { self.select(tab) }
         saveSession()
@@ -174,9 +181,7 @@ final class BrowserStore: ObservableObject {
 
     /// ページが開いた新しい窓（target=_blank・window.open）。WebKit が渡した設定で WebView を作ってタブにする
     func adoptPopup(configuration: WKWebViewConfiguration, opener: BrowserTab) -> WKWebView {
-        let tab = BrowserTab(id: nextTabID, store: self, mode: opener.mode)
-        nextTabID += 1
-        if let i = tabs.firstIndex(where: { $0 === opener }) { tabs.insert(tab, at: i + 1) } else { tabs.append(tab) }
+        let tab = makeTab(mode: opener.mode, after: opener)
         let wv = tab.adopt(configuration: configuration, scheme: opener.scheme)
         select(tab)
         logs.add("新しい窓をタブにしました（#\(opener.id) から）", level: .info, category: .nav, tab: tab.id)
@@ -211,10 +216,8 @@ final class BrowserStore: ObservableObject {
 
     func reopenClosedTab() {
         guard let s = closedTabs.popLast() else { return }
-        let tab = BrowserTab(id: nextTabID, store: self, mode: s.mode)
-        nextTabID += 1
+        let tab = makeTab(mode: s.mode, after: nil)
         tab.restore(from: s)
-        tabs.append(tab)
         select(tab)
     }
 
