@@ -7200,8 +7200,15 @@ enum SiteUtil {
 
 /// 数字のアドレスを読む
 enum IPAddressText {
-    /// "192.168.0.1" → [192, 168, 0, 1]
-    static func v4(_ s: String) -> [UInt8]? {
+    /// "192.168.0.1" → [192, 168, 0, 1]。
+    /// loose: ゲストの TCP/IP（GuestStack.resolve）の読み方。空の所を飛ばして 4 つに分かれ、どれも UInt8() で読めればよい
+    /// （"1..2.3.4"・"+1.2.3.4"・"0001.2.3.4" も通る）。loose でなければ厳しく読む（判定・守りに使う）
+    static func v4(_ s: String, loose: Bool = false) -> [UInt8]? {
+        if loose {
+            let labels = s.split(separator: ".")
+            let octets = labels.compactMap { UInt8($0) }
+            return labels.count == 4 && octets.count == 4 ? octets : nil
+        }
         let parts = s.split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 4 else { return nil }
         var out: [UInt8] = []
@@ -9670,9 +9677,7 @@ final class GuestStack: @unchecked Sendable {
 
     /// 名前を IPv4 アドレスにする（IP アドレスの形ならそのまま）
     func resolve(_ name: String, _ done: @escaping ([UInt8]?) -> Void) {
-        let labels = name.split(separator: ".")
-        let octets = labels.compactMap { UInt8($0) }
-        if labels.count == 4 && octets.count == 4 { done(octets); return }
+        if let octets = IPAddressText.v4(name, loose: true) { done(octets); return }
         let packet = DNSMessage.query(name: name, id: .random(in: 0...UInt16.max))
         let port = allocPort()
         dnsQueries[port] = DNSQuery(packet: packet) { [weak self] ip in

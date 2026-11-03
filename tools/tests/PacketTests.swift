@@ -133,6 +133,16 @@ func packetTests() {
         expect(literal("a.b.c.d") == nil)
         expect(literal(" 1.2.3.4") == nil)
         expect(literal("") == nil)
+        // 同じ入力で、IPAddressText.v4(loose: true) は resolve と同じ。厳しい方（loose: false）は変な形を通さない
+        for s in ["192.168.1.10", "1..2.3.4", ".1.2.3.4", "1.2.3.4.", "+1.2.3.4", "0001.2.3.4", "010.0.0.1",
+                  "256.1.1.1", "1.2.3", "1.2.3.4.5", "a.b.c.d", " 1.2.3.4", ""] {
+            expectEqual(IPAddressText.v4(s, loose: true), literal(s), s)
+        }
+        expectEqual(IPAddressText.v4("192.168.1.10"), [192, 168, 1, 10])
+        expectEqual(IPAddressText.v4("010.0.0.1"), [10, 0, 0, 1])
+        for s in ["1..2.3.4", ".1.2.3.4", "1.2.3.4.", "+1.2.3.4", "0001.2.3.4", "256.1.1.1", "1.2.3", ""] {
+            expect(IPAddressText.v4(s) == nil, "厳しい方は通さない: \(s)")
+        }
     }
     test("EthernetFrame・ARPPacket を読む") {
         let mac: [UInt8] = [2, 0, 0, 0, 0, 9]

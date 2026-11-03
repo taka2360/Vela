@@ -192,9 +192,7 @@ final class GuestStack: @unchecked Sendable {
 
     /// 名前を IPv4 アドレスにする（IP アドレスの形ならそのまま）
     func resolve(_ name: String, _ done: @escaping ([UInt8]?) -> Void) {
-        let labels = name.split(separator: ".")
-        let octets = labels.compactMap { UInt8($0) }
-        if labels.count == 4 && octets.count == 4 { done(octets); return }
+        if let octets = IPAddressText.v4(name, loose: true) { done(octets); return }
         let packet = DNSMessage.query(name: name, id: .random(in: 0...UInt16.max))
         let port = allocPort()
         dnsQueries[port] = DNSQuery(packet: packet) { [weak self] ip in
