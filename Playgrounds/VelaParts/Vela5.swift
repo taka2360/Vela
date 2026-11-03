@@ -1016,6 +1016,24 @@ final class DevLog: @unchecked Sendable {
     }
 }
 
+/// 開発者パネルのログ・通信のページの絞り込み（「このタブだけ」と「探す」）。Cookie のページは決まりが違うので使わない
+struct DevQuery {
+    let onlyThisTab: Bool
+    /// 小文字にした「探す」の文字
+    private let q: String
+
+    init(onlyThisTab: Bool, query: String) {
+        self.onlyThisTab = onlyThisTab
+        q = query.lowercased()
+    }
+
+    /// 調べるときに選ばれているタブ（「このタブだけ」でなければ nil = 全部のタブ）
+    func tab(selected: Int?) -> Int? { onlyThisTab ? selected : nil }
+
+    /// 「探す」が空か、text（小文字にして）に含まれるか
+    func matches(_ text: String) -> Bool { q.isEmpty || text.lowercased().contains(q) }
+}
+
 // ======================================================================
 // MARK: - CrashLog.swift
 // ======================================================================

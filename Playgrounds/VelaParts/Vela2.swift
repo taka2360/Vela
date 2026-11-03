@@ -54,10 +54,10 @@ struct DevNetworkPage: View {
     }
 
     private var records: [NetRecord] {
-        let tab = onlyThisTab ? store.selectedID : nil
-        let q = query.lowercased()
+        let dq = DevQuery(onlyThisTab: onlyThisTab, query: query)
+        let tab = dq.tab(selected: store.selectedID)
         return store.netLog.recent(limit: 300) { r in
-            (!onlyProblems || r.isProblem) && (tab == nil || r.tab == tab) && (q.isEmpty || r.url.lowercased().contains(q))
+            (!onlyProblems || r.isProblem) && (tab == nil || r.tab == tab) && dq.matches(r.url)
         }
     }
 }

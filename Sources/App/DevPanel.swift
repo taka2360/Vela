@@ -154,11 +154,11 @@ struct DevLogPage: View {
     }
 
     private var filtered: [LogEntry] {
-        let tab = onlyThisTab ? store.selectedID : nil
-        let q = query.lowercased()
+        let dq = DevQuery(onlyThisTab: onlyThisTab, query: query)
+        let tab = dq.tab(selected: store.selectedID)
         return store.logs.all().filter { e in
             e.level >= minLevel && (category == nil || e.category == category) && (tab == nil || e.tab == tab)
-                && (q.isEmpty || e.message.lowercased().contains(q))
+                && dq.matches(e.message)
         }
     }
 

@@ -1191,11 +1191,11 @@ struct DevLogPage: View {
     }
 
     private var filtered: [LogEntry] {
-        let tab = onlyThisTab ? store.selectedID : nil
-        let q = query.lowercased()
+        let dq = DevQuery(onlyThisTab: onlyThisTab, query: query)
+        let tab = dq.tab(selected: store.selectedID)
         return store.logs.all().filter { e in
             e.level >= minLevel && (category == nil || e.category == category) && (tab == nil || e.tab == tab)
-                && (q.isEmpty || e.message.lowercased().contains(q))
+                && dq.matches(e.message)
         }
     }
 
@@ -1308,10 +1308,10 @@ struct DevNetworkPage: View {
     }
 
     private var records: [NetRecord] {
-        let tab = onlyThisTab ? store.selectedID : nil
-        let q = query.lowercased()
+        let dq = DevQuery(onlyThisTab: onlyThisTab, query: query)
+        let tab = dq.tab(selected: store.selectedID)
         return store.netLog.recent(limit: 300) { r in
-            (!onlyProblems || r.isProblem) && (tab == nil || r.tab == tab) && (q.isEmpty || r.url.lowercased().contains(q))
+            (!onlyProblems || r.isProblem) && (tab == nil || r.tab == tab) && dq.matches(r.url)
         }
     }
 }
@@ -5792,6 +5792,24 @@ final class DevLog: @unchecked Sendable {
         else { category = .app }
         return (level, category)
     }
+}
+
+/// 開発者パネルのログ・通信のページの絞り込み（「このタブだけ」と「探す」）。Cookie のページは決まりが違うので使わない
+struct DevQuery {
+    let onlyThisTab: Bool
+    /// 小文字にした「探す」の文字
+    private let q: String
+
+    init(onlyThisTab: Bool, query: String) {
+        self.onlyThisTab = onlyThisTab
+        q = query.lowercased()
+    }
+
+    /// 調べるときに選ばれているタブ（「このタブだけ」でなければ nil = 全部のタブ）
+    func tab(selected: Int?) -> Int? { onlyThisTab ? selected : nil }
+
+    /// 「探す」が空か、text（小文字にして）に含まれるか
+    func matches(_ text: String) -> Bool { q.isEmpty || text.lowercased().contains(q) }
 }
 
 // ======================================================================
