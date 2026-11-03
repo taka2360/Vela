@@ -7,6 +7,9 @@ import SwiftUI
 @MainActor
 struct DevNetworkPage: View {
     @ObservedObject var store: BrowserStore
+    /// 変わると描き直す（中身は使わない）。@Published でない値（ログ・通信の記録・Cookie・HSTS・WebView の数・
+    /// ダウンロード中の数）を毎秒出し直すため。今は store が毎秒変わることでも描き直している
+    let tick: Int
     @State private var onlyProblems = false
     @State private var onlyThisTab = false
     @State private var query = ""
@@ -83,6 +86,9 @@ struct DevNetRow: View {
 @MainActor
 struct DevCookiePage: View {
     @ObservedObject var store: BrowserStore
+    /// 変わると描き直す（中身は使わない）。@Published でない値（ログ・通信の記録・Cookie・HSTS・WebView の数・
+    /// ダウンロード中の数）を毎秒出し直すため。今は store が毎秒変わることでも描き直している
+    let tick: Int
     @State private var query = ""
 
     var body: some View {
@@ -127,6 +133,9 @@ struct DevCookiePage: View {
 @MainActor
 struct DevHSTSPage: View {
     @ObservedObject var store: BrowserStore
+    /// 変わると描き直す（中身は使わない）。@Published でない値（ログ・通信の記録・Cookie・HSTS・WebView の数・
+    /// ダウンロード中の数）を毎秒出し直すため。今は store が毎秒変わることでも描き直している
+    let tick: Int
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -154,6 +163,9 @@ struct DevHSTSPage: View {
 @MainActor
 struct DevAdBlockPage: View {
     @ObservedObject var store: BrowserStore
+    /// 変わると描き直す（中身は使わない）。@Published でない値（ログ・通信の記録・Cookie・HSTS・WebView の数・
+    /// ダウンロード中の数）を毎秒出し直すため。今は store が毎秒変わることでも描き直している
+    let tick: Int
     @ObservedObject var adblock: AdBlocker
 
     var body: some View {
@@ -182,6 +194,9 @@ struct DevAdBlockPage: View {
 @MainActor
 struct DevVNetPage: View {
     @ObservedObject var store: BrowserStore
+    /// 変わると描き直す（中身は使わない）。@Published でない値（ログ・通信の記録・Cookie・HSTS・WebView の数・
+    /// ダウンロード中の数）を毎秒出し直すため。今は store が毎秒変わることでも描き直している
+    let tick: Int
 
     var body: some View {
         ScrollView {
@@ -214,6 +229,9 @@ struct DevVNetPage: View {
 @MainActor
 struct DevSystemPage: View {
     @ObservedObject var store: BrowserStore
+    /// 変わると描き直す（中身は使わない）。@Published でない値（ログ・通信の記録・Cookie・HSTS・WebView の数・
+    /// ダウンロード中の数）を毎秒出し直すため。今は store が毎秒変わることでも描き直している
+    let tick: Int
 
     var body: some View {
         ScrollView {

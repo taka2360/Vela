@@ -64,20 +64,20 @@ struct DevPageBar: View {
 struct DevPageContent: View {
     @ObservedObject var store: BrowserStore
     let page: DevPage
-    /// 変わると描き直す（中身は使わない）
+    /// 変わると描き直す（中身は使わない）。各ページにもそのまま渡す
     let tick: Int
 
     var body: some View {
         switch page {
-        case .overview: DevOverview(store: store)
-        case .log: DevLogPage(store: store)
-        case .network: DevNetworkPage(store: store)
-        case .tabs: DevTabsPage(store: store)
-        case .cookies: DevCookiePage(store: store)
-        case .hsts: DevHSTSPage(store: store)
-        case .adblock: DevAdBlockPage(store: store, adblock: store.adblock)
-        case .vnet: DevVNetPage(store: store)
-        case .system: DevSystemPage(store: store)
+        case .overview: DevOverview(store: store, tick: tick)
+        case .log: DevLogPage(store: store, tick: tick)
+        case .network: DevNetworkPage(store: store, tick: tick)
+        case .tabs: DevTabsPage(store: store, tick: tick)
+        case .cookies: DevCookiePage(store: store, tick: tick)
+        case .hsts: DevHSTSPage(store: store, tick: tick)
+        case .adblock: DevAdBlockPage(store: store, tick: tick, adblock: store.adblock)
+        case .vnet: DevVNetPage(store: store, tick: tick)
+        case .system: DevSystemPage(store: store, tick: tick)
         case .scope: DevScopePage()
         }
     }
@@ -98,6 +98,9 @@ struct DevLine: View {
 @MainActor
 struct DevOverview: View {
     @ObservedObject var store: BrowserStore
+    /// 変わると描き直す（中身は使わない）。@Published でない値（ログ・通信の記録・Cookie・HSTS・WebView の数・
+    /// ダウンロード中の数）を毎秒出し直すため。今は store が毎秒変わることでも描き直している
+    let tick: Int
 
     var body: some View {
         ScrollView {
@@ -128,6 +131,9 @@ struct DevOverview: View {
 @MainActor
 struct DevLogPage: View {
     @ObservedObject var store: BrowserStore
+    /// 変わると描き直す（中身は使わない）。@Published でない値（ログ・通信の記録・Cookie・HSTS・WebView の数・
+    /// ダウンロード中の数）を毎秒出し直すため。今は store が毎秒変わることでも描き直している
+    let tick: Int
     @State private var minLevel = LogLevel.info
     @State private var category: LogCategory?
     @State private var onlyThisTab = false
@@ -193,6 +199,9 @@ struct DevLogView: View {
 @MainActor
 struct DevTabsPage: View {
     @ObservedObject var store: BrowserStore
+    /// 変わると描き直す（中身は使わない）。@Published でない値（ログ・通信の記録・Cookie・HSTS・WebView の数・
+    /// ダウンロード中の数）を毎秒出し直すため。今は store が毎秒変わることでも描き直している
+    let tick: Int
 
     var body: some View {
         ScrollView {
