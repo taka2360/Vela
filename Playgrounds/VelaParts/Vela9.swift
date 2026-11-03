@@ -487,7 +487,7 @@ final class GuestTCP: @unchecked Sendable {
     private var sndUna: UInt32, sndNxt: UInt32
     private var rcvNxt: UInt32 = 0
     /// sndUna から先の、まだ受け取ってもらっていないデータ
-    private var sendBuf = Data()
+    private var sendBuf = ByteQueue()
     private var wantFIN = false, finSent = false, gotFIN = false
     private var peerWindow = 65535
     private let mss = 1460
@@ -512,7 +512,7 @@ final class GuestTCP: @unchecked Sendable {
     /// データを送る
     func write(_ d: Data) {
         guard state != .closed else { return }
-        sendBuf.append(d)
+        sendBuf.append(contentsOf: d)
         pump()
     }
 
@@ -565,8 +565,7 @@ final class GuestTCP: @unchecked Sendable {
             let room = peerWindow - inFlight
             if room <= 0 { return }
             let n = min(unsent, mss, room)
-            let start = sendBuf.startIndex + inFlight
-            send([.ack, .psh], payload: ArraySlice(sendBuf[start..<(start + n)]))
+            send([.ack, .psh], payload: sendBuf.slice(at: inFlight, count: n))
             sndNxt &+= UInt32(n)
             lastProgress = Date()
         }
@@ -600,7 +599,10 @@ final class GuestTCP: @unchecked Sendable {
             if let acked = TCPSeq.acked(ack: h.ack, una: sndUna, nxt: sndNxt) {
                 var n = Int(acked)
                 if finSent && h.ack == sndNxt { n -= 1 }        // FIN の分
-                if n > 0 { sendBuf.removeFirst(min(n, sendBuf.count)) }
+                if n > 0 {
+                    sendBuf.consume(min(n, sendBuf.count))
+                    sendBuf.compact(above: 65536, resetWhenEmpty: true)
+                }
                 sndUna = h.ack
                 lastProgress = Date()
                 retries = 0
@@ -669,7 +671,7 @@ final class GuestTCP: @unchecked Sendable {
             if let z = zeroWindowSince, now.timeIntervalSince(z) > GuestTCP.maxZeroWindow { abort(); return }
             sndNxt = sndUna
             finSent = false
-            send([.ack, .psh], payload: ArraySlice(sendBuf.prefix(1)))
+            send([.ack, .psh], payload: sendBuf.prefix(1))
             sndNxt = sndUna &+ 1
             lastProgress = now
             return
