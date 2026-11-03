@@ -23,15 +23,13 @@ struct BrowserView: View {
             if store.tabs.count > 1 {
                 TabStrip(store: store)
             }
-            if !store.isOnline {
-                OfflineBanner()
-            }
+            OfflineBanner(status: store.status)
             Divider()
             PageArea(store: store)
                 .overlay(alignment: .top) { SuggestionOverlay(store: store, editor: store.address) }
         }
         .background(ShortcutKeys(store: store))
-        .sheet(isPresented: $store.showDevPanel) { DevPanel(store: store) }
+        .sheet(isPresented: $store.showDevPanel) { DevPanel(store: store, status: store.status) }
         .sheet(isPresented: $store.showAdBlock) { AdBlockView(adblock: store.adblock) }
         .sheet(isPresented: $store.showSettings) { SettingsView(store: store) }
         .sheet(isPresented: $store.showLibrary) { LibraryView(store: store, library: store.library) }
@@ -78,17 +76,22 @@ struct TopBar: View {
 }
 
 /// ネットワークにつながっていないときの帯
+/// つながっていないときだけ出す帯（つながっているときは何も出さない）
 struct OfflineBanner: View {
+    @ObservedObject var status: StatusModel
+
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "wifi.slash")
-            Text("ネットワークにつながっていません")
+        if !status.isOnline {
+            HStack(spacing: 8) {
+                Image(systemName: "wifi.slash")
+                Text("ネットワークにつながっていません")
+            }
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundColor(.white)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 5)
+            .background(Color.orange)
         }
-        .font(.system(size: 13, weight: .semibold))
-        .foregroundColor(.white)
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 5)
-        .background(Color.orange)
     }
 }
 
@@ -214,7 +217,7 @@ struct AddressField: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
-            ModeBadge(tab: tab, ready: store.vnetReady)
+            ModeBadge(tab: tab, status: store.status)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.horizontal, 10)
@@ -235,7 +238,8 @@ struct AddressField: View {
 /// 通信の作りの小さな札（VNet か標準か。VNet を通らない通信を使っていれば知らせる）
 struct ModeBadge: View {
     @ObservedObject var tab: BrowserTab
-    let ready: Bool
+    @ObservedObject var status: StatusModel
+    private var ready: Bool { status.vnetReady }
 
     var body: some View {
         HStack(spacing: 4) {

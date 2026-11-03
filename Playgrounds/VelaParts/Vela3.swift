@@ -27,6 +27,26 @@ import Security
 // ・タブの並び（と各タブの戻る/進むの履歴）を session.json に保存して、次に起動したときに戻す
 // ・メモリが足りなくなったら（メモリ警告）、見ていないタブの WebView を捨てる（スナップショットと履歴は残す）
 
+/// BrowserStore の様子のうち、毎秒のように変わるもの。書くのは BrowserStore（タイマー・NWPathMonitor・refreshStatus・setOnline）だけ。
+/// 見るのは、ツールバーの帯とバッジ・開発者パネルだけ（ここが変わっても、BrowserStore を見るほかの画面は描き直されない）
+@MainActor
+final class StatusModel: ObservableObject {
+    /// VNet の様子（ツールバー・開発者パネル用）
+    @Published fileprivate(set) var vnetReady = false
+    @Published fileprivate(set) var vnetStatus = "準備中…"
+    /// VNet の数字（開発者パネル用。開いている間だけ入れる）
+    @Published fileprivate(set) var vnetStats: VNetMachine.Stats?
+    /// ネットワークにつながっているか（NWPathMonitor）
+    @Published fileprivate(set) var isOnline = true
+    /// 前回は落ちて終わった（開発者パネルで前回の記録を見られる）
+    @Published fileprivate(set) var hadCrash = false
+    /// 開発者パネルを描き直す合図（パネルを開いている間だけ、0.5 秒ごとに増える）
+    @Published fileprivate(set) var devTick = 0
+
+    /// BrowserStore のプロパティの初期値として作られる。何も触らない
+    nonisolated init() {}
+}
+
 @MainActor
 final class BrowserStore: ObservableObject {
     @Published private(set) var tabs: [BrowserTab] = []
@@ -36,23 +56,14 @@ final class BrowserStore: ObservableObject {
     /// いま出しているダイアログ（順番待ちは dialogQueue）
     @Published private(set) var dialog: JSDialog?
     @Published var dialogInput = ""
-    /// VNet の様子（ツールバー・開発者パネル用）
-    @Published private(set) var vnetReady = false
-    @Published private(set) var vnetStatus = "準備中…"
-    /// 開発者パネルを描き直す合図（パネルを開いている間だけ、0.5 秒ごとに増える）
-    @Published private(set) var devTick = 0
-    /// VNet の数字（開発者パネル用）
-    @Published private(set) var vnetStats: VNetMachine.Stats?
+    /// 毎秒のように変わる様子（VNet・ネットワーク・開発者パネルの合図）。見る画面だけが描き直されるよう分けてある
+    let status = StatusModel()
     @Published var showSettings = false
     /// 起動した時刻
     let launchedAt = Date()
     /// 通信の記録（VNet が引き受けた要求 1 つずつ）
     let netLog = NetLog()
     @Published var showDownloads = false
-    /// 前回は落ちて終わった（開発者パネルで前回の記録を見られる）
-    @Published private(set) var hadCrash = false
-    /// ネットワークにつながっているか（NWPathMonitor）
-    @Published private(set) var isOnline = true
     /// ダウンロード
     let downloads = DownloadManager()
     /// ブックマークと履歴
@@ -112,7 +123,7 @@ final class BrowserStore: ObservableObject {
         let lb = logs
         if let crash = CrashLog.previousCrashSummary() {
             logs.add("⚠️ 前回は落ちて終わりました: \(crash)（開発者パネルの「前回の記録」で、落ちる前のログが見られます）", level: .error, category: .app)
-            hadCrash = true
+            status.hadCrash = true
         }
         takeover = HTTPSTakeover.install()
         if takeover == .installed { defaultMode = .vnetDirect }
@@ -418,30 +429,30 @@ final class BrowserStore: ObservableObject {
     // MARK: 様子
 
     private func setOnline(_ online: Bool) {
-        if online == isOnline { return }
-        isOnline = online
+        if online == status.isOnline { return }
+        status.isOnline = online
         logs.add(online ? "ネットワークにつながりました" : "⚠️ ネットワークにつながっていません", level: online ? .info : .warning, category: .app)
     }
 
     private func refreshStatus() {
         guard defaultMode.usesVNet || tabs.contains(where: { $0.mode.usesVNet }) else {
-            vnetStatus = "VNet: 使っていません（\(takeover.description)）"
+            status.vnetStatus = "VNet: 使っていません（\(takeover.description)）"
             return
         }
         machine.stats { [weak self] s in
             let store = self
             let text = (s.ready ? "IP \(s.ip)" : "IP をもらっています…") + "・" + s.summary
             Task { @MainActor in
-                store?.vnetReady = s.ready
-                store?.vnetStatus = text
-                if store?.showDevPanel == true { store?.vnetStats = s }
+                store?.status.vnetReady = s.ready
+                store?.status.vnetStatus = text
+                if store?.showDevPanel == true { store?.status.vnetStats = s }
             }
         }
     }
 
     private func flushLogIfVisible() {
         guard showDevPanel else { return }
-        devTick += 1
+        status.devTick += 1
     }
 
     // MARK: 設定・データ

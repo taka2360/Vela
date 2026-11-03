@@ -55,15 +55,13 @@ struct BrowserView: View {
             if store.tabs.count > 1 {
                 TabStrip(store: store)
             }
-            if !store.isOnline {
-                OfflineBanner()
-            }
+            OfflineBanner(status: store.status)
             Divider()
             PageArea(store: store)
                 .overlay(alignment: .top) { SuggestionOverlay(store: store, editor: store.address) }
         }
         .background(ShortcutKeys(store: store))
-        .sheet(isPresented: $store.showDevPanel) { DevPanel(store: store) }
+        .sheet(isPresented: $store.showDevPanel) { DevPanel(store: store, status: store.status) }
         .sheet(isPresented: $store.showAdBlock) { AdBlockView(adblock: store.adblock) }
         .sheet(isPresented: $store.showSettings) { SettingsView(store: store) }
         .sheet(isPresented: $store.showLibrary) { LibraryView(store: store, library: store.library) }
@@ -110,17 +108,22 @@ struct TopBar: View {
 }
 
 /// ネットワークにつながっていないときの帯
+/// つながっていないときだけ出す帯（つながっているときは何も出さない）
 struct OfflineBanner: View {
+    @ObservedObject var status: StatusModel
+
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "wifi.slash")
-            Text("ネットワークにつながっていません")
+        if !status.isOnline {
+            HStack(spacing: 8) {
+                Image(systemName: "wifi.slash")
+                Text("ネットワークにつながっていません")
+            }
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundColor(.white)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 5)
+            .background(Color.orange)
         }
-        .font(.system(size: 13, weight: .semibold))
-        .foregroundColor(.white)
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 5)
-        .background(Color.orange)
     }
 }
 
@@ -246,7 +249,7 @@ struct AddressField: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
-            ModeBadge(tab: tab, ready: store.vnetReady)
+            ModeBadge(tab: tab, status: store.status)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.horizontal, 10)
@@ -267,7 +270,8 @@ struct AddressField: View {
 /// 通信の作りの小さな札（VNet か標準か。VNet を通らない通信を使っていれば知らせる）
 struct ModeBadge: View {
     @ObservedObject var tab: BrowserTab
-    let ready: Bool
+    @ObservedObject var status: StatusModel
+    private var ready: Bool { status.vnetReady }
 
     var body: some View {
         HStack(spacing: 4) {
@@ -1040,7 +1044,7 @@ struct SiteTile: View {
 // MARK: - 開発者パネル（「…」メニュー・⌘⌥I から。普段の画面とは分ける）
 //
 // ページ: 概要・ログ・通信・タブ・Cookie・HSTS・広告ブロック・VNet・システム・範囲とリスク
-// 開いている間だけ、BrowserStore.devTick（0.5 秒ごと）で描き直す。どのページも、数が多いものは新しい方から数百件だけ出す
+// 開いている間だけ、StatusModel.devTick（0.5 秒ごと）で描き直す。どのページも、数が多いものは新しい方から数百件だけ出す
 
 enum DevPage: String, CaseIterable, Hashable {
     case overview = "概要", log = "ログ", network = "通信", tabs = "タブ", cookies = "Cookie", hsts = "HSTS"
@@ -1050,6 +1054,7 @@ enum DevPage: String, CaseIterable, Hashable {
 @MainActor
 struct DevPanel: View {
     @ObservedObject var store: BrowserStore
+    @ObservedObject var status: StatusModel
     @Environment(\.dismiss) private var dismiss
     @State private var page = DevPage.overview
 
@@ -1061,15 +1066,15 @@ struct DevPanel: View {
                 Menu {
                     Button("ログをコピー") { UIPasteboard.general.string = store.logs.export() }
                     Button("通信の記録をコピー") { UIPasteboard.general.string = store.netLog.export() }
-                    Button(store.hadCrash ? "前回の記録をコピー（落ちた）" : "前回の記録をコピー") {
+                    Button(status.hadCrash ? "前回の記録をコピー（落ちた）" : "前回の記録をコピー") {
                         UIPasteboard.general.string = CrashLog.previous() ?? "（前回の記録はありません）"
                     }
                 } label: {
-                    Label(store.hadCrash ? "コピー（前回は落ちた）" : "コピー", systemImage: "doc.on.doc")
+                    Label(status.hadCrash ? "コピー（前回は落ちた）" : "コピー", systemImage: "doc.on.doc")
                 }
             }
             DevPageBar(page: $page)
-            DevPageContent(store: store, page: page, tick: store.devTick)
+            DevPageContent(store: store, page: page, tick: status.devTick)
         }
         .padding()
     }
@@ -1106,14 +1111,14 @@ struct DevPageContent: View {
 
     var body: some View {
         switch page {
-        case .overview: DevOverview(store: store, tick: tick)
+        case .overview: DevOverview(store: store, tick: tick, status: store.status)
         case .log: DevLogPage(store: store, tick: tick)
         case .network: DevNetworkPage(store: store, tick: tick)
         case .tabs: DevTabsPage(store: store, tick: tick)
         case .cookies: DevCookiePage(store: store, tick: tick)
         case .hsts: DevHSTSPage(store: store, tick: tick)
         case .adblock: DevAdBlockPage(store: store, tick: tick, adblock: store.adblock)
-        case .vnet: DevVNetPage(store: store, tick: tick)
+        case .vnet: DevVNetPage(store: store, tick: tick, status: store.status)
         case .system: DevSystemPage(store: store, tick: tick)
         case .scope: DevScopePage()
         }
@@ -1138,6 +1143,7 @@ struct DevOverview: View {
     /// 変わると描き直す（中身は使わない）。@Published でない値（ログ・通信の記録・Cookie・HSTS・WebView の数・
     /// ダウンロード中の数）を毎秒出し直すため。今は store が毎秒変わることでも描き直している
     let tick: Int
+    @ObservedObject var status: StatusModel
 
     var body: some View {
         ScrollView {
@@ -1145,13 +1151,13 @@ struct DevOverview: View {
                 Group {
                 DevLine(store.takeover.description)
                 DevLine("新しいタブの通信: \(store.defaultMode.rawValue)")
-                DevLine("VNet: \(store.vnetStatus)")
+                DevLine("VNet: \(status.vnetStatus)")
                 DevLine("タブ \(store.tabs.count) 枚・動いている WebView \(store.liveWebViewCount) / \(BrowserStore.maxLiveWebViews)")
                 DevLine("Cookie（写し）\(store.cookieJar.count) 個・HSTS \(store.hsts.all().count) 件")
                 DevLine("広告ブロック: \(store.adblock.enabled ? "使う" : "止めている")・VNet 用のルール \(store.adblock.ruleCount) 個・止めた数 \(store.adblock.totalBlocked)")
-                DevLine("ネットワーク: \(store.isOnline ? "つながっている" : "つながっていない")・ダウンロード中 \(store.downloads.runningCount) 件")
+                DevLine("ネットワーク: \(status.isOnline ? "つながっている" : "つながっていない")・ダウンロード中 \(store.downloads.runningCount) 件")
                 DevLine("ログ: 警告 \(store.logs.count(.warning))・エラー \(store.logs.count(.error))・通信の記録 \(store.netLog.count) 件")
-                if store.hadCrash { DevLine("⚠️ 前回は落ちて終わりました（右上の「コピー」→ 前回の記録）") }
+                if status.hadCrash { DevLine("⚠️ 前回は落ちて終わりました（右上の「コピー」→ 前回の記録）") }
                 }
                 Divider().padding(.vertical, 6)
                 Text("最近の警告・エラー").font(.subheadline)

@@ -197,13 +197,14 @@ struct DevVNetPage: View {
     /// 変わると描き直す（中身は使わない）。@Published でない値（ログ・通信の記録・Cookie・HSTS・WebView の数・
     /// ダウンロード中の数）を毎秒出し直すため。今は store が毎秒変わることでも描き直している
     let tick: Int
+    @ObservedObject var status: StatusModel
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 4) {
                 DevLine(store.takeover.description)
                 DevLine("新しいタブの通信: \(store.defaultMode.rawValue)")
-                if let s = store.vnetStats {
+                if let s = status.vnetStats {
                     DevLine("IP: \(s.ready ? s.ip : "（まだ）")")
                     DevLine("フレーム: 送 \(s.framesOut)（\(s.bytesOut / 1024)KB）・受 \(s.framesIn)（\(s.bytesIn / 1024)KB）・捨てた \(s.droppedRx)")
                     DevLine("TCP: 送り直し \(s.tcpRetransmits)・順番を直した \(s.tcpReordered)")
