@@ -112,6 +112,28 @@ func packetTests() {
         g.compact(above: 131072, resetWhenEmpty: true)
         expectEqual(g.pos, 0); expectEqual(Array(g.slice(at: 0, count: g.count)), before)
     }
+    test("GuestStack.resolve: 数字のアドレスとして、すぐ答えるもの（ゆるい読み方）") {
+        let q = DispatchQueue(label: "test-resolve")
+        let g = GuestStack(queue: q)
+        func literal(_ s: String) -> [UInt8]? {
+            var got: [UInt8]?
+            q.sync { g.resolve(s) { got = $0 } }       // 数字のアドレスなら、その場で done が呼ばれる
+            return got
+        }
+        expectEqual(literal("192.168.1.10"), [192, 168, 1, 10])
+        expectEqual(literal("1..2.3.4"), [1, 2, 3, 4], "空の所は飛ばす")
+        expectEqual(literal(".1.2.3.4"), [1, 2, 3, 4])
+        expectEqual(literal("1.2.3.4."), [1, 2, 3, 4])
+        expectEqual(literal("+1.2.3.4"), [1, 2, 3, 4], "UInt8(\"+1\") は読める")
+        expectEqual(literal("0001.2.3.4"), [1, 2, 3, 4])
+        expectEqual(literal("010.0.0.1"), [10, 0, 0, 1], "8 進数にはしない")
+        expect(literal("256.1.1.1") == nil)
+        expect(literal("1.2.3") == nil)
+        expect(literal("1.2.3.4.5") == nil)
+        expect(literal("a.b.c.d") == nil)
+        expect(literal(" 1.2.3.4") == nil)
+        expect(literal("") == nil)
+    }
     test("EthernetFrame・ARPPacket を読む") {
         let mac: [UInt8] = [2, 0, 0, 0, 0, 9]
         let f = arpFrame(op: ARP.request, srcMAC: mac, senderIP: [10, 0, 2, 9], targetIP: Net.dns)
