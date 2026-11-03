@@ -33,6 +33,26 @@ func vnetSchemeHTTPSFirstCopy(http: URL, real: URL, message: String, actions: Pa
 
 func httpsFirstPageTests() {
     print("HTTPS-First のページ")
+    test("HTTPSFirst.eligible は、前の 2 か所の式と同じ答え") {
+        // 前の式（BrowserTab と VNetScheme で同じだった）をそのまま写したもの
+        func old(_ h: String, _ port: Int?, _ allowed: Set<String>) -> Bool {
+            !allowed.contains(h) && !SiteUtil.isIPLiteral(h) && LocalNetworkPolicy.classify(host: h) == nil && port == nil
+        }
+        let hosts = ["example.com", "EXAMPLE.com.", "example.com.", "192.168.0.1", "8.8.8.8", "::1", "[::1]", "fe80::1",
+                     "printer.local", "localhost", "router.home.arpa", "10.0.0.1", "allowed.test", ""]
+        for h in hosts {
+            for port in [nil, 80, 8080] as [Int?] {
+                for allowed in [Set<String>(), ["allowed.test", "example.com"]] {
+                    expectEqual(HTTPSFirst.eligible(host: h, port: port, allowed: allowed), old(h, port, allowed), "\(h) \(String(describing: port))")
+                }
+            }
+        }
+        expect(HTTPSFirst.eligible(host: "example.com", port: nil, allowed: []))
+        expect(!HTTPSFirst.eligible(host: "example.com", port: 80, allowed: []), ":80 を書いても対象外")
+        expect(!HTTPSFirst.eligible(host: "192.168.0.1", port: nil, allowed: []))
+        expect(!HTTPSFirst.eligible(host: "printer.local", port: nil, allowed: []))
+        expect(!HTTPSFirst.eligible(host: "example.com", port: nil, allowed: ["example.com"]))
+    }
     let http = url("http://example.com/a?b=1")
     let https = url("https://example.com/a?b=1")
 

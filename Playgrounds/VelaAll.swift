@@ -3280,7 +3280,7 @@ final class BrowserTab: ObservableObject, Identifiable {
     /// HTTPS-First（標準の通信）: ページを開く http:// を https に上げるなら、その URL
     func httpsFirstUpgrade(_ u: URL) -> URL? {
         guard VelaSettings.httpsFirst, mode == .native, u.scheme?.lowercased() == "http", let h = u.host?.lowercased(),
-              !httpAllowedHosts.contains(h), !SiteUtil.isIPLiteral(h), LocalNetworkPolicy.classify(host: h) == nil, u.port == nil,
+              HTTPSFirst.eligible(host: h, port: u.port, allowed: httpAllowedHosts),
               var c = URLComponents(url: u, resolvingAgainstBaseURL: false) else { return nil }
         c.scheme = "https"
         httpsFirstFrom = u
@@ -6060,8 +6060,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         let reason: String
         if hsts?.shouldUpgrade(h) == true {
             reason = "HSTS"
-        } else if httpsFirst && ctx.isTopLevel && !httpAllowedHosts.contains(h) && !SiteUtil.isIPLiteral(h)
-                    && LocalNetworkPolicy.classify(host: h) == nil && c.port == nil {
+        } else if httpsFirst && ctx.isTopLevel && HTTPSFirst.eligible(host: h, port: c.port, allowed: httpAllowedHosts) {
             // 公開の名前のホストだけ（LAN・数字のアドレス・ポート指定は、https が無いことが多いので上げない）
             reason = "HTTPS-First"
         } else {
@@ -7063,6 +7062,15 @@ struct RequestContext: Sendable {
 // MARK: - CORS
 
 /// サーバーの Access-Control-* をそのまま通す。Vela が自分で許可を作ることはしない
+/// HTTPS-First（http:// のページをまず https で開いてみる）の対象になるホストか（標準の通信・VNet の両方が使う）
+enum HTTPSFirst {
+    /// 公開の名前のホストだけ: 「http のまま開く」で許したホストでない・数字のアドレスでない・LAN でない・ポートを書いていない（:80 も）。
+    /// host の作り方（小文字にする・末尾の . を外すか など）と、ほかの条件（設定・トップレベルか・HSTS）は呼ぶ側が決める
+    static func eligible(host: String, port: Int?, allowed: Set<String>) -> Bool {
+        !allowed.contains(host) && !SiteUtil.isIPLiteral(host) && LocalNetworkPolicy.classify(host: host) == nil && port == nil
+    }
+}
+
 enum CORSPassthrough {
     /// vnetsMode: 予備の vnets:// 方式（開発者向け）。そのときだけ、許可されたオリジンの https:// を vnets:// に読み替える
     static func headers(_ server: [(String, String)], vnetsMode: Bool) -> [(String, String)] {

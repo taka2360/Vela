@@ -872,7 +872,7 @@ final class BrowserTab: ObservableObject, Identifiable {
     /// HTTPS-First（標準の通信）: ページを開く http:// を https に上げるなら、その URL
     func httpsFirstUpgrade(_ u: URL) -> URL? {
         guard VelaSettings.httpsFirst, mode == .native, u.scheme?.lowercased() == "http", let h = u.host?.lowercased(),
-              !httpAllowedHosts.contains(h), !SiteUtil.isIPLiteral(h), LocalNetworkPolicy.classify(host: h) == nil, u.port == nil,
+              HTTPSFirst.eligible(host: h, port: u.port, allowed: httpAllowedHosts),
               var c = URLComponents(url: u, resolvingAgainstBaseURL: false) else { return nil }
         c.scheme = "https"
         httpsFirstFrom = u

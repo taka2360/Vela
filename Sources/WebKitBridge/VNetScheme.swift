@@ -173,8 +173,7 @@ final class VNetScheme: NSObject, WKURLSchemeHandler, @unchecked Sendable {
         let reason: String
         if hsts?.shouldUpgrade(h) == true {
             reason = "HSTS"
-        } else if httpsFirst && ctx.isTopLevel && !httpAllowedHosts.contains(h) && !SiteUtil.isIPLiteral(h)
-                    && LocalNetworkPolicy.classify(host: h) == nil && c.port == nil {
+        } else if httpsFirst && ctx.isTopLevel && HTTPSFirst.eligible(host: h, port: c.port, allowed: httpAllowedHosts) {
             // 公開の名前のホストだけ（LAN・数字のアドレス・ポート指定は、https が無いことが多いので上げない）
             reason = "HTTPS-First"
         } else {

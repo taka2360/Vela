@@ -55,6 +55,15 @@ struct RequestContext: Sendable {
 // MARK: - CORS
 
 /// サーバーの Access-Control-* をそのまま通す。Vela が自分で許可を作ることはしない
+/// HTTPS-First（http:// のページをまず https で開いてみる）の対象になるホストか（標準の通信・VNet の両方が使う）
+enum HTTPSFirst {
+    /// 公開の名前のホストだけ: 「http のまま開く」で許したホストでない・数字のアドレスでない・LAN でない・ポートを書いていない（:80 も）。
+    /// host の作り方（小文字にする・末尾の . を外すか など）と、ほかの条件（設定・トップレベルか・HSTS）は呼ぶ側が決める
+    static func eligible(host: String, port: Int?, allowed: Set<String>) -> Bool {
+        !allowed.contains(host) && !SiteUtil.isIPLiteral(host) && LocalNetworkPolicy.classify(host: host) == nil && port == nil
+    }
+}
+
 enum CORSPassthrough {
     /// vnetsMode: 予備の vnets:// 方式（開発者向け）。そのときだけ、許可されたオリジンの https:// を vnets:// に読み替える
     static func headers(_ server: [(String, String)], vnetsMode: Bool) -> [(String, String)] {
