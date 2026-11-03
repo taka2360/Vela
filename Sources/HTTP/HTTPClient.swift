@@ -96,6 +96,29 @@ struct FetchError: Error, Sendable, CustomStringConvertible {
     }
 }
 
+// MARK: - 名前を引いた結果の覚え
+
+/// 名前 → IPv4 アドレスを覚えておく（HTTPPool の中だけ・stack.queue の上だけで使う。鍵は無い）。
+/// 覚えてから ttl 秒より前（<）なら使う。成功したものだけ覚える（数字のアドレスも覚える）。
+/// 古いものを消すことはしない（今の動き。名前の数だけ増える。数は stats の dnsCached に出る）
+final class DNSCache {
+    static let ttl: TimeInterval = 300
+    private var entries: [String: (ip: [UInt8], at: Date)] = [:]
+    private let now: () -> Date
+
+    /// now: テストで時計を進めるため（ふだんは Date()）
+    init(now: @escaping () -> Date = { Date() }) { self.now = now }
+
+    var count: Int { entries.count }
+
+    func lookup(_ host: String) -> [UInt8]? {
+        guard let c = entries[host], now().timeIntervalSince(c.at) < DNSCache.ttl else { return nil }
+        return c.ip
+    }
+
+    func store(_ host: String, _ ip: [UInt8]) { entries[host] = (ip, now()) }
+}
+
 // MARK: - 1 本の接続
 
 /// 1 本の接続（TCP、https ならその上に TLS）。使い終わったら、次の要求に使い回す
@@ -323,7 +346,7 @@ final class HTTPPool: @unchecked Sendable {
     private var waiting: [String: [Waiter]] = [:]
     /// 全体の待ち（接続の合計が上限・貯めている中身が上限）
     private var admission: [Waiter] = []
-    private var dnsCache: [String: (ip: [UInt8], at: Date)] = [:]
+    private let dnsCache = DNSCache()
     /// 名前を引いて分かったアドレスの種類（トップのページが LAN のものかを見るのに使う）
     private var hostClass: [String: IPClass] = [:]
     /// 使っていない接続を、これより長く置いておかない（相手はたいてい黙って閉じている）
@@ -634,9 +657,9 @@ final class HTTPPool: @unchecked Sendable {
     }
 
     private func resolve(_ host: String, _ done: @escaping ([UInt8]?) -> Void) {
-        if let c = dnsCache[host], Date().timeIntervalSince(c.at) < 300 { done(c.ip); return }
+        if let ip = dnsCache.lookup(host) { done(ip); return }
         stack.resolve(host) { [weak self] ip in
-            if let ip { self?.dnsCache[host] = (ip, Date()) }
+            if let ip { self?.dnsCache.store(host, ip) }
             done(ip)
         }
     }

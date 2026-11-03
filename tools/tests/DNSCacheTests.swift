@@ -9,6 +9,29 @@ final class Counter: @unchecked Sendable {
     func get(_ k: String) -> Int { lock.lock(); defer { lock.unlock() }; return counts[k] ?? 0 }
 }
 
+final class FakeClock: @unchecked Sendable { var t = Date(timeIntervalSince1970: 1_000_000) }
+
+func dnsCacheUnitTests() {
+    print("DNSCache")
+    test("300 秒より前（<）なら使う・ちょうど 300 秒で使わない・消さない") {
+        let clock = FakeClock()
+        let c = DNSCache(now: { clock.t })
+        expect(c.lookup("a.test") == nil)
+        c.store("a.test", [1, 2, 3, 4])
+        expectEqual(c.lookup("a.test"), [1, 2, 3, 4])
+        clock.t = clock.t.addingTimeInterval(299.9)
+        expectEqual(c.lookup("a.test"), [1, 2, 3, 4], "299.9 秒後")
+        clock.t = clock.t.addingTimeInterval(0.1)
+        expect(c.lookup("a.test") == nil, "ちょうど 300 秒")
+        expectEqual(c.count, 1, "古くなっても消さない")
+        c.store("a.test", [5, 6, 7, 8])
+        expectEqual(c.lookup("a.test"), [5, 6, 7, 8], "覚え直すと、その時刻から 300 秒")
+        c.store("1.2.3.4", [1, 2, 3, 4])
+        expectEqual(c.count, 2)
+        expectEqual(DNSCache.ttl, 300)
+    }
+}
+
 /// 偽のサーバーで、DNS に何回問い合わせたかを数える（今の動きを書き留めたもの）
 func dnsCacheNetTests() {
     print("DNS の覚え（偽のサーバー）")
