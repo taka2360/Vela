@@ -1,0 +1,53 @@
+# uBlock Origin の最新の安定版から、スクリプトレットの道具（resources/ubo-scriptlets.json）を作り直して署名する。
+# 中身が変わったときだけコミットする。秘密鍵は Secrets の UBO_SIGNING_KEY（resources/README.md）
+name: ubo-scriptlets
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'uBO のタグ（空なら最新の安定版）'
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ubo-scriptlets
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Build and sign
+        env:
+          UBO_SIGNING_KEY: ${{ secrets.UBO_SIGNING_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node tools/ubo/build_scriptlets.mjs ${{ github.event.inputs.tag }}
+      - name: Verify signature
+        run: node tools/ubo/verify.mjs
+      - name: Assemble with Vela's Swift code (runner's preinstalled Swift)
+        run: |
+          swift --version
+          swiftc -O Sources/Policy/SiteUtil.swift Sources/AdBlock/FilterPreparser.swift Sources/AdBlock/ABPFilter.swift \
+                 Sources/AdBlock/Scriptlets.swift tools/ubo/assemble/main.swift -o /tmp/vela-assemble
+          /tmp/vela-assemble
+      - name: Assembled scriptlets still run
+        run: node tools/ubo/test_assembled.mjs
+      - name: Names used by the lists
+        run: node tools/ubo/check_lists.mjs
+      - name: Commit
+        run: |
+          if git diff --quiet -- resources; then echo "変わっていません"; exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add resources/ubo-scriptlets.json resources/ubo-scriptlets.json.sig
+          git commit -m "uBO のスクリプトレットを $(node -p "require('./resources/ubo-scriptlets.json').ubo") から作り直す"
+          git push

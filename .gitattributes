@@ -1,1 +1,4 @@
 *.sh text eol=lf
+# 署名したファイルは、改行を変えない（変えると署名が合わなくなる）
+resources/ubo-scriptlets.json -text
+resources/ubo-scriptlets.json.sig -text

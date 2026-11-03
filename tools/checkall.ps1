@@ -26,6 +26,14 @@ try {
     "tests: exit=$code | " + (($out | Select-Object -Last 1) -as [string])
     if ($code -ne 0) { $ok = $false; $out | Select-Object -Last 40 }
 
+    # uBO scriptlets: the signed JSON matches the embedded public key, and the JS assembled by the unit tests runs in node
+    foreach ($js in @('tools\ubo\verify.mjs', 'tools\ubo\test_assembled.mjs')) {
+        $out = node (Join-Path $root $js) 2>&1
+        $code = $LASTEXITCODE
+        "node [$js]: exit=$code | " + (($out | Select-Object -Last 1) -as [string])
+        if ($code -ne 0) { $ok = $false; $out | Select-Object -Last 40 }
+    }
+
     if ($ok) { 'ALL OK'; $final = 0 } else { 'SOMETHING FAILED'; $final = 1 }
 } finally {
     Pop-Location

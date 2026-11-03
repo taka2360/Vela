@@ -1,0 +1,6 @@
+! テスト用のホストのルール（tools/ubo/test_assembled.mjs が中身の動きを確かめる）
+vela-selftest.invalid##+js(json-prune, adPlacements playerAds)
+vela-selftest.invalid##+js(set, ytInitialPlayerResponse.adSlots, undefined)
+vela-selftest.invalid##+js(trusted-rpfr, '"adSlots"', '"no_ads"', /player)
+vela-selftest.invalid##+js(trusted-edit-inbound-object, JSON.stringify, 0, [?.context].context.client+={"clientScreen":"CHANNEL"})
+vela-selftest.invalid##+js(json-prune-fetch-response, adPlacements, , propsToMatch, /player)
