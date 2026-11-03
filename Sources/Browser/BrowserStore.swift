@@ -77,6 +77,10 @@ final class BrowserStore: ObservableObject {
     let downloads = DownloadManager()
     /// ブックマークと履歴
     let library = Library()
+    /// ホームの設定（背景・出す項目）
+    let home = HomeStore()
+    /// サイトのアイコン（ホームのタイル）
+    let icons = SiteIconStore()
     /// 広告ブロック
     let adblock = AdBlocker()
     @Published var showAdBlock = false
@@ -160,6 +164,24 @@ final class BrowserStore: ObservableObject {
         if defaultMode == .vnetsLegacy { compileVNetOnlyRules() }
 
         library.load(logs: logs)
+        home.load(logs: logs)
+        icons.load(logs: logs)
+        if defaultMode.usesVNet {
+            let m = machine
+            icons.vnetFetch = { u, done in
+                var req = HTTPRequest(url: u)
+                req.headers = [("Accept", "image/*,*/*;q=0.8")]
+                req.context.cookiesAllowed = false
+                m.send(req) { r in
+                    if case .success(let res) = r, res.status == 200, !res.body.isEmpty, res.body.count <= SiteIconStore.maxBytes {
+                        done(res.body)
+                    } else {
+                        done(nil)
+                    }
+                }
+            }
+        }
+        library.onClearAllHistory = { [weak self] in self?.icons.removeAll() }
         adblock.onRuleListsChanged = { [weak self] userAction in
             guard let self else { return }
             // 利用者が ON/OFF を切り替えたときだけ、見ているタブを読み直す（リストの自動更新では読み直さない。動画の途中で止まらないように）

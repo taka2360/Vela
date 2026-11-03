@@ -59,7 +59,7 @@ STAMP=$MODS/.stamp
 if [ ! -f "$STAMP" ] || [ -n "$(find "$HERE/stubs" -newer "$STAMP" -name '*.swift')" ]; then
     echo "スタブ（SwiftUI・WebKit など iOS の部品の形だけ）を用意しています…"
     rm -rf "$MODS"; mkdir -p "$MODS"
-    for m in UIKit ObjectiveC Compression Security CryptoKit Network WebKit SwiftUI; do
+    for m in UIKit ObjectiveC Compression Security CryptoKit Network WebKit SwiftUI PhotosUI; do
         # エラーが 1 つでもあれば止める（古いモジュールのまま調べて「OK」と出さないように、作りかけも消す）
         if "$SWIFTC" -swift-version 5 -parse-as-library -emit-module -module-name "$m" -I "$MODS" \
                 -emit-module-path "$MODS/$m.swiftmodule" "$HERE/stubs/$m.swift" 2>&1 | grep -E "error"; then

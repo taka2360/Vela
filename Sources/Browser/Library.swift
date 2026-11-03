@@ -9,6 +9,8 @@ final class Library: ObservableObject {
     @Published private(set) var bookmarks = BookmarkList()
     @Published private(set) var history = HistoryLog()
     var log: ((String) -> Void)?
+    /// 履歴を全部消したとき（サイトのアイコンも消す）
+    var onClearAllHistory: (() -> Void)?
     private let bookmarkFile = JSONFile<BookmarkList>(name: "bookmarks.json", delay: 0.5)
     /// 履歴はページを開くたびに変わるので、まとめて書く
     private let historyFile = JSONFile<HistoryLog>(name: "history.json", delay: 5)
@@ -93,6 +95,7 @@ final class Library: ObservableObject {
     func clearHistory(since: Date?) {
         history.clear(since: since)
         historyFile.saveNow(history)
+        if since == nil { onClearAllHistory?() }
         log?(since == nil ? "履歴を全部消しました" : "履歴を消しました（\(since!) から後）")
     }
 

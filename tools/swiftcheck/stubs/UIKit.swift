@@ -80,6 +80,25 @@ open class UIApplication: UIResponder {
 open class UIImage: NSObject {
     public init?(systemName: String) { super.init() }
     public init?(data: Data) { super.init() }
+    open var size: CGSize { .zero }
+    open var scale: CGFloat { 1 }
+    open func draw(in rect: CGRect) {}
+    open func pngData() -> Data? { nil }
+    open func jpegData(compressionQuality: CGFloat) -> Data? { nil }
+}
+
+open class UIGraphicsImageRendererFormat: NSObject {
+    public override init() { super.init() }
+    open var scale: CGFloat = 1
+    open var opaque = false
+}
+open class UIGraphicsImageRendererContext: NSObject {}
+open class UIGraphicsImageRenderer: NSObject {
+    public init(size: CGSize, format: UIGraphicsImageRendererFormat) { super.init() }
+    public init(size: CGSize) { super.init() }
+    open func image(actions: (UIGraphicsImageRendererContext) -> Void) -> UIImage { fatalError() }
+    open func pngData(actions: (UIGraphicsImageRendererContext) -> Void) -> Data { Data() }
+    open func jpegData(withCompressionQuality compressionQuality: CGFloat, actions: (UIGraphicsImageRendererContext) -> Void) -> Data { Data() }
 }
 
 // MARK: - 部品（コントロール・メニュー・クリップボード）

@@ -3,6 +3,7 @@
 
 import SwiftUI
 import WebKit
+import PhotosUI
 import Foundation
 import Network
 #if canImport(FoundationNetworking)

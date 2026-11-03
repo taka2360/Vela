@@ -18,7 +18,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\swiftcheck\swiftcheck.
 ```
 
 - 最後の行が `結果: OK` ならエラー無し。`結果: NG` なら「==== エラー ====」の所を直す（終了コードも 0 / 1）
-- SwiftUI・WebKit・UIKit・Network・Security・Compression・CryptoKit・ObjectiveC は Linux に無いので、`tools/swiftcheck/stubs/` の**形だけの定義（スタブ）**で代用している。
+- SwiftUI・WebKit・UIKit・Network・Security・Compression・CryptoKit・ObjectiveC・PhotosUI は Linux に無いので、`tools/swiftcheck/stubs/` の**形だけの定義（スタブ）**で代用している。
   - 「cannot find 'X' in scope」「has no member」などが iOS の本物の API について出たら、まずスタブの不足を疑う。本物の iOS 16 SDK と**同じ名前・ラベル・型**でスタブに足す（コードの方をスタブに合わせて曲げない）
   - スタブは本物よりゆるい所がある。OK でも iPad で 100% 通るとは限らない（特に MainActor・Sendable まわり）
 - 「Linux では調べられなかったもの」は iPad では通る想定のもの（Objective-C の `@convention(block)` など、NSObject の `override init` から iOS の API（WKWebView など）を触る所）。ふつうは無視してよい

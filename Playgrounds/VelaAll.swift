@@ -1,8 +1,9 @@
 // このファイルは merge_swift.py で自動生成したものです（直接編集しないでください）
-// 元ファイル: MyApp.swift, BrowserView.swift, BrowserControls.swift, TabViews.swift, LibraryView.swift, DevPanel.swift, DevPanelPages.swift, SettingsView.swift, AdBlockView.swift, ScriptletSelfTest.swift, Downloads.swift, SharedViews.swift, DownloadManager.swift, DownloadFiles.swift, BrowserModels.swift, BrowserStore.swift, BrowserTab.swift, TabWebDelegate.swift, Library.swift, LibraryModel.swift, AddressInput.swift, ErrorPages.swift, NetLog.swift, FilterLists.swift, FilterCatalog.swift, FilterPreparser.swift, ABPFilter.swift, Scriptlets.swift, ScriptletVerify.swift, BlockEngine.swift, ContentBlocker.swift, Persistence.swift, DevLog.swift, CrashLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, SiteUtil.swift, Cookies.swift, RedirectPolicy.swift, LocalNetworkPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPRequestBytes.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
+// 元ファイル: MyApp.swift, BrowserView.swift, BrowserControls.swift, TabViews.swift, LibraryView.swift, HomeViews.swift, DevPanel.swift, DevPanelPages.swift, SettingsView.swift, AdBlockView.swift, ScriptletSelfTest.swift, Downloads.swift, SharedViews.swift, DownloadManager.swift, DownloadFiles.swift, BrowserModels.swift, BrowserStore.swift, BrowserTab.swift, TabWebDelegate.swift, Library.swift, LibraryModel.swift, HomeStore.swift, SiteIcons.swift, HomeModel.swift, AddressInput.swift, ErrorPages.swift, NetLog.swift, FilterLists.swift, FilterCatalog.swift, FilterPreparser.swift, ABPFilter.swift, Scriptlets.swift, ScriptletVerify.swift, BlockEngine.swift, ContentBlocker.swift, Persistence.swift, DevLog.swift, CrashLog.swift, VNetScheme.swift, HTTPSTakeover.swift, PageScripts.swift, NetPolicy.swift, SiteUtil.swift, Cookies.swift, RedirectPolicy.swift, LocalNetworkPolicy.swift, CookieJar.swift, HSTSStore.swift, HTTPClient.swift, HTTPRequestBytes.swift, HTTPResponseParser.swift, HTTPSupport.swift, TLSClient.swift, GuestStack.swift, GuestTCP.swift, DNSMessage.swift, Packet.swift, VNetMachine.swift, VNetCore.swift, VNetDriver.swift, UserNet.swift, UserNetApple.swift
 
 import SwiftUI
 import WebKit
+import PhotosUI
 import Foundation
 import Network
 #if canImport(FoundationNetworking)
@@ -88,7 +89,7 @@ struct TopBar: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 14) {
+            HStack(spacing: 18) {
                 NavButtons(tab: tab)
                 Button { store.openLibrary(.bookmarks) } label: { Image(systemName: "book") }
                 AddressField(store: store, tab: tab, editor: store.address, library: store.library)
@@ -99,9 +100,10 @@ struct TopBar: View {
                     .keyboardShortcut("t", modifiers: .command)
                 Button { store.openTabOverview() } label: { Image(systemName: "square.on.square") }
             }
-            .font(.system(size: 18))
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            // 大きさは前（18pt・高さ 36）の 1.3 倍くらい
+            .font(.system(size: 23))
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
             LoadingBar(progress: tab.progress, visible: tab.isLoading)
         }
         .background(Color(UIColor.secondarySystemBackground))
@@ -133,7 +135,7 @@ struct NavButtons: View {
     @ObservedObject var tab: BrowserTab
 
     var body: some View {
-        HStack(spacing: 18) {
+        HStack(spacing: 23) {
             Button { tab.goBack() } label: { Image(systemName: "chevron.backward") }
                 .disabled(!tab.canGoBack)
                 .contextMenu { HistoryMenu(tab: tab, back: true) }
@@ -184,9 +186,9 @@ struct LoadingBar: View {
         GeometryReader { g in
             Rectangle()
                 .fill(Color.accentColor)
-                .frame(width: g.size.width * CGFloat(max(0.05, min(progress, 1))), height: 2)
+                .frame(width: g.size.width * CGFloat(max(0.05, min(progress, 1))), height: 3)
         }
-        .frame(height: 2)
+        .frame(height: 3)
         .opacity(visible ? 1 : 0)
     }
 }
@@ -215,8 +217,8 @@ struct AddressField: View {
                 }
             }
         }
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color(UIColor.tertiarySystemFill)))
-        .frame(height: 36)
+        .background(RoundedRectangle(cornerRadius: 13).fill(Color(UIColor.tertiarySystemFill)))
+        .frame(height: 46)
         .frame(maxWidth: .infinity)
         .onChange(of: focused) { f in
             if editor.editing != f { editor.editing = f }
@@ -233,28 +235,30 @@ struct AddressField: View {
             .textInputAutocapitalization(.never)
             .keyboardType(.webSearch)
             .submitLabel(.go)
+            .font(.system(size: 20))
             .onSubmit {
                 store.open(editor.text, in: tab)
                 focused = false
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 13)
     }
 
     private var display: some View {
-        HStack(spacing: 6) {
-            if tab.isSecure { Image(systemName: "lock.fill").font(.system(size: 12)).foregroundStyle(.secondary) }
+        HStack(spacing: 8) {
+            if tab.isSecure { Image(systemName: "lock.fill").font(.system(size: 16)).foregroundStyle(.secondary) }
             Text(displayText)
+                .font(.system(size: 20))
                 .lineLimit(1)
                 .foregroundColor(tab.url == nil ? .secondary : .primary)
             if tab.blockedCount > 0 {
                 Label("\(tab.blockedCount)", systemImage: "shield.lefthalf.filled")
-                    .font(.system(size: 11))
+                    .font(.system(size: 14))
                     .foregroundStyle(.secondary)
             }
             ModeBadge(tab: tab, status: store.status)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 13)
     }
 
     private var displayText: String {
@@ -278,14 +282,14 @@ struct ModeBadge: View {
     var body: some View {
         HStack(spacing: 4) {
             Text(label)
-                .font(.system(size: 10, weight: .semibold))
-                .padding(.horizontal, 5)
-                .padding(.vertical, 2)
-                .background(RoundedRectangle(cornerRadius: 4).fill(color.opacity(0.18)))
+                .font(.system(size: 13, weight: .semibold))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(RoundedRectangle(cornerRadius: 5).fill(color.opacity(0.18)))
                 .foregroundColor(color)
             if !tab.nonVNetUsage.isEmpty {
                 Text(tab.nonVNetUsage.sorted().joined(separator: "・"))
-                    .font(.system(size: 10))
+                    .font(.system(size: 13))
                     .foregroundStyle(.secondary)
             }
         }
@@ -363,7 +367,7 @@ struct TabPage: View {
         ZStack {
             WebHost(webView: tab.webView)
             if tab.url == nil {
-                StartPage(store: store, library: store.library)
+                StartPage(store: store, library: store.library, home: store.home, icons: store.icons)
             }
         }
     }
@@ -467,8 +471,8 @@ struct PageMenu: View {
             ModeSwitchItems(store: store, tab: tab)
         } label: {
             Text("ぁあ")
-                .font(.system(size: 15, weight: .medium))
-                .padding(.horizontal, 6)
+                .font(.system(size: 20, weight: .medium))
+                .padding(.horizontal, 8)
         }
     }
 }
@@ -676,7 +680,7 @@ struct TabCard: View {
 // MARK: - LibraryView.swift
 // ======================================================================
 
-// MARK: - ブックマーク・履歴の画面（シート）、アドレス欄の候補、新しいタブの画面
+// MARK: - ブックマーク・履歴の画面（シート）、アドレス欄の候補（新しいタブの画面は HomeViews.swift）
 
 struct LibraryView: View {
     @ObservedObject var store: BrowserStore
@@ -964,52 +968,159 @@ struct SuggestionList: View {
     }
 }
 
-// MARK: 新しいタブの画面（ブックマークとよく見るサイト）
+// ======================================================================
+// MARK: - HomeViews.swift
+// ======================================================================
 
+// MARK: - ホーム（新しいタブの画面）: 背景・ブックマークとよく見るサイトのタイル・カスタマイズの画面
+//
+// ・タイルを長押しすると、新しいタブで開く・コピー・名前を変える・並べ替え・削除（ブックマーク）、ブックマークに入れる・外す（よく見るサイト）
+// ・下の「編集」から、出す項目と背景（用意した色・自分の写真）を変えられる
+
+/// ホームのタイル 1 つ分
+struct HomeSite: Identifiable {
+    let title: String
+    let url: String
+    /// ブックマークのタイルなら、そのブックマーク
+    let bookmark: Bookmark?
+    var id: String { (bookmark?.id.uuidString ?? "top") + url }
+}
+
+@MainActor
 struct StartPage: View {
     @ObservedObject var store: BrowserStore
     @ObservedObject var library: Library
+    @ObservedObject var home: HomeStore
+    @ObservedObject var icons: SiteIconStore
+    @State private var customizing = false
+    @State private var renaming: Bookmark?
+    @State private var newTitle = ""
     private let columns = [GridItem(.adaptive(minimum: 96), spacing: 16)]
+    static let maxBookmarks = 24
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                let favorites = Array(library.bookmarks.items.prefix(12))
-                let top = library.history.topSites(limit: 8)
-                if favorites.isEmpty && top.isEmpty {
-                    EmptyNote(icon: "globe", text: "上のアドレス欄に、URL か調べたいことを入れてください")
-                        .padding(.top, 120)
+        let layout = home.layout
+        let onImage = layout.background != .none
+        let favorites = layout.showBookmarks ? Array(library.bookmarks.items.prefix(StartPage.maxBookmarks)) : []
+        let top = layout.showTopSites ? layout.visibleTopSites(library.history) : []
+        ZStack {
+            HomeBackgroundView(background: layout.background, photo: home.wallpaper)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    if favorites.isEmpty && top.isEmpty {
+                        HomeEmptyNote(onImage: onImage)
+                            .padding(.top, 120)
+                    }
+                    if !favorites.isEmpty {
+                        SiteGrid(title: "ブックマーク", onImage: onImage, columns: columns,
+                                 sites: favorites.map { HomeSite(title: $0.title, url: $0.url, bookmark: $0) }) { site in
+                            tile(site, onImage: onImage)
+                        }
+                    }
+                    if !top.isEmpty {
+                        SiteGrid(title: "よく見るサイト", onImage: onImage, columns: columns,
+                                 sites: top.map { HomeSite(title: $0.title, url: $0.url, bookmark: nil) }) { site in
+                            tile(site, onImage: onImage)
+                        }
+                    }
+                    HStack {
+                        Spacer()
+                        Button { customizing = true } label: {
+                            Label("編集", systemImage: "slider.horizontal.3")
+                                .font(.system(size: 15, weight: .medium))
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 8)
+                                .background(.regularMaterial, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        Spacer()
+                    }
+                    .padding(.top, 8)
                 }
-                if !favorites.isEmpty {
-                    SiteGrid(store: store, title: "ブックマーク", sites: favorites.map { ($0.title, $0.url) }, columns: columns)
-                }
-                if !top.isEmpty {
-                    SiteGrid(store: store, title: "よく見るサイト", sites: top.map { ($0.title, $0.url) }, columns: columns)
-                }
+                .frame(maxWidth: 760)
+                .padding(32)
+                .frame(maxWidth: .infinity)
             }
-            .frame(maxWidth: 760)
-            .padding(32)
-            .frame(maxWidth: .infinity)
         }
-        .background(Color(UIColor.systemBackground))
+        .sheet(isPresented: $customizing) {
+            HomeCustomizeView(home: home)
+        }
+        .alert("名前を変える", isPresented: Binding.present({ renaming }, clear: { renaming = nil })) {
+            TextField("名前", text: $newTitle)
+            Button("キャンセル", role: .cancel) { renaming = nil }
+            Button("OK") {
+                if let b = renaming { library.renameBookmark(b.id, title: newTitle) }
+                renaming = nil
+            }
+        } message: {
+            Text(renaming?.url ?? "")
+        }
+    }
+
+    private func tile(_ site: HomeSite, onImage: Bool) -> some View {
+        SiteTile(title: site.title, url: site.url, icon: icons.image(for: site.url), onImage: onImage) {
+            open(site.url, newTab: false)
+        }
+        .onAppear { icons.ensure(site.url, viaVNet: store.defaultMode.usesVNet) }
+        .contextMenu {
+            SiteLinkMenuItems(url: site.url) { open(site.url, newTab: true) }
+            if let b = site.bookmark {
+                Button {
+                    newTitle = b.title
+                    renaming = b
+                } label: { Label("名前を変える", systemImage: "pencil") }
+                Button { library.moveBookmark(b.id, by: -1) } label: { Label("前へ", systemImage: "arrow.left") }
+                Button { library.moveBookmark(b.id, by: 1) } label: { Label("後ろへ", systemImage: "arrow.right") }
+                Button(role: .destructive) { library.removeBookmark(b.id) } label: { Label("削除", systemImage: "trash") }
+            } else {
+                if !library.bookmarks.contains(site.url), let u = URL(string: site.url) {
+                    Button { library.toggleBookmark(url: u, title: site.title) } label: { Label("ブックマークに入れる", systemImage: "book") }
+                }
+                Button(role: .destructive) { home.hideTopSite(site.url) } label: { Label("よく見るサイトから外す", systemImage: "eye.slash") }
+            }
+        }
+    }
+
+    private func open(_ url: String, newTab: Bool) {
+        guard let u = URL(string: url) else { return }
+        store.open(url: u, newTab: newTab)
     }
 }
 
-struct SiteGrid: View {
-    let store: BrowserStore
+/// 何も無いときの案内（背景が画像なら白い字）
+struct HomeEmptyNote: View {
+    let onImage: Bool
+
+    var body: some View {
+        if onImage {
+            VStack(spacing: 10) {
+                Image(systemName: "globe").font(.system(size: 36))
+                Text("上のアドレス欄に、URL か調べたいことを入れてください").multilineTextAlignment(.center)
+            }
+            .foregroundColor(.white)
+            .shadow(color: .black.opacity(0.5), radius: 3)
+            .frame(maxWidth: .infinity)
+        } else {
+            EmptyNote(icon: "globe", text: "上のアドレス欄に、URL か調べたいことを入れてください")
+        }
+    }
+}
+
+struct SiteGrid<Tile: View>: View {
     let title: String
-    let sites: [(String, String)]
+    let onImage: Bool
     let columns: [GridItem]
+    let sites: [HomeSite]
+    @ViewBuilder let tile: (HomeSite) -> Tile
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(title).font(.headline)
-            LazyVGrid(columns: columns, spacing: 16) {
-                ForEach(sites, id: \.1) { site in
-                    SiteTile(title: site.0, url: site.1) {
-                        if let u = URL(string: site.1) { store.open(url: u) }
-                    }
-                }
+                .foregroundColor(onImage ? .white : .primary)
+                .shadow(color: onImage ? .black.opacity(0.5) : .clear, radius: 3)
+            // タイルの高さはそろえてある（SiteTile.titleHeight）ので、アイコンの y は名前の長さで変わらない
+            LazyVGrid(columns: columns, alignment: .center, spacing: 16) {
+                ForEach(sites) { site in tile(site) }
             }
         }
     }
@@ -1018,25 +1129,226 @@ struct SiteGrid: View {
 struct SiteTile: View {
     let title: String
     let url: String
+    let icon: UIImage?
+    let onImage: Bool
     let open: () -> Void
+
+    static let iconSide: CGFloat = 64
+    /// 名前は 2 行まで。1 行でも 2 行分の高さを取って、アイコンの位置（y）をそろえる
+    static let titleHeight: CGFloat = 30
 
     var body: some View {
         Button(action: open) {
             VStack(spacing: 6) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 14).fill(Color(UIColor.tertiarySystemFill))
-                    Text(initial).font(.system(size: 26, weight: .semibold)).foregroundStyle(.secondary)
-                }
-                .frame(width: 64, height: 64)
-                Text(title.isEmpty ? host : title).font(.system(size: 12)).lineLimit(2).multilineTextAlignment(.center)
-                    .foregroundColor(.primary)
+                SiteIconView(icon: icon, initial: initial, onImage: onImage)
+                Text(title.isEmpty ? host : title)
+                    .font(.system(size: 12))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+                    .foregroundColor(onImage ? .white : .primary)
+                    .shadow(color: onImage ? .black.opacity(0.6) : .clear, radius: 2)
+                    .frame(maxWidth: .infinity, minHeight: SiteTile.titleHeight, maxHeight: SiteTile.titleHeight, alignment: .top)
             }
+            .frame(maxWidth: .infinity, alignment: .top)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
 
     private var host: String { AddressInput.shortDisplay(URL(string: url)) }
     private var initial: String { String(host.first ?? "?").uppercased() }
+}
+
+/// タイルのアイコン（サイトのアイコンが無ければ頭文字）
+struct SiteIconView: View {
+    let icon: UIImage?
+    let initial: String
+    let onImage: Bool
+
+    /// これより小さいアイコン（16・32px の favicon）は、引き伸ばさずに真ん中に小さく出す
+    static let smallIcon: CGFloat = 60
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+        ZStack {
+            if let icon {
+                shape.fill(Color.white)
+                if icon.size.width * icon.scale < SiteIconView.smallIcon {
+                    Image(uiImage: icon).resizable().aspectRatio(contentMode: .fit).frame(width: 32, height: 32)
+                } else {
+                    Image(uiImage: icon).resizable().aspectRatio(contentMode: .fit)
+                }
+            } else {
+                if onImage { shape.fill(.ultraThinMaterial) } else { shape.fill(Color(UIColor.tertiarySystemFill)) }
+                Text(initial).font(.system(size: 26, weight: .semibold))
+                    .foregroundColor(onImage ? .white : .secondary)
+            }
+        }
+        .frame(width: SiteTile.iconSide, height: SiteTile.iconSide)
+        .clipShape(shape)
+        .shadow(color: .black.opacity(onImage ? 0.25 : 0.08), radius: 3, y: 1)
+    }
+}
+
+// MARK: 背景
+
+enum HomePresets {
+    static func title(_ id: String) -> String {
+        switch id {
+        case "sky": return "空"
+        case "sunset": return "夕焼け"
+        case "forest": return "森"
+        case "ocean": return "海"
+        case "lavender": return "ラベンダー"
+        case "night": return "夜"
+        default: return id
+        }
+    }
+
+    static func colors(_ id: String) -> [Color] {
+        switch id {
+        case "sky": return [Color(red: 0.30, green: 0.56, blue: 0.92), Color(red: 0.55, green: 0.78, blue: 0.98)]
+        case "sunset": return [Color(red: 0.93, green: 0.42, blue: 0.36), Color(red: 0.62, green: 0.30, blue: 0.62)]
+        case "forest": return [Color(red: 0.16, green: 0.45, blue: 0.33), Color(red: 0.42, green: 0.66, blue: 0.40)]
+        case "ocean": return [Color(red: 0.05, green: 0.30, blue: 0.48), Color(red: 0.14, green: 0.60, blue: 0.66)]
+        case "lavender": return [Color(red: 0.52, green: 0.44, blue: 0.80), Color(red: 0.80, green: 0.56, blue: 0.80)]
+        case "night": return [Color(red: 0.07, green: 0.08, blue: 0.20), Color(red: 0.24, green: 0.20, blue: 0.42)]
+        default: return [Color.gray, Color.gray]
+        }
+    }
+
+    static func gradient(_ id: String) -> LinearGradient {
+        LinearGradient(colors: colors(id), startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+}
+
+struct HomeBackgroundView: View {
+    let background: HomeBackground
+    let photo: UIImage?
+
+    var body: some View {
+        Group {
+            switch background {
+            case .none:
+                Color(UIColor.systemBackground)
+            case .preset(let id):
+                HomePresets.gradient(id)
+            case .photo:
+                if let photo {
+                    GeometryReader { g in
+                        Image(uiImage: photo).resizable().scaledToFill()
+                            .frame(width: g.size.width, height: g.size.height)
+                            .clipped()
+                    }
+                    // 白い字を読みやすくする
+                    .overlay(Color.black.opacity(0.18))
+                } else {
+                    Color(UIColor.systemBackground)
+                }
+            }
+        }
+        .ignoresSafeArea()
+    }
+}
+
+// MARK: カスタマイズの画面
+
+@MainActor
+struct HomeCustomizeView: View {
+    @ObservedObject var home: HomeStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var picked: PhotosPickerItem?
+    private let swatchColumns = [GridItem(.adaptive(minimum: 88), spacing: 12)]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            SheetHeader(closeLabel: "完了", close: { dismiss() }) {
+                Text("ホームをカスタマイズ").font(.headline)
+            }
+            .padding()
+            List {
+                Section("表示する項目") {
+                    Toggle("ブックマーク", isOn: flag(\.showBookmarks))
+                    Toggle("よく見るサイト", isOn: flag(\.showTopSites))
+                    if !home.layout.hiddenTopSites.isEmpty {
+                        Button("外したよく見るサイトを戻す（\(home.layout.hiddenTopSites.count) 件）") { home.restoreTopSites() }
+                    }
+                }
+                Section("背景") {
+                    LazyVGrid(columns: swatchColumns, spacing: 12) {
+                        swatch(.none, title: "なし") { Color(UIColor.systemBackground) }
+                        ForEach(HomeLayout.presetIDs, id: \.self) { id in
+                            swatch(.preset(id), title: HomePresets.title(id)) { HomePresets.gradient(id) }
+                        }
+                        if let photo = home.wallpaper {
+                            swatch(.photo, title: "写真") {
+                                Image(uiImage: photo).resizable().scaledToFill()
+                            }
+                        }
+                        PhotosPicker(selection: $picked, matching: .images) {
+                            SwatchBox(title: home.preparingPhoto ? "読み込み中…" : "写真を選ぶ", selected: false) {
+                                ZStack {
+                                    Color(UIColor.tertiarySystemFill)
+                                    Image(systemName: "photo.on.rectangle").font(.system(size: 22)).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(home.preparingPhoto)
+                    }
+                    .padding(.vertical, 6)
+                    if home.wallpaper != nil {
+                        Button("写真を削除", role: .destructive) { home.removePhoto() }
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+        }
+        .onChange(of: picked) { item in
+            guard let item else { return }
+            Task { @MainActor in
+                if let d = try? await item.loadTransferable(type: Data.self) { home.setPhoto(d) }
+                picked = nil
+            }
+        }
+    }
+
+    private func flag(_ k: WritableKeyPath<HomeLayout, Bool>) -> Binding<Bool> {
+        Binding(get: { home.layout[keyPath: k] }, set: { v in home.update { $0[keyPath: k] = v } })
+    }
+
+    private func swatch<P: View>(_ b: HomeBackground, title: String, @ViewBuilder preview: () -> P) -> some View {
+        Button { home.setBackground(b) } label: {
+            SwatchBox(title: title, selected: home.layout.background == b, preview: preview)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// 背景の見本 1 つ（選んでいるものは青い枠）
+struct SwatchBox<P: View>: View {
+    let title: String
+    let selected: Bool
+    let preview: P
+
+    init(title: String, selected: Bool, @ViewBuilder preview: () -> P) {
+        self.title = title
+        self.selected = selected
+        self.preview = preview()
+    }
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+        VStack(spacing: 4) {
+            preview
+                .frame(width: 80, height: 56)
+                .clipShape(shape)
+                .overlay(shape.stroke(selected ? Color.accentColor : Color.gray.opacity(0.3), lineWidth: selected ? 3 : 1))
+            Text(title).font(.system(size: 12)).lineLimit(1).foregroundColor(.primary)
+        }
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+    }
 }
 
 // ======================================================================
@@ -2784,6 +3096,10 @@ final class BrowserStore: ObservableObject {
     let downloads = DownloadManager()
     /// ブックマークと履歴
     let library = Library()
+    /// ホームの設定（背景・出す項目）
+    let home = HomeStore()
+    /// サイトのアイコン（ホームのタイル）
+    let icons = SiteIconStore()
     /// 広告ブロック
     let adblock = AdBlocker()
     @Published var showAdBlock = false
@@ -2867,6 +3183,24 @@ final class BrowserStore: ObservableObject {
         if defaultMode == .vnetsLegacy { compileVNetOnlyRules() }
 
         library.load(logs: logs)
+        home.load(logs: logs)
+        icons.load(logs: logs)
+        if defaultMode.usesVNet {
+            let m = machine
+            icons.vnetFetch = { u, done in
+                var req = HTTPRequest(url: u)
+                req.headers = [("Accept", "image/*,*/*;q=0.8")]
+                req.context.cookiesAllowed = false
+                m.send(req) { r in
+                    if case .success(let res) = r, res.status == 200, !res.body.isEmpty, res.body.count <= SiteIconStore.maxBytes {
+                        done(res.body)
+                    } else {
+                        done(nil)
+                    }
+                }
+            }
+        }
+        library.onClearAllHistory = { [weak self] in self?.icons.removeAll() }
         adblock.onRuleListsChanged = { [weak self] userAction in
             guard let self else { return }
             // 利用者が ON/OFF を切り替えたときだけ、見ているタブを読み直す（リストの自動更新では読み直さない。動画の途中で止まらないように）
@@ -3774,6 +4108,10 @@ final class BrowserTab: ObservableObject, Identifiable {
         if let u = url, u != errorPageURL, LibraryKey.isRecordable(u) {
             store?.recordVisit(url: u, title: title)
             lastRecorded = u
+            // ホームのタイルに出すアイコン（VNet が動いていて、このタブも VNet なら VNet で取る）
+            if let wv = webView, let store {
+                store.icons.pageLoaded(wv, page: u, viaVNet: mode.usesVNet && store.defaultMode.usesVNet)
+            }
         }
         store?.saveSession()
     }
@@ -4000,6 +4338,8 @@ final class Library: ObservableObject {
     @Published private(set) var bookmarks = BookmarkList()
     @Published private(set) var history = HistoryLog()
     var log: ((String) -> Void)?
+    /// 履歴を全部消したとき（サイトのアイコンも消す）
+    var onClearAllHistory: (() -> Void)?
     private let bookmarkFile = JSONFile<BookmarkList>(name: "bookmarks.json", delay: 0.5)
     /// 履歴はページを開くたびに変わるので、まとめて書く
     private let historyFile = JSONFile<HistoryLog>(name: "history.json", delay: 5)
@@ -4084,6 +4424,7 @@ final class Library: ObservableObject {
     func clearHistory(since: Date?) {
         history.clear(since: since)
         historyFile.saveNow(history)
+        if since == nil { onClearAllHistory?() }
         log?(since == nil ? "履歴を全部消しました" : "履歴を消しました（\(since!) から後）")
     }
 
@@ -4346,6 +4687,484 @@ enum PageZoom {
     }
 
     static func percent(_ z: Double) -> String { "\(Int((z * 100).rounded()))%" }
+}
+
+// ======================================================================
+// MARK: - HomeStore.swift
+// ======================================================================
+
+// MARK: - ホームの設定の置き場（home.json）と、背景の写真（home-wallpaper.jpg）
+//
+// 中身の決まりは HomeModel.swift の HomeLayout。ここは保存と画面への知らせだけ
+
+@MainActor
+final class HomeStore: ObservableObject {
+    @Published private(set) var layout = HomeLayout()
+    /// 自分で選んだ写真（選んだことがなければ nil。背景を色にしても残しておき、また選べるようにする）
+    @Published private(set) var wallpaper: UIImage?
+    /// 写真を縮めている間
+    @Published private(set) var preparingPhoto = false
+    var log: ((String) -> Void)?
+    private let file = JSONFile<HomeLayout>(name: "home.json", delay: 0.5)
+    private var loaded = false
+
+    /// 写真の長い辺の上限（px）
+    static let maxWallpaperSide: CGFloat = 2400
+
+    /// BrowserStore の初期値として作られる（MainActor の外のことがある）ので、ここでは何もしない。読むのは load
+    nonisolated init() {}
+
+    nonisolated static var wallpaperURL: URL { AppPaths.support.appendingPathComponent("home-wallpaper.jpg") }
+
+    func load(logs: DevLog) {
+        if loaded { return }
+        loaded = true
+        log = { s in logs.add(s, level: .info, category: .app) }
+        file.log = { s in logs.add(s) }
+        layout = file.load() ?? HomeLayout()
+        if let d = try? Data(contentsOf: HomeStore.wallpaperURL) { wallpaper = UIImage(data: d) }
+        if layout.background == .photo && wallpaper == nil { update { $0.background = .none } }
+    }
+
+    func update(_ change: (inout HomeLayout) -> Void) {
+        var l = layout
+        change(&l)
+        if l == layout { return }
+        layout = l
+        file.save(l)
+    }
+
+    func setBackground(_ b: HomeBackground) {
+        if b == .photo && wallpaper == nil { return }
+        update { $0.background = b }
+    }
+
+    func hideTopSite(_ url: String) { update { $0.hideTopSite(url) } }
+    func restoreTopSites() { update { $0.hiddenTopSites = [] } }
+
+    /// 選んだ写真を背景にする（縮めて JPEG で置く）
+    func setPhoto(_ data: Data) {
+        preparingPhoto = true
+        Task { @MainActor in
+            let jpg = await Task.detached(priority: .userInitiated) { HomeStore.prepareWallpaper(data) }.value
+            preparingPhoto = false
+            guard let jpg, let img = UIImage(data: jpg) else {
+                log?("⚠️ 背景の写真を読めませんでした")
+                return
+            }
+            do {
+                try FileManager.default.createDirectory(at: AppPaths.support, withIntermediateDirectories: true)
+                try jpg.write(to: HomeStore.wallpaperURL, options: .atomic)
+            } catch {
+                log?("⚠️ 背景の写真を書けません（\(error)）")
+            }
+            wallpaper = img
+            update { $0.background = .photo }
+        }
+    }
+
+    /// 写真を消す（背景が写真なら「なし」に戻す）
+    func removePhoto() {
+        try? FileManager.default.removeItem(at: HomeStore.wallpaperURL)
+        wallpaper = nil
+        if layout.background == .photo { update { $0.background = .none } }
+    }
+
+    nonisolated private static func prepareWallpaper(_ d: Data) -> Data? {
+        guard let img = UIImage(data: d) else { return nil }
+        let w = img.size.width * img.scale, h = img.size.height * img.scale
+        guard w >= 1, h >= 1 else { return nil }
+        let f = min(1, maxWallpaperSide / max(w, h))
+        let size = CGSize(width: (w * f).rounded(), height: (h * f).rounded())
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(size: size, format: format).jpegData(withCompressionQuality: 0.85) { _ in
+            img.draw(in: CGRect(origin: .zero, size: size))
+        }
+    }
+}
+
+// ======================================================================
+// MARK: - SiteIcons.swift
+// ======================================================================
+
+// MARK: - サイトのアイコン（ホームのタイルに出す）
+//
+// ・ページを読み終えたら、ページの <link rel="icon"> などを集めて、よいものから取りに行く（選び方は HomeModel.swift の SiteIconPick）
+// ・まだ開いていないサイト（前からあるブックマークなど）は、ホームに出たときに /apple-touch-icon.png・/favicon.ico を試す
+// ・VNet のタブは VNet で、標準の通信のタブは URLSession で取る（どちらも Cookie は送らない）
+// ・取れたものは 180px までに縮めて PNG で Application Support/Vela/Icons/<ホスト>.png に置く。記録は icons.json
+
+@MainActor
+final class SiteIconStore: ObservableObject {
+    /// VNet で 1 つ取りに行く（BrowserStore が入れる。終わったら done(中身 か nil)）
+    typealias VNetFetch = @Sendable (URL, @escaping @Sendable (Data?) -> Void) -> Void
+
+    /// 新しいアイコンが入るたびに増える（ホームを描き直す合図）
+    @Published private(set) var revision = 0
+    var log: ((String) -> Void)?
+    /// VNet で取る方法（VNet が動いていないなら nil）
+    var vnetFetch: VNetFetch?
+
+    static let maxBytes = 1_000_000
+    static let maxSide: CGFloat = 180
+    static let maxRecords = 1500
+
+    private var records: [String: IconRecord] = [:]
+    private var cache: [String: UIImage] = [:]
+    /// ファイルが無いと分かっているもの（何度もディスクを見ないように）
+    private var missing = Set<String>()
+    private var inFlight = Set<String>()
+    private let indexFile = JSONFile<[String: IconRecord]>(name: "icons.json", delay: 2)
+    private var loaded = false
+
+    /// BrowserStore の初期値として作られる（MainActor の外のことがある）ので、ここでは何もしない。読むのは load
+    nonisolated init() {}
+
+    nonisolated static var folder: URL { AppPaths.support.appendingPathComponent("Icons", isDirectory: true) }
+
+    func load(logs: DevLog) {
+        if loaded { return }
+        loaded = true
+        log = { s in logs.add(s, level: .info, category: .app) }
+        indexFile.log = { s in logs.add(s) }
+        records = indexFile.load() ?? [:]
+        try? FileManager.default.createDirectory(at: SiteIconStore.folder, withIntermediateDirectories: true)
+    }
+
+    /// そのサイトのアイコン（無ければ nil）
+    func image(for url: String) -> UIImage? {
+        guard let k = SiteIconPick.key(for: url) else { return nil }
+        if let i = cache[k] { return i }
+        if missing.contains(k) { return nil }
+        if let d = try? Data(contentsOf: fileURL(k)), let i = UIImage(data: d) {
+            cache[k] = i
+            return i
+        }
+        missing.insert(k)
+        return nil
+    }
+
+    /// ページを読み終えた: ページの <link> を見て、要るなら取りに行く
+    func pageLoaded(_ webView: WKWebView, page: URL, viaVNet: Bool) {
+        guard let k = SiteIconPick.key(for: page.absoluteString), !inFlight.contains(k),
+              SiteIconPick.needsFetch(records[k], havePageLinks: true) else { return }
+        inFlight.insert(k)
+        // 返事は 1 回だけ来る（self を持っていても循環しない）
+        webView.evaluateJavaScript(SiteIconPick.collectScript) { result, _ in
+            let json = result as? String ?? ""
+            Task { @MainActor in
+                let links = SiteIconPick.parseLinks(json)
+                self.fetch(key: k, candidates: SiteIconPick.candidates(links: links, page: page), fromPage: true, viaVNet: viaVNet)
+            }
+        }
+    }
+
+    /// ホームに出た: まだ一度も試していないサイトなら、/apple-touch-icon.png・/favicon.ico を試す
+    func ensure(_ url: String, viaVNet: Bool) {
+        guard let k = SiteIconPick.key(for: url), !inFlight.contains(k), let u = URL(string: url),
+              SiteIconPick.needsFetch(records[k], havePageLinks: false) else { return }
+        inFlight.insert(k)
+        fetch(key: k, candidates: SiteIconPick.fallbackCandidates(page: u), fromPage: false, viaVNet: viaVNet)
+    }
+
+    /// 全部消す（履歴を全部消したとき）
+    func removeAll() {
+        records = [:]
+        cache = [:]
+        missing = []
+        indexFile.saveNow(records)
+        let fm = FileManager.default
+        for f in (try? fm.contentsOfDirectory(at: SiteIconStore.folder, includingPropertiesForKeys: nil)) ?? [] {
+            try? fm.removeItem(at: f)
+        }
+        revision += 1
+        log?("サイトのアイコンを全部消しました")
+    }
+
+    // MARK: 取りに行く
+
+    private func fetch(key k: String, candidates: [URL], fromPage: Bool, viaVNet: Bool) {
+        let vnet = viaVNet ? vnetFetch : nil
+        let fallback = VelaSettings.autoFallbackToNative
+        Task { @MainActor in
+            var png: Data?
+            var source: URL?
+            for u in candidates {
+                guard let d = await SiteIconStore.download(u, vnet: vnet, fallbackToNative: fallback) else { continue }
+                if let p = SiteIconStore.prepare(d) { png = p; source = u; break }
+            }
+            self.finish(k, png: png, source: source, fromPage: fromPage)
+        }
+    }
+
+    private func finish(_ k: String, png: Data?, source: URL?, fromPage: Bool) {
+        inFlight.remove(k)
+        let file = fileURL(k)
+        if let png, let img = UIImage(data: png) {
+            do {
+                try FileManager.default.createDirectory(at: SiteIconStore.folder, withIntermediateDirectories: true)
+                try png.write(to: file, options: .atomic)
+                cache[k] = img
+                missing.remove(k)
+                revision += 1
+                log?("アイコンを取りました: \(k)（\(source?.absoluteString ?? "")）")
+            } catch {
+                log?("⚠️ アイコンを書けません: \(k)（\(error)）")
+            }
+        }
+        // 取り直しに失敗しても、前のものが残っていれば「ある」のまま
+        let has = cache[k] != nil || FileManager.default.fileExists(atPath: file.path)
+        records[k] = IconRecord(fetched: Date(), ok: has, fromPage: fromPage)
+        prune()
+        indexFile.save(records)
+    }
+
+    /// 記録が増えすぎたら、古いものから忘れる（ファイルも消す）
+    private func prune() {
+        guard records.count > SiteIconStore.maxRecords else { return }
+        let old = records.sorted { $0.value.fetched < $1.value.fetched }.prefix(records.count - SiteIconStore.maxRecords)
+        for (k, _) in old {
+            records[k] = nil
+            cache[k] = nil
+            try? FileManager.default.removeItem(at: fileURL(k))
+        }
+    }
+
+    private func fileURL(_ k: String) -> URL {
+        let safe = String(k.map { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" ? $0 : "_" })
+        return SiteIconStore.folder.appendingPathComponent(safe + ".png")
+    }
+
+    /// 1 つ取る（200 で、大きすぎないものだけ）
+    nonisolated private static func download(_ u: URL, vnet: VNetFetch?, fallbackToNative: Bool) async -> Data? {
+        if let vnet {
+            let d: Data? = await withCheckedContinuation { (c: CheckedContinuation<Data?, Never>) in
+                vnet(u) { d in c.resume(returning: d) }
+            }
+            if d != nil || !fallbackToNative { return d }
+        }
+        var req = URLRequest(url: u, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        req.setValue(BrowserIdentity.userAgent, forHTTPHeaderField: "User-Agent")
+        req.setValue("image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        req.httpShouldHandleCookies = false
+        return await withCheckedContinuation { (c: CheckedContinuation<Data?, Never>) in
+            URLSession.shared.dataTask(with: req) { data, response, error in
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard error == nil, status == 200, let data, !data.isEmpty, data.count <= maxBytes else {
+                    c.resume(returning: nil); return
+                }
+                c.resume(returning: data)
+            }.resume()
+        }
+    }
+
+    /// 画像として読めるか確かめて、maxSide までに縮めた PNG にする（読めなければ nil。HTML のエラーページなど）
+    private static func prepare(_ d: Data) -> Data? {
+        guard let img = UIImage(data: d) else { return nil }
+        let w = img.size.width * img.scale, h = img.size.height * img.scale
+        guard w >= 8, h >= 8 else { return nil }
+        let f = min(1, maxSide / max(w, h))
+        let size = CGSize(width: (w * f).rounded(), height: (h * f).rounded())
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(size: size, format: format).pngData { _ in
+            img.draw(in: CGRect(origin: .zero, size: size))
+        }
+    }
+}
+
+// ======================================================================
+// MARK: - HomeModel.swift
+// ======================================================================
+
+// MARK: - ホーム（新しいタブの画面）の設定と、サイトのアイコンの選び方（UI と WebKit に頼らない部分。Linux でテストする）
+//
+// ・ホームの設定（背景・出す項目・よく見るサイトから外したもの）は home.json
+// ・アイコンはホストごとに 1 つ（「www.」は外して比べる）。ページの <link rel="icon"> などから選び、無ければ /favicon.ico
+// ・取れたものは 14 日、取れなかったものは 1 日たったら取り直す
+
+/// ホームの背景
+enum HomeBackground: Equatable {
+    case none
+    /// 用意した色（id は HomeLayout.presetIDs のどれか）
+    case preset(String)
+    /// 自分で選んだ写真（Application Support/Vela/home-wallpaper.jpg）
+    case photo
+
+    init(code: String) {
+        if code == "photo" { self = .photo }
+        else if code.hasPrefix("preset:"), HomeLayout.presetIDs.contains(String(code.dropFirst(7))) { self = .preset(String(code.dropFirst(7))) }
+        else { self = .none }
+    }
+
+    var code: String {
+        switch self {
+        case .none: return "none"
+        case .preset(let id): return "preset:" + id
+        case .photo: return "photo"
+        }
+    }
+}
+
+struct HomeLayout: Codable, Equatable {
+    /// 用意した背景の色の名前（見た目は HomeViews.swift）
+    static let presetIDs = ["sky", "sunset", "forest", "ocean", "lavender", "night"]
+    static let maxTopSites = 8
+
+    /// HomeBackground.code
+    var backgroundCode = "none"
+    var showBookmarks = true
+    var showTopSites = true
+    /// よく見るサイトから外したホスト（SiteIconPick.key の形）
+    var hiddenTopSites: [String] = []
+
+    var background: HomeBackground {
+        get { HomeBackground(code: backgroundCode) }
+        set { backgroundCode = newValue.code }
+    }
+
+    init() {}
+
+    // 後から項目を足しても、前の home.json を読めるように（無い項目は初期値）
+    private enum CodingKeys: String, CodingKey { case backgroundCode, showBookmarks, showTopSites, hiddenTopSites }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        backgroundCode = try c.decodeIfPresent(String.self, forKey: .backgroundCode) ?? "none"
+        showBookmarks = try c.decodeIfPresent(Bool.self, forKey: .showBookmarks) ?? true
+        showTopSites = try c.decodeIfPresent(Bool.self, forKey: .showTopSites) ?? true
+        hiddenTopSites = try c.decodeIfPresent([String].self, forKey: .hiddenTopSites) ?? []
+    }
+
+    /// よく見るサイトから外す（同じものは 1 つ。多すぎたら古いものから忘れる）
+    mutating func hideTopSite(_ url: String) {
+        guard let k = SiteIconPick.key(for: url), !hiddenTopSites.contains(k) else { return }
+        hiddenTopSites.append(k)
+        if hiddenTopSites.count > 200 { hiddenTopSites.removeFirst(hiddenTopSites.count - 200) }
+    }
+
+    /// ホームに出すよく見るサイト（外したものを除いて limit 件）
+    func visibleTopSites(_ history: HistoryLog, limit: Int = HomeLayout.maxTopSites) -> [HistoryEntry] {
+        let hidden = Set(hiddenTopSites)
+        let all = history.topSites(limit: limit + hidden.count)
+        return Array(all.filter { e in SiteIconPick.key(for: e.url).map { !hidden.contains($0) } ?? true }.prefix(limit))
+    }
+}
+
+// MARK: サイトのアイコン
+
+/// ページの <link> 1 つ（ページの JavaScript で集める。href は絶対の URL にしてある）
+struct IconLink: Codable, Equatable {
+    var rel: String
+    var href: String
+    var sizes: String = ""
+    var type: String = ""
+}
+
+/// アイコンを取りに行った記録（ホストごと）
+struct IconRecord: Codable, Equatable {
+    var fetched: Date
+    var ok: Bool
+    /// ページの <link> を見て取りに行ったか（false なら /favicon.ico などを当てずっぽうで試しただけ）
+    var fromPage: Bool
+}
+
+enum SiteIconPick {
+    static let refreshOK: TimeInterval = 14 * 86_400
+    static let retryFailed: TimeInterval = 86_400
+    /// 1 つのサイトで試す URL の数
+    static let maxTries = 4
+
+    /// ページから <link> を集める JavaScript（JSON の文字列を返す）
+    static let collectScript = """
+    (() => { const out = []; \
+    for (const l of document.querySelectorAll('link[rel][href]')) { \
+    const r = (l.getAttribute('rel') || '').toLowerCase(); \
+    if (!/(^|\\s)(icon|apple-touch-icon|apple-touch-icon-precomposed)(\\s|$)/.test(r)) continue; \
+    out.push({ rel: r, href: String(l.href || ''), sizes: l.getAttribute('sizes') || '', type: l.getAttribute('type') || '' }); \
+    if (out.length >= 30) break; } \
+    return JSON.stringify(out); })()
+    """
+
+    /// アイコンを覚えるときのホストの名前（小文字・「www.」を外す）。http・https でなければ nil
+    static func key(for url: String) -> String? {
+        guard let u = URL(string: url), let s = u.scheme?.lowercased(), s == "http" || s == "https",
+              let h = u.host, !h.isEmpty else { return nil }
+        return SiteUtil.stripWWW(SiteUtil.normalizeHost(h))
+    }
+
+    static func parseLinks(_ json: String) -> [IconLink] {
+        guard let d = json.data(using: .utf8), let v = try? JSONDecoder().decode([IconLink].self, from: d) else { return [] }
+        return v
+    }
+
+    /// sizes="16x16 32x32" の一番大きい辺（無い・any なら nil）
+    static func largestSize(_ sizes: String) -> Int? {
+        var best: Int?
+        for part in sizes.lowercased().split(whereSeparator: { $0 == " " || $0 == "," }) {
+            let wh = part.split(separator: "x")
+            guard wh.count == 2, let w = Int(wh[0]), let h = Int(wh[1]) else { continue }
+            best = max(best ?? 0, min(w, h))
+        }
+        return best
+    }
+
+    /// 取りに行ってよい URL か（http・https。公開のページから LAN の機器へは取りに行かない）
+    static func isAllowed(_ icon: URL, page: URL) -> Bool {
+        guard let s = icon.scheme?.lowercased(), s == "http" || s == "https", let h = icon.host, !h.isEmpty else { return false }
+        if LocalNetworkPolicy.classify(host: h)?.isLocal == true {
+            return LocalNetworkPolicy.classify(host: page.host ?? "")?.isLocal == true
+        }
+        return true
+    }
+
+    /// 試す順の URL（よいものから。最後は /favicon.ico）
+    static func candidates(links: [IconLink], page: URL) -> [URL] {
+        var scored: [(Int, URL)] = []
+        for l in links {
+            let type = l.type.lowercased()
+            let lower = l.href.lowercased()
+            // SVG は UIImage で読めない
+            if type.contains("svg") || lower.hasSuffix(".svg") || lower.contains(".svg?") { continue }
+            guard let u = URL(string: l.href), isAllowed(u, page: page) else { continue }
+            let apple = l.rel.contains("apple-touch-icon")
+            let size = largestSize(l.sizes) ?? (apple ? 180 : (lower.contains(".ico") ? 32 : 48))
+            // 大きいほどよい（256 まで）。apple-touch-icon は四角く作ってあるので上げる。小さすぎるものは下げる
+            var score = min(size, 256)
+            if apple { score += 120 }
+            if size < 32 { score -= 40 }
+            scored.append((score, u))
+        }
+        var out: [URL] = []
+        for (_, u) in scored.sorted(by: { $0.0 > $1.0 }) where !out.contains(u) { out.append(u) }
+        for f in fallbackCandidates(page: page) where !out.contains(f) { out.append(f) }
+        return Array(out.prefix(maxTries))
+    }
+
+    /// ページを見ないで試すもの（/apple-touch-icon.png と /favicon.ico）
+    static func fallbackCandidates(page: URL) -> [URL] {
+        guard var c = URLComponents(url: page, resolvingAgainstBaseURL: false), c.host != nil,
+              let s = c.scheme?.lowercased(), s == "http" || s == "https" else { return [] }
+        c.query = nil
+        c.fragment = nil
+        c.user = nil
+        c.password = nil
+        var out: [URL] = []
+        for p in ["/apple-touch-icon.png", "/favicon.ico"] {
+            c.path = p
+            if let u = c.url { out.append(u) }
+        }
+        return out
+    }
+
+    /// 取りに行くべきか（havePageLinks: ページの <link> を見られる）
+    static func needsFetch(_ r: IconRecord?, havePageLinks: Bool, now: Date = Date()) -> Bool {
+        guard let r else { return true }
+        let age = now.timeIntervalSince(r.fetched)
+        // 当てずっぽうで取ったもの・取れなかったものは、ページを見られたらすぐ試し直す（よい大きさのものがあるかもしれない）
+        if havePageLinks && !r.fromPage { return true }
+        return age > (r.ok ? refreshOK : retryFailed)
+    }
 }
 
 // ======================================================================

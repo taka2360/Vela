@@ -1,6 +1,6 @@
 import SwiftUI
 
-// MARK: - ブックマーク・履歴の画面（シート）、アドレス欄の候補、新しいタブの画面
+// MARK: - ブックマーク・履歴の画面（シート）、アドレス欄の候補（新しいタブの画面は HomeViews.swift）
 
 struct LibraryView: View {
     @ObservedObject var store: BrowserStore
@@ -286,79 +286,4 @@ struct SuggestionList: View {
         if let s, let u = URL(string: s.url) { store.open(url: u) } else { store.open(editor.text) }
         editor.blur()
     }
-}
-
-// MARK: 新しいタブの画面（ブックマークとよく見るサイト）
-
-struct StartPage: View {
-    @ObservedObject var store: BrowserStore
-    @ObservedObject var library: Library
-    private let columns = [GridItem(.adaptive(minimum: 96), spacing: 16)]
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                let favorites = Array(library.bookmarks.items.prefix(12))
-                let top = library.history.topSites(limit: 8)
-                if favorites.isEmpty && top.isEmpty {
-                    EmptyNote(icon: "globe", text: "上のアドレス欄に、URL か調べたいことを入れてください")
-                        .padding(.top, 120)
-                }
-                if !favorites.isEmpty {
-                    SiteGrid(store: store, title: "ブックマーク", sites: favorites.map { ($0.title, $0.url) }, columns: columns)
-                }
-                if !top.isEmpty {
-                    SiteGrid(store: store, title: "よく見るサイト", sites: top.map { ($0.title, $0.url) }, columns: columns)
-                }
-            }
-            .frame(maxWidth: 760)
-            .padding(32)
-            .frame(maxWidth: .infinity)
-        }
-        .background(Color(UIColor.systemBackground))
-    }
-}
-
-struct SiteGrid: View {
-    let store: BrowserStore
-    let title: String
-    let sites: [(String, String)]
-    let columns: [GridItem]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(title).font(.headline)
-            LazyVGrid(columns: columns, spacing: 16) {
-                ForEach(sites, id: \.1) { site in
-                    SiteTile(title: site.0, url: site.1) {
-                        if let u = URL(string: site.1) { store.open(url: u) }
-                    }
-                }
-            }
-        }
-    }
-}
-
-struct SiteTile: View {
-    let title: String
-    let url: String
-    let open: () -> Void
-
-    var body: some View {
-        Button(action: open) {
-            VStack(spacing: 6) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 14).fill(Color(UIColor.tertiarySystemFill))
-                    Text(initial).font(.system(size: 26, weight: .semibold)).foregroundStyle(.secondary)
-                }
-                .frame(width: 64, height: 64)
-                Text(title.isEmpty ? host : title).font(.system(size: 12)).lineLimit(2).multilineTextAlignment(.center)
-                    .foregroundColor(.primary)
-            }
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var host: String { AddressInput.shortDisplay(URL(string: url)) }
-    private var initial: String { String(host.first ?? "?").uppercased() }
 }

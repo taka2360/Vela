@@ -55,7 +55,7 @@ struct TopBar: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 14) {
+            HStack(spacing: 18) {
                 NavButtons(tab: tab)
                 Button { store.openLibrary(.bookmarks) } label: { Image(systemName: "book") }
                 AddressField(store: store, tab: tab, editor: store.address, library: store.library)
@@ -66,9 +66,10 @@ struct TopBar: View {
                     .keyboardShortcut("t", modifiers: .command)
                 Button { store.openTabOverview() } label: { Image(systemName: "square.on.square") }
             }
-            .font(.system(size: 18))
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            // 大きさは前（18pt・高さ 36）の 1.3 倍くらい
+            .font(.system(size: 23))
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
             LoadingBar(progress: tab.progress, visible: tab.isLoading)
         }
         .background(Color(UIColor.secondarySystemBackground))
@@ -100,7 +101,7 @@ struct NavButtons: View {
     @ObservedObject var tab: BrowserTab
 
     var body: some View {
-        HStack(spacing: 18) {
+        HStack(spacing: 23) {
             Button { tab.goBack() } label: { Image(systemName: "chevron.backward") }
                 .disabled(!tab.canGoBack)
                 .contextMenu { HistoryMenu(tab: tab, back: true) }
@@ -151,9 +152,9 @@ struct LoadingBar: View {
         GeometryReader { g in
             Rectangle()
                 .fill(Color.accentColor)
-                .frame(width: g.size.width * CGFloat(max(0.05, min(progress, 1))), height: 2)
+                .frame(width: g.size.width * CGFloat(max(0.05, min(progress, 1))), height: 3)
         }
-        .frame(height: 2)
+        .frame(height: 3)
         .opacity(visible ? 1 : 0)
     }
 }
@@ -182,8 +183,8 @@ struct AddressField: View {
                 }
             }
         }
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color(UIColor.tertiarySystemFill)))
-        .frame(height: 36)
+        .background(RoundedRectangle(cornerRadius: 13).fill(Color(UIColor.tertiarySystemFill)))
+        .frame(height: 46)
         .frame(maxWidth: .infinity)
         .onChange(of: focused) { f in
             if editor.editing != f { editor.editing = f }
@@ -200,28 +201,30 @@ struct AddressField: View {
             .textInputAutocapitalization(.never)
             .keyboardType(.webSearch)
             .submitLabel(.go)
+            .font(.system(size: 20))
             .onSubmit {
                 store.open(editor.text, in: tab)
                 focused = false
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 13)
     }
 
     private var display: some View {
-        HStack(spacing: 6) {
-            if tab.isSecure { Image(systemName: "lock.fill").font(.system(size: 12)).foregroundStyle(.secondary) }
+        HStack(spacing: 8) {
+            if tab.isSecure { Image(systemName: "lock.fill").font(.system(size: 16)).foregroundStyle(.secondary) }
             Text(displayText)
+                .font(.system(size: 20))
                 .lineLimit(1)
                 .foregroundColor(tab.url == nil ? .secondary : .primary)
             if tab.blockedCount > 0 {
                 Label("\(tab.blockedCount)", systemImage: "shield.lefthalf.filled")
-                    .font(.system(size: 11))
+                    .font(.system(size: 14))
                     .foregroundStyle(.secondary)
             }
             ModeBadge(tab: tab, status: store.status)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 13)
     }
 
     private var displayText: String {
@@ -245,14 +248,14 @@ struct ModeBadge: View {
     var body: some View {
         HStack(spacing: 4) {
             Text(label)
-                .font(.system(size: 10, weight: .semibold))
-                .padding(.horizontal, 5)
-                .padding(.vertical, 2)
-                .background(RoundedRectangle(cornerRadius: 4).fill(color.opacity(0.18)))
+                .font(.system(size: 13, weight: .semibold))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(RoundedRectangle(cornerRadius: 5).fill(color.opacity(0.18)))
                 .foregroundColor(color)
             if !tab.nonVNetUsage.isEmpty {
                 Text(tab.nonVNetUsage.sorted().joined(separator: "・"))
-                    .font(.system(size: 10))
+                    .font(.system(size: 13))
                     .foregroundStyle(.secondary)
             }
         }
@@ -330,7 +333,7 @@ struct TabPage: View {
         ZStack {
             WebHost(webView: tab.webView)
             if tab.url == nil {
-                StartPage(store: store, library: store.library)
+                StartPage(store: store, library: store.library, home: store.home, icons: store.icons)
             }
         }
     }

@@ -658,3 +658,33 @@ public extension UIViewControllerRepresentable where Coordinator == Void {
 public extension UIViewControllerRepresentable {
     var body: Never { fatalError() }
 }
+
+// MARK: - ホームの背景・アイコン（グラデーション・すりガラス・画像の合わせ方）
+
+public struct Gradient: Equatable {
+    public init(colors: [Color]) {}
+}
+public struct LinearGradient: ShapeStyle, View {
+    public init(gradient: Gradient, startPoint: UnitPoint, endPoint: UnitPoint) {}
+    public init(colors: [Color], startPoint: UnitPoint, endPoint: UnitPoint) {}
+    public var body: Never { fatalError() }
+}
+public struct Material: ShapeStyle {
+    public static let ultraThinMaterial = Material(), thinMaterial = Material(), regularMaterial = Material(), thickMaterial = Material()
+}
+public extension ShapeStyle where Self == Material {
+    static var ultraThinMaterial: Material { .ultraThinMaterial }
+    static var thinMaterial: Material { .thinMaterial }
+    static var regularMaterial: Material { .regularMaterial }
+    static var thickMaterial: Material { .thickMaterial }
+}
+public extension View {
+    func background<S: ShapeStyle, T: Shape>(_ style: S, in shape: T, fillStyle: FillStyle = FillStyle()) -> _M { .init() }
+    func scaledToFill() -> _M { .init() }
+    func scaledToFit() -> _M { .init() }
+    func clipped(antialiased: Bool = false) -> _M { .init() }
+}
+
+/// CoreTransferable（iOS 16。SwiftUI から見える）
+public protocol Transferable {}
+extension Data: Transferable {}

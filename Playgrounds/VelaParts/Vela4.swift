@@ -3,6 +3,7 @@
 
 import SwiftUI
 import WebKit
+import PhotosUI
 import Foundation
 import Network
 #if canImport(FoundationNetworking)
@@ -188,6 +189,8 @@ final class Library: ObservableObject {
     @Published private(set) var bookmarks = BookmarkList()
     @Published private(set) var history = HistoryLog()
     var log: ((String) -> Void)?
+    /// 履歴を全部消したとき（サイトのアイコンも消す）
+    var onClearAllHistory: (() -> Void)?
     private let bookmarkFile = JSONFile<BookmarkList>(name: "bookmarks.json", delay: 0.5)
     /// 履歴はページを開くたびに変わるので、まとめて書く
     private let historyFile = JSONFile<HistoryLog>(name: "history.json", delay: 5)
@@ -272,6 +275,7 @@ final class Library: ObservableObject {
     func clearHistory(since: Date?) {
         history.clear(since: since)
         historyFile.saveNow(history)
+        if since == nil { onClearAllHistory?() }
         log?(since == nil ? "履歴を全部消しました" : "履歴を消しました（\(since!) から後）")
     }
 
@@ -534,6 +538,484 @@ enum PageZoom {
     }
 
     static func percent(_ z: Double) -> String { "\(Int((z * 100).rounded()))%" }
+}
+
+// ======================================================================
+// MARK: - HomeStore.swift
+// ======================================================================
+
+// MARK: - ホームの設定の置き場（home.json）と、背景の写真（home-wallpaper.jpg）
+//
+// 中身の決まりは HomeModel.swift の HomeLayout。ここは保存と画面への知らせだけ
+
+@MainActor
+final class HomeStore: ObservableObject {
+    @Published private(set) var layout = HomeLayout()
+    /// 自分で選んだ写真（選んだことがなければ nil。背景を色にしても残しておき、また選べるようにする）
+    @Published private(set) var wallpaper: UIImage?
+    /// 写真を縮めている間
+    @Published private(set) var preparingPhoto = false
+    var log: ((String) -> Void)?
+    private let file = JSONFile<HomeLayout>(name: "home.json", delay: 0.5)
+    private var loaded = false
+
+    /// 写真の長い辺の上限（px）
+    static let maxWallpaperSide: CGFloat = 2400
+
+    /// BrowserStore の初期値として作られる（MainActor の外のことがある）ので、ここでは何もしない。読むのは load
+    nonisolated init() {}
+
+    nonisolated static var wallpaperURL: URL { AppPaths.support.appendingPathComponent("home-wallpaper.jpg") }
+
+    func load(logs: DevLog) {
+        if loaded { return }
+        loaded = true
+        log = { s in logs.add(s, level: .info, category: .app) }
+        file.log = { s in logs.add(s) }
+        layout = file.load() ?? HomeLayout()
+        if let d = try? Data(contentsOf: HomeStore.wallpaperURL) { wallpaper = UIImage(data: d) }
+        if layout.background == .photo && wallpaper == nil { update { $0.background = .none } }
+    }
+
+    func update(_ change: (inout HomeLayout) -> Void) {
+        var l = layout
+        change(&l)
+        if l == layout { return }
+        layout = l
+        file.save(l)
+    }
+
+    func setBackground(_ b: HomeBackground) {
+        if b == .photo && wallpaper == nil { return }
+        update { $0.background = b }
+    }
+
+    func hideTopSite(_ url: String) { update { $0.hideTopSite(url) } }
+    func restoreTopSites() { update { $0.hiddenTopSites = [] } }
+
+    /// 選んだ写真を背景にする（縮めて JPEG で置く）
+    func setPhoto(_ data: Data) {
+        preparingPhoto = true
+        Task { @MainActor in
+            let jpg = await Task.detached(priority: .userInitiated) { HomeStore.prepareWallpaper(data) }.value
+            preparingPhoto = false
+            guard let jpg, let img = UIImage(data: jpg) else {
+                log?("⚠️ 背景の写真を読めませんでした")
+                return
+            }
+            do {
+                try FileManager.default.createDirectory(at: AppPaths.support, withIntermediateDirectories: true)
+                try jpg.write(to: HomeStore.wallpaperURL, options: .atomic)
+            } catch {
+                log?("⚠️ 背景の写真を書けません（\(error)）")
+            }
+            wallpaper = img
+            update { $0.background = .photo }
+        }
+    }
+
+    /// 写真を消す（背景が写真なら「なし」に戻す）
+    func removePhoto() {
+        try? FileManager.default.removeItem(at: HomeStore.wallpaperURL)
+        wallpaper = nil
+        if layout.background == .photo { update { $0.background = .none } }
+    }
+
+    nonisolated private static func prepareWallpaper(_ d: Data) -> Data? {
+        guard let img = UIImage(data: d) else { return nil }
+        let w = img.size.width * img.scale, h = img.size.height * img.scale
+        guard w >= 1, h >= 1 else { return nil }
+        let f = min(1, maxWallpaperSide / max(w, h))
+        let size = CGSize(width: (w * f).rounded(), height: (h * f).rounded())
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(size: size, format: format).jpegData(withCompressionQuality: 0.85) { _ in
+            img.draw(in: CGRect(origin: .zero, size: size))
+        }
+    }
+}
+
+// ======================================================================
+// MARK: - SiteIcons.swift
+// ======================================================================
+
+// MARK: - サイトのアイコン（ホームのタイルに出す）
+//
+// ・ページを読み終えたら、ページの <link rel="icon"> などを集めて、よいものから取りに行く（選び方は HomeModel.swift の SiteIconPick）
+// ・まだ開いていないサイト（前からあるブックマークなど）は、ホームに出たときに /apple-touch-icon.png・/favicon.ico を試す
+// ・VNet のタブは VNet で、標準の通信のタブは URLSession で取る（どちらも Cookie は送らない）
+// ・取れたものは 180px までに縮めて PNG で Application Support/Vela/Icons/<ホスト>.png に置く。記録は icons.json
+
+@MainActor
+final class SiteIconStore: ObservableObject {
+    /// VNet で 1 つ取りに行く（BrowserStore が入れる。終わったら done(中身 か nil)）
+    typealias VNetFetch = @Sendable (URL, @escaping @Sendable (Data?) -> Void) -> Void
+
+    /// 新しいアイコンが入るたびに増える（ホームを描き直す合図）
+    @Published private(set) var revision = 0
+    var log: ((String) -> Void)?
+    /// VNet で取る方法（VNet が動いていないなら nil）
+    var vnetFetch: VNetFetch?
+
+    static let maxBytes = 1_000_000
+    static let maxSide: CGFloat = 180
+    static let maxRecords = 1500
+
+    private var records: [String: IconRecord] = [:]
+    private var cache: [String: UIImage] = [:]
+    /// ファイルが無いと分かっているもの（何度もディスクを見ないように）
+    private var missing = Set<String>()
+    private var inFlight = Set<String>()
+    private let indexFile = JSONFile<[String: IconRecord]>(name: "icons.json", delay: 2)
+    private var loaded = false
+
+    /// BrowserStore の初期値として作られる（MainActor の外のことがある）ので、ここでは何もしない。読むのは load
+    nonisolated init() {}
+
+    nonisolated static var folder: URL { AppPaths.support.appendingPathComponent("Icons", isDirectory: true) }
+
+    func load(logs: DevLog) {
+        if loaded { return }
+        loaded = true
+        log = { s in logs.add(s, level: .info, category: .app) }
+        indexFile.log = { s in logs.add(s) }
+        records = indexFile.load() ?? [:]
+        try? FileManager.default.createDirectory(at: SiteIconStore.folder, withIntermediateDirectories: true)
+    }
+
+    /// そのサイトのアイコン（無ければ nil）
+    func image(for url: String) -> UIImage? {
+        guard let k = SiteIconPick.key(for: url) else { return nil }
+        if let i = cache[k] { return i }
+        if missing.contains(k) { return nil }
+        if let d = try? Data(contentsOf: fileURL(k)), let i = UIImage(data: d) {
+            cache[k] = i
+            return i
+        }
+        missing.insert(k)
+        return nil
+    }
+
+    /// ページを読み終えた: ページの <link> を見て、要るなら取りに行く
+    func pageLoaded(_ webView: WKWebView, page: URL, viaVNet: Bool) {
+        guard let k = SiteIconPick.key(for: page.absoluteString), !inFlight.contains(k),
+              SiteIconPick.needsFetch(records[k], havePageLinks: true) else { return }
+        inFlight.insert(k)
+        // 返事は 1 回だけ来る（self を持っていても循環しない）
+        webView.evaluateJavaScript(SiteIconPick.collectScript) { result, _ in
+            let json = result as? String ?? ""
+            Task { @MainActor in
+                let links = SiteIconPick.parseLinks(json)
+                self.fetch(key: k, candidates: SiteIconPick.candidates(links: links, page: page), fromPage: true, viaVNet: viaVNet)
+            }
+        }
+    }
+
+    /// ホームに出た: まだ一度も試していないサイトなら、/apple-touch-icon.png・/favicon.ico を試す
+    func ensure(_ url: String, viaVNet: Bool) {
+        guard let k = SiteIconPick.key(for: url), !inFlight.contains(k), let u = URL(string: url),
+              SiteIconPick.needsFetch(records[k], havePageLinks: false) else { return }
+        inFlight.insert(k)
+        fetch(key: k, candidates: SiteIconPick.fallbackCandidates(page: u), fromPage: false, viaVNet: viaVNet)
+    }
+
+    /// 全部消す（履歴を全部消したとき）
+    func removeAll() {
+        records = [:]
+        cache = [:]
+        missing = []
+        indexFile.saveNow(records)
+        let fm = FileManager.default
+        for f in (try? fm.contentsOfDirectory(at: SiteIconStore.folder, includingPropertiesForKeys: nil)) ?? [] {
+            try? fm.removeItem(at: f)
+        }
+        revision += 1
+        log?("サイトのアイコンを全部消しました")
+    }
+
+    // MARK: 取りに行く
+
+    private func fetch(key k: String, candidates: [URL], fromPage: Bool, viaVNet: Bool) {
+        let vnet = viaVNet ? vnetFetch : nil
+        let fallback = VelaSettings.autoFallbackToNative
+        Task { @MainActor in
+            var png: Data?
+            var source: URL?
+            for u in candidates {
+                guard let d = await SiteIconStore.download(u, vnet: vnet, fallbackToNative: fallback) else { continue }
+                if let p = SiteIconStore.prepare(d) { png = p; source = u; break }
+            }
+            self.finish(k, png: png, source: source, fromPage: fromPage)
+        }
+    }
+
+    private func finish(_ k: String, png: Data?, source: URL?, fromPage: Bool) {
+        inFlight.remove(k)
+        let file = fileURL(k)
+        if let png, let img = UIImage(data: png) {
+            do {
+                try FileManager.default.createDirectory(at: SiteIconStore.folder, withIntermediateDirectories: true)
+                try png.write(to: file, options: .atomic)
+                cache[k] = img
+                missing.remove(k)
+                revision += 1
+                log?("アイコンを取りました: \(k)（\(source?.absoluteString ?? "")）")
+            } catch {
+                log?("⚠️ アイコンを書けません: \(k)（\(error)）")
+            }
+        }
+        // 取り直しに失敗しても、前のものが残っていれば「ある」のまま
+        let has = cache[k] != nil || FileManager.default.fileExists(atPath: file.path)
+        records[k] = IconRecord(fetched: Date(), ok: has, fromPage: fromPage)
+        prune()
+        indexFile.save(records)
+    }
+
+    /// 記録が増えすぎたら、古いものから忘れる（ファイルも消す）
+    private func prune() {
+        guard records.count > SiteIconStore.maxRecords else { return }
+        let old = records.sorted { $0.value.fetched < $1.value.fetched }.prefix(records.count - SiteIconStore.maxRecords)
+        for (k, _) in old {
+            records[k] = nil
+            cache[k] = nil
+            try? FileManager.default.removeItem(at: fileURL(k))
+        }
+    }
+
+    private func fileURL(_ k: String) -> URL {
+        let safe = String(k.map { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" ? $0 : "_" })
+        return SiteIconStore.folder.appendingPathComponent(safe + ".png")
+    }
+
+    /// 1 つ取る（200 で、大きすぎないものだけ）
+    nonisolated private static func download(_ u: URL, vnet: VNetFetch?, fallbackToNative: Bool) async -> Data? {
+        if let vnet {
+            let d: Data? = await withCheckedContinuation { (c: CheckedContinuation<Data?, Never>) in
+                vnet(u) { d in c.resume(returning: d) }
+            }
+            if d != nil || !fallbackToNative { return d }
+        }
+        var req = URLRequest(url: u, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        req.setValue(BrowserIdentity.userAgent, forHTTPHeaderField: "User-Agent")
+        req.setValue("image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        req.httpShouldHandleCookies = false
+        return await withCheckedContinuation { (c: CheckedContinuation<Data?, Never>) in
+            URLSession.shared.dataTask(with: req) { data, response, error in
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard error == nil, status == 200, let data, !data.isEmpty, data.count <= maxBytes else {
+                    c.resume(returning: nil); return
+                }
+                c.resume(returning: data)
+            }.resume()
+        }
+    }
+
+    /// 画像として読めるか確かめて、maxSide までに縮めた PNG にする（読めなければ nil。HTML のエラーページなど）
+    private static func prepare(_ d: Data) -> Data? {
+        guard let img = UIImage(data: d) else { return nil }
+        let w = img.size.width * img.scale, h = img.size.height * img.scale
+        guard w >= 8, h >= 8 else { return nil }
+        let f = min(1, maxSide / max(w, h))
+        let size = CGSize(width: (w * f).rounded(), height: (h * f).rounded())
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(size: size, format: format).pngData { _ in
+            img.draw(in: CGRect(origin: .zero, size: size))
+        }
+    }
+}
+
+// ======================================================================
+// MARK: - HomeModel.swift
+// ======================================================================
+
+// MARK: - ホーム（新しいタブの画面）の設定と、サイトのアイコンの選び方（UI と WebKit に頼らない部分。Linux でテストする）
+//
+// ・ホームの設定（背景・出す項目・よく見るサイトから外したもの）は home.json
+// ・アイコンはホストごとに 1 つ（「www.」は外して比べる）。ページの <link rel="icon"> などから選び、無ければ /favicon.ico
+// ・取れたものは 14 日、取れなかったものは 1 日たったら取り直す
+
+/// ホームの背景
+enum HomeBackground: Equatable {
+    case none
+    /// 用意した色（id は HomeLayout.presetIDs のどれか）
+    case preset(String)
+    /// 自分で選んだ写真（Application Support/Vela/home-wallpaper.jpg）
+    case photo
+
+    init(code: String) {
+        if code == "photo" { self = .photo }
+        else if code.hasPrefix("preset:"), HomeLayout.presetIDs.contains(String(code.dropFirst(7))) { self = .preset(String(code.dropFirst(7))) }
+        else { self = .none }
+    }
+
+    var code: String {
+        switch self {
+        case .none: return "none"
+        case .preset(let id): return "preset:" + id
+        case .photo: return "photo"
+        }
+    }
+}
+
+struct HomeLayout: Codable, Equatable {
+    /// 用意した背景の色の名前（見た目は HomeViews.swift）
+    static let presetIDs = ["sky", "sunset", "forest", "ocean", "lavender", "night"]
+    static let maxTopSites = 8
+
+    /// HomeBackground.code
+    var backgroundCode = "none"
+    var showBookmarks = true
+    var showTopSites = true
+    /// よく見るサイトから外したホスト（SiteIconPick.key の形）
+    var hiddenTopSites: [String] = []
+
+    var background: HomeBackground {
+        get { HomeBackground(code: backgroundCode) }
+        set { backgroundCode = newValue.code }
+    }
+
+    init() {}
+
+    // 後から項目を足しても、前の home.json を読めるように（無い項目は初期値）
+    private enum CodingKeys: String, CodingKey { case backgroundCode, showBookmarks, showTopSites, hiddenTopSites }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        backgroundCode = try c.decodeIfPresent(String.self, forKey: .backgroundCode) ?? "none"
+        showBookmarks = try c.decodeIfPresent(Bool.self, forKey: .showBookmarks) ?? true
+        showTopSites = try c.decodeIfPresent(Bool.self, forKey: .showTopSites) ?? true
+        hiddenTopSites = try c.decodeIfPresent([String].self, forKey: .hiddenTopSites) ?? []
+    }
+
+    /// よく見るサイトから外す（同じものは 1 つ。多すぎたら古いものから忘れる）
+    mutating func hideTopSite(_ url: String) {
+        guard let k = SiteIconPick.key(for: url), !hiddenTopSites.contains(k) else { return }
+        hiddenTopSites.append(k)
+        if hiddenTopSites.count > 200 { hiddenTopSites.removeFirst(hiddenTopSites.count - 200) }
+    }
+
+    /// ホームに出すよく見るサイト（外したものを除いて limit 件）
+    func visibleTopSites(_ history: HistoryLog, limit: Int = HomeLayout.maxTopSites) -> [HistoryEntry] {
+        let hidden = Set(hiddenTopSites)
+        let all = history.topSites(limit: limit + hidden.count)
+        return Array(all.filter { e in SiteIconPick.key(for: e.url).map { !hidden.contains($0) } ?? true }.prefix(limit))
+    }
+}
+
+// MARK: サイトのアイコン
+
+/// ページの <link> 1 つ（ページの JavaScript で集める。href は絶対の URL にしてある）
+struct IconLink: Codable, Equatable {
+    var rel: String
+    var href: String
+    var sizes: String = ""
+    var type: String = ""
+}
+
+/// アイコンを取りに行った記録（ホストごと）
+struct IconRecord: Codable, Equatable {
+    var fetched: Date
+    var ok: Bool
+    /// ページの <link> を見て取りに行ったか（false なら /favicon.ico などを当てずっぽうで試しただけ）
+    var fromPage: Bool
+}
+
+enum SiteIconPick {
+    static let refreshOK: TimeInterval = 14 * 86_400
+    static let retryFailed: TimeInterval = 86_400
+    /// 1 つのサイトで試す URL の数
+    static let maxTries = 4
+
+    /// ページから <link> を集める JavaScript（JSON の文字列を返す）
+    static let collectScript = """
+    (() => { const out = []; \
+    for (const l of document.querySelectorAll('link[rel][href]')) { \
+    const r = (l.getAttribute('rel') || '').toLowerCase(); \
+    if (!/(^|\\s)(icon|apple-touch-icon|apple-touch-icon-precomposed)(\\s|$)/.test(r)) continue; \
+    out.push({ rel: r, href: String(l.href || ''), sizes: l.getAttribute('sizes') || '', type: l.getAttribute('type') || '' }); \
+    if (out.length >= 30) break; } \
+    return JSON.stringify(out); })()
+    """
+
+    /// アイコンを覚えるときのホストの名前（小文字・「www.」を外す）。http・https でなければ nil
+    static func key(for url: String) -> String? {
+        guard let u = URL(string: url), let s = u.scheme?.lowercased(), s == "http" || s == "https",
+              let h = u.host, !h.isEmpty else { return nil }
+        return SiteUtil.stripWWW(SiteUtil.normalizeHost(h))
+    }
+
+    static func parseLinks(_ json: String) -> [IconLink] {
+        guard let d = json.data(using: .utf8), let v = try? JSONDecoder().decode([IconLink].self, from: d) else { return [] }
+        return v
+    }
+
+    /// sizes="16x16 32x32" の一番大きい辺（無い・any なら nil）
+    static func largestSize(_ sizes: String) -> Int? {
+        var best: Int?
+        for part in sizes.lowercased().split(whereSeparator: { $0 == " " || $0 == "," }) {
+            let wh = part.split(separator: "x")
+            guard wh.count == 2, let w = Int(wh[0]), let h = Int(wh[1]) else { continue }
+            best = max(best ?? 0, min(w, h))
+        }
+        return best
+    }
+
+    /// 取りに行ってよい URL か（http・https。公開のページから LAN の機器へは取りに行かない）
+    static func isAllowed(_ icon: URL, page: URL) -> Bool {
+        guard let s = icon.scheme?.lowercased(), s == "http" || s == "https", let h = icon.host, !h.isEmpty else { return false }
+        if LocalNetworkPolicy.classify(host: h)?.isLocal == true {
+            return LocalNetworkPolicy.classify(host: page.host ?? "")?.isLocal == true
+        }
+        return true
+    }
+
+    /// 試す順の URL（よいものから。最後は /favicon.ico）
+    static func candidates(links: [IconLink], page: URL) -> [URL] {
+        var scored: [(Int, URL)] = []
+        for l in links {
+            let type = l.type.lowercased()
+            let lower = l.href.lowercased()
+            // SVG は UIImage で読めない
+            if type.contains("svg") || lower.hasSuffix(".svg") || lower.contains(".svg?") { continue }
+            guard let u = URL(string: l.href), isAllowed(u, page: page) else { continue }
+            let apple = l.rel.contains("apple-touch-icon")
+            let size = largestSize(l.sizes) ?? (apple ? 180 : (lower.contains(".ico") ? 32 : 48))
+            // 大きいほどよい（256 まで）。apple-touch-icon は四角く作ってあるので上げる。小さすぎるものは下げる
+            var score = min(size, 256)
+            if apple { score += 120 }
+            if size < 32 { score -= 40 }
+            scored.append((score, u))
+        }
+        var out: [URL] = []
+        for (_, u) in scored.sorted(by: { $0.0 > $1.0 }) where !out.contains(u) { out.append(u) }
+        for f in fallbackCandidates(page: page) where !out.contains(f) { out.append(f) }
+        return Array(out.prefix(maxTries))
+    }
+
+    /// ページを見ないで試すもの（/apple-touch-icon.png と /favicon.ico）
+    static func fallbackCandidates(page: URL) -> [URL] {
+        guard var c = URLComponents(url: page, resolvingAgainstBaseURL: false), c.host != nil,
+              let s = c.scheme?.lowercased(), s == "http" || s == "https" else { return [] }
+        c.query = nil
+        c.fragment = nil
+        c.user = nil
+        c.password = nil
+        var out: [URL] = []
+        for p in ["/apple-touch-icon.png", "/favicon.ico"] {
+            c.path = p
+            if let u = c.url { out.append(u) }
+        }
+        return out
+    }
+
+    /// 取りに行くべきか（havePageLinks: ページの <link> を見られる）
+    static func needsFetch(_ r: IconRecord?, havePageLinks: Bool, now: Date = Date()) -> Bool {
+        guard let r else { return true }
+        let age = now.timeIntervalSince(r.fetched)
+        // 当てずっぽうで取ったもの・取れなかったものは、ページを見られたらすぐ試し直す（よい大きさのものがあるかもしれない）
+        if havePageLinks && !r.fromPage { return true }
+        return age > (r.ok ? refreshOK : retryFailed)
+    }
 }
 
 // ======================================================================
@@ -807,654 +1289,5 @@ enum ErrorPage {
             }
         }
         return o
-    }
-}
-
-// ======================================================================
-// MARK: - NetLog.swift
-// ======================================================================
-
-// MARK: - 通信の記録（開発者パネルの「通信」。VNet が引き受けた要求 1 つずつ）
-//
-// 要求ごとに、メソッド・URL・種類・結果（返事の番号・大きさ・かかった時間）と、途中で決めたこと
-// （HSTS で https に上げた・リダイレクト・Cookie を保存した・広告ブロックで止めた など）をメモとして持つ。
-// 最新 maxRecords 件まで。どのスレッドから書いてもよい
-
-struct NetRecord: Identifiable, Sendable, Equatable {
-    enum Outcome: Sendable, Equatable {
-        case pending
-        case ok
-        case failed(String)
-        case blocked(String)
-        case cancelled
-        case download
-
-        var label: String {
-            switch self {
-            case .pending: return "…"
-            case .ok: return "完了"
-            case .failed: return "失敗"
-            case .blocked: return "ブロック"
-            case .cancelled: return "取り消し"
-            case .download: return "ダウンロード"
-            }
-        }
-    }
-
-    let id: Int
-    let tab: Int?
-    let started: Date
-    var method: String
-    var url: String
-    /// 種類（ページ・画像・スクリプト など。当て推量）
-    var kind: String
-    var topLevel: Bool
-    var status: Int?
-    var bytes = 0
-    var finished: Date?
-    var outcome = Outcome.pending
-    var notes: [String] = []
-
-    var durationMs: Int? { finished.map { Int($0.timeIntervalSince(started) * 1000) } }
-    var isProblem: Bool {
-        switch outcome {
-        case .failed, .blocked: return true
-        default: return (status ?? 0) >= 400
-        }
-    }
-
-    /// 1 行の説明
-    var line: String {
-        let st = status.map(String.init) ?? outcome.label
-        let ms = durationMs.map { "\($0)ms" } ?? "…"
-        let kb = bytes > 0 ? "・\(bytes / 1024)KB" : ""
-        var s = "\(st) \(method) \(kind)\(topLevel ? "（ページ）" : "") \(ms)\(kb) \(url)"
-        switch outcome {
-        case .failed(let m): s += "  ✕ \(m)"
-        case .blocked(let r): s += "  🚫 \(r)"
-        default: break
-        }
-        return s
-    }
-}
-
-final class NetLog: @unchecked Sendable {
-    static let maxRecords = 1000
-    private let lock = NSLock()
-    private var records: [NetRecord] = []
-    private var positions: [Int: Int] = [:]     // id → records の中の位置
-    private var nextID = 1
-
-    init() {}
-
-    /// 始まった要求を記録して、番号を返す
-    func begin(tab: Int?, method: String, url: String, kind: String, topLevel: Bool, now: Date = Date()) -> Int {
-        lock.lock(); defer { lock.unlock() }
-        let id = nextID
-        nextID += 1
-        records.append(NetRecord(id: id, tab: tab, started: now, method: method, url: url, kind: kind, topLevel: topLevel))
-        positions[id] = records.count - 1
-        if records.count > NetLog.maxRecords + 100 {
-            // まとめて古いものを捨てる（1 件ずつだと位置の付け直しが重い）
-            records.removeFirst(records.count - NetLog.maxRecords)
-            positions = [:]
-            for (i, r) in records.enumerated() { positions[r.id] = i }
-        }
-        return id
-    }
-
-    func update(_ id: Int, _ change: (inout NetRecord) -> Void) {
-        lock.lock(); defer { lock.unlock() }
-        guard id > 0, let i = positions[id], i < records.count, records[i].id == id else { return }
-        change(&records[i])
-    }
-
-    func note(_ id: Int, _ s: String) {
-        update(id) { $0.notes.append(s) }
-    }
-
-    /// 終わった（status が分かっていれば入れる）
-    func finish(_ id: Int, outcome: NetRecord.Outcome, status: Int? = nil, bytes: Int? = nil, now: Date = Date()) {
-        update(id) { r in
-            if r.finished != nil && r.outcome != .pending { return }      // 先に終わっていたら変えない
-            r.outcome = outcome
-            if let status { r.status = status }
-            if let bytes { r.bytes = bytes }
-            r.finished = now
-        }
-    }
-
-    /// 新しい順
-    func recent(limit: Int = 300, filter: (NetRecord) -> Bool = { _ in true }) -> [NetRecord] {
-        lock.lock(); defer { lock.unlock() }
-        var out: [NetRecord] = []
-        for r in records.reversed() where filter(r) {
-            out.append(r)
-            if out.count >= limit { break }
-        }
-        return out
-    }
-
-    var count: Int { lock.lock(); defer { lock.unlock() }; return records.count }
-
-    func clear() {
-        lock.lock(); records = []; positions = [:]; lock.unlock()
-    }
-
-    func export() -> String {
-        recent(limit: NetLog.maxRecords).reversed().map { r in
-            ([r.line] + r.notes.map { "    " + $0 }).joined(separator: "\n")
-        }.joined(separator: "\n")
-    }
-}
-
-// ======================================================================
-// MARK: - FilterLists.swift
-// ======================================================================
-
-// MARK: - 広告ブロックのリストの管理（ダウンロード・更新・WebKit のルールへのコンパイル・サイトごとの OFF）
-//
-// ・リストは Application Support/Vela/filters/<id>.txt に置く。状態（いつ更新したか・ルールの数・コンパイル済みの名前）は adblock.json
-// ・ダウンロードは標準の通信（URLSession）で行う（VNet が動いていなくても更新できるように）
-// ・起動するたびに、置いてあるリストを裏で読んで、BlockEngine（VNet のタブ用）と WebKit のルール（JSON）を作る。
-//   WebKit のルールは中身の印（ハッシュ）を名前に入れてあるので、変わっていなければコンパイルし直さずに取り出せる
-// ・自動更新はリストの「! Expires:」ごと（無ければ 4 日。uBO の Quick fixes は 8 時間）。起動したときと、アプリが前に来たとき。手で「今すぐ更新」もできる
-// ・!#include は落とすときに展開して 1 つのファイルにする（FilterPreparser.expandIncludes）
-// ・スクリプトレット（##+js）: 道具（uBO から作った JSON）を 1 日ごとに Vela の GitHub から落とし、署名を確かめてから使う（ScriptletVerify）。
-//   trusted の道具は、組み込みの一覧（catalog）で trusted にしたリストの行だけ使う（保存ファイルの id や URL では信じない）
-
-/// VNet の通信から（裏のスレッドで）使う、判定の入れ物
-final class BlockEngineBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var engine = BlockEngine.empty
-    private var enabled = true
-    private var disabledSites = Set<String>()
-
-    func set(engine e: BlockEngine) { lock.lock(); engine = e; lock.unlock() }
-    func set(enabled on: Bool, disabledSites sites: Set<String>) { lock.lock(); enabled = on; disabledSites = sites; lock.unlock() }
-    var ruleCount: Int { lock.lock(); defer { lock.unlock() }; return engine.ruleCount }
-
-    /// 止めるなら当たったルール。topHost: タブで開いているページのホスト（サイトごとの OFF の判定）
-    func match(url: URL, types: Set<ResourceType>, sourceHost: String?, topHost: String?) -> BlockEngine.Decision? {
-        lock.lock()
-        let e = engine, on = enabled
-        let off = topHost.map { AdBlocker.isDisabled(host: $0, in: disabledSites) } ?? false
-        lock.unlock()
-        guard on, !off else { return nil }
-        return e.match(url: url, types: types, sourceHost: sourceHost)
-    }
-}
-
-@MainActor
-final class AdBlocker: ObservableObject {
-    nonisolated static var catalog: [FilterListInfo] { FilterCatalog.lists }
-    /// 「! Expires:」が無いリストの更新の間隔
-    static let updateInterval: TimeInterval = 4 * 86_400
-    /// スクリプトレットの道具（Vela の GitHub。Actions が uBO から作って署名したもの）
-    nonisolated static let scriptletsURL = "https://raw.githubusercontent.com/taka2360/Vela/main/resources/ubo-scriptlets.json"
-    static let scriptletsInterval: TimeInterval = 86_400
-    nonisolated static let idPrefix = "vela-ab-"
-
-    @Published private(set) var lists: [FilterListInfo] = []
-    @Published private(set) var busy = false
-    @Published private(set) var status = "準備中…"
-    @Published private(set) var enabled = true
-    @Published private(set) var disabledSites = Set<String>()
-    /// 起動してから止めた数（VNet のタブ）
-    @Published private(set) var totalBlocked = 0
-    /// スクリプトレットの道具の様子（画面に出す）
-    @Published private(set) var scriptletStatus = "まだありません"
-    @Published private(set) var scriptletRuleCount = 0
-    let box = BlockEngineBox()
-    private var scriptletLibrary: ScriptletLibrary?
-    private var scriptletIndex = ScriptletIndex()
-    private var scriptletCache: [String: ScriptletInjection?] = [:]
-    private var scriptletsChecked: Date?
-    private var checkingScriptlets = false
-    /// 最後に読んだリストのスクリプトレットの行（道具が更新されたら、これで索引を作り直す）
-    private var lastScriptletSources: [([ScriptletFilter], Bool)] = []
-    /// リスト id → WebKit のルール
-    private var netLists: [String: WKContentRuleList] = [:]
-    private var cosLists: [String: WKContentRuleList] = [:]
-    /// ルールが変わったとき（タブに入れ直す）。userAction: 利用者が ON/OFF を切り替えた（開いているページを読み直す）
-    var onRuleListsChanged: (@MainActor (_ userAction: Bool) -> Void)?
-    private let stateFile = JSONFile<AdBlockState>(name: "adblock.json", delay: 0.5)
-    private var lastAutoUpdate: Date?
-    private var logs: DevLog?
-    private var started = false
-
-    nonisolated init() {}
-
-    private func log(_ s: String, level: LogLevel = .info) { logs?.add(s, level: level, category: .block) }
-
-    nonisolated static var folder: URL {
-        let dir = JSONFile<AdBlockState>.defaultDirectory().appendingPathComponent("filters", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
-    }
-    nonisolated static func textURL(_ id: String) -> URL { folder.appendingPathComponent("\(id).txt") }
-    nonisolated static var scriptletsFile: URL { folder.appendingPathComponent("ubo-scriptlets.json") }
-    nonisolated static var scriptletsSigFile: URL { folder.appendingPathComponent("ubo-scriptlets.json.sig") }
-
-    nonisolated static func isTrusted(_ l: FilterListInfo) -> Bool { FilterCatalog.isTrusted(l) }
-
-    /// !#if の判定に使う値（UA に Mobile があれば env_mobile）
-    nonisolated static var filterEnv: [String] { FilterPreparser.env(userAgent: BrowserIdentity.userAgent) }
-
-    nonisolated static func isDisabled(host: String, in sites: Set<String>) -> Bool {
-        let h = host.lowercased()
-        return sites.contains { SiteUtil.hostMatches(h, domain: $0) }
-    }
-
-    // MARK: 始める
-
-    func start(logs: DevLog) {
-        if started { return }
-        started = true
-        self.logs = logs
-        stateFile.log = { s in logs.add(s) }
-        let d = UserDefaults.standard
-        enabled = d.object(forKey: "adblock.enabled") == nil ? true : d.bool(forKey: "adblock.enabled")
-        disabledSites = Set(d.stringArray(forKey: "adblock.disabledSites") ?? [])
-        box.set(enabled: enabled, disabledSites: disabledSites)
-        let saved = stateFile.load()
-        lastAutoUpdate = saved?.lastAutoUpdate
-        scriptletsChecked = saved?.scriptletsChecked
-        lists = FilterCatalog.merge(saved: saved?.lists ?? [])
-        loadScriptletLibrary()
-        let dueIDs = self.dueIDs()
-        Task {
-            await self.updateScriptletsIfDue()
-            if dueIDs.isEmpty { await self.rebuild() } else { await self.update(manual: false, only: dueIDs) }
-        }
-    }
-
-    /// 更新が要るリスト（ファイルが無い・期限切れ）
-    private func dueIDs(now: Date = Date()) -> [String] {
-        lists.filter { l in
-            guard l.enabled else { return false }
-            if !FileManager.default.fileExists(atPath: AdBlocker.textURL(l.id).path) { return true }
-            guard let last = l.lastUpdated else { return true }
-            let interval = l.expiresHours.map { TimeInterval($0) * 3600 } ?? AdBlocker.updateInterval
-            return now.timeIntervalSince(last) > interval
-        }.map { $0.id }
-    }
-
-    /// アプリが前に来たとき: 期限切れのリストと道具だけ更新する
-    func updateIfDue() {
-        guard started, !busy else { return }
-        let ids = dueIDs()
-        Task {
-            await self.updateScriptletsIfDue()
-            if !ids.isEmpty { await self.update(manual: false, only: ids) }
-        }
-    }
-
-    // MARK: 設定
-
-    func setEnabled(_ on: Bool) {
-        enabled = on
-        UserDefaults.standard.set(on, forKey: "adblock.enabled")
-        box.set(enabled: on, disabledSites: disabledSites)
-        log(on ? "広告ブロックを使います" : "広告ブロックを止めました")
-        onRuleListsChanged?(true)
-    }
-
-    func isActive(for host: String?) -> Bool {
-        guard enabled else { return false }
-        guard let host else { return true }
-        return !AdBlocker.isDisabled(host: host, in: disabledSites)
-    }
-
-    /// そのサイトで止める・使う
-    func toggleSite(_ host: String) {
-        let h = SiteUtil.stripWWW(host.lowercased())
-        if AdBlocker.isDisabled(host: h, in: disabledSites) {
-            disabledSites = disabledSites.filter { !SiteUtil.hostMatches(h, domain: $0) }
-            log("\(h) で広告ブロックを使います")
-        } else {
-            disabledSites.insert(h)
-            log("\(h) では広告ブロックを止めます")
-        }
-        saveSites()
-    }
-
-    func removeDisabledSite(_ h: String) {
-        disabledSites.remove(h)
-        saveSites()
-    }
-
-    private func saveSites() {
-        UserDefaults.standard.set(Array(disabledSites).sorted(), forKey: "adblock.disabledSites")
-        box.set(enabled: enabled, disabledSites: disabledSites)
-        onRuleListsChanged?(true)
-    }
-
-    func setListEnabled(_ id: String, _ on: Bool) {
-        guard let i = lists.firstIndex(where: { $0.id == id }) else { return }
-        lists[i].enabled = on
-        saveState()
-        if on && !FileManager.default.fileExists(atPath: AdBlocker.textURL(id).path) {
-            Task { await self.update(manual: true, only: [id]) }
-        } else {
-            Task { await self.rebuild() }
-        }
-    }
-
-    /// 自分で URL を足す
-    func addCustom(_ text: String) {
-        guard let u = URL(string: text.trimmingCharacters(in: .whitespaces)), let s = u.scheme?.lowercased(), s == "https" || s == "http",
-              !lists.contains(where: { $0.url == u.absoluteString }) else { return }
-        let id = "custom-" + ContentBlockerCompiler.hash(u.absoluteString)
-        lists.append(FilterListInfo(id: id, name: u.host ?? u.absoluteString, url: u.absoluteString, enabled: true, builtIn: false))
-        saveState()
-        Task { await self.update(manual: true, only: [id]) }
-    }
-
-    func removeList(_ id: String) {
-        guard let i = lists.firstIndex(where: { $0.id == id }), !lists[i].builtIn else { return }
-        let l = lists.remove(at: i)
-        try? FileManager.default.removeItem(at: AdBlocker.textURL(id))
-        for rid in [l.netID, l.cosID].compactMap({ $0 }) { WKContentRuleListStore.default().removeContentRuleList(forIdentifier: rid) { _ in } }
-        saveState()
-        Task { await self.rebuild() }
-    }
-
-    func noteBlocked() { totalBlocked += 1 }
-
-    /// そのタブに入れる WebKit のルール（VNet のタブは隠すルールだけ。通信は BlockEngine が調べる）
-    func ruleLists(for mode: NetMode, host: String?) -> [WKContentRuleList] {
-        guard isActive(for: host) else { return [] }
-        let ids = lists.filter { $0.enabled }.map { $0.id }
-        var out = ids.compactMap { cosLists[$0] }
-        if !mode.usesVNet { out += ids.compactMap { netLists[$0] } }
-        return out
-    }
-
-    var ruleCount: Int { box.ruleCount }
-
-    // MARK: 更新
-
-    /// ダウンロードしてから作り直す。only: そのリストだけ
-    func update(manual: Bool, only: [String]? = nil) async {
-        if busy { return }
-        busy = true
-        let targets = lists.filter { $0.enabled && (only == nil || only!.contains($0.id)) }
-        log("広告ブロックのリストを更新します（\(targets.count) 個\(manual ? "・手で" : "・自動")）")
-        for (n, l) in targets.enumerated() {
-            status = "ダウンロード中 \(n + 1)/\(targets.count): \(l.name)"
-            let result = await AdBlocker.download(l.url)
-            guard let i = lists.firstIndex(where: { $0.id == l.id }) else { continue }
-            if var text = result.text {
-                // !#include を展開する（同じ場所のものだけ。捨てる !#if の枝の中のものは読まない）
-                if text.contains("!#include"), let base = URL(string: l.url) {
-                    status = "ダウンロード中 \(n + 1)/\(targets.count): \(l.name)（中のリスト）"
-                    let ex = await FilterPreparser.expandIncludes(text, base: base, env: AdBlocker.filterEnv) { u in
-                        await AdBlocker.download(u.absoluteString, checkFormat: false).text
-                    }
-                    text = ex.text
-                    if !ex.included.isEmpty { log("\(l.name): 中のリスト \(ex.included.count) 個を読みました") }
-                    if !ex.failed.isEmpty { log("⚠️ \(l.name): 読めなかった中のリスト: \(ex.failed.joined(separator: "・"))", level: .warning) }
-                }
-                do {
-                    try Data(text.utf8).write(to: AdBlocker.textURL(l.id), options: .atomic)
-                    lists[i].lastUpdated = Date()
-                    lists[i].lastError = nil
-                    lists[i].expiresHours = FilterPreparser.expiresHours(text)
-                    log("✓ \(l.name): \(text.utf8.count / 1024)KB\(lists[i].expiresHours.map { "（\($0) 時間ごと）" } ?? "")")
-                } catch {
-                    lists[i].lastError = "保存できません: \(error.localizedDescription)"
-                }
-            } else {
-                let message = result.error ?? "不明"
-                lists[i].lastError = message
-                log("⚠️ \(l.name) をダウンロードできません: \(message)", level: .warning)
-            }
-        }
-        if only == nil { lastAutoUpdate = Date() }
-        saveState()
-        busy = false
-        await rebuild()
-    }
-
-    /// ダウンロードの結果（text か error のどちらか）
-    struct Downloaded: Sendable { var text: String?; var error: String? }
-
-    /// checkFormat: 広告ブロックのリストの形か確かめる（!#include の中のリストは確かめない）
-    nonisolated static func download(_ urlString: String, checkFormat: Bool = true) async -> Downloaded {
-        guard let u = URL(string: urlString) else { return Downloaded(error: "URL が正しくありません") }
-        var req = URLRequest(url: u, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
-        req.setValue(BrowserIdentity.userAgent, forHTTPHeaderField: "User-Agent")
-        return await withCheckedContinuation { (c: CheckedContinuation<Downloaded, Never>) in
-            URLSession.shared.dataTask(with: req) { data, response, error in
-                if let error { c.resume(returning: Downloaded(error: error.localizedDescription)); return }
-                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                guard status == 200, let data, let text = String(data: data, encoding: .utf8) else {
-                    c.resume(returning: Downloaded(error: "サーバーの返事が \(status) です")); return
-                }
-                // HTML（ログインやエラーのページ）などをリストだと思わないように
-                let head = text.prefix(2000)
-                guard !checkFormat || head.contains("!") || head.contains("[Adblock") || head.contains("##") || head.contains("||") else {
-                    c.resume(returning: Downloaded(error: "広告ブロックのリストではないようです")); return
-                }
-                c.resume(returning: Downloaded(text: text))
-            }.resume()
-        }
-    }
-
-    // MARK: 作り直す（BlockEngine と WebKit のルール）
-
-    private struct Built {
-        let id: String
-        let network: [NetworkRule]
-        let scriptlets: [ScriptletFilter]
-        let trusted: Bool
-        let netJSON: String
-        let cosJSON: String
-        let networkCount: Int
-        let cosmeticCount: Int
-        let unsupported: Int
-        let skipped: Int
-    }
-
-    /// 置いてあるリストを裏で読んで、BlockEngine を作り、WebKit のルールを（変わったものだけ）コンパイルする
-    func rebuild() async {
-        busy = true
-        status = "リストを読んでいます…"
-        let enabledLists = lists.filter { $0.enabled }
-        let start = Date()
-        let env = AdBlocker.filterEnv
-        let built: [Built] = await Task.detached(priority: .utility) {
-            enabledLists.compactMap { l -> Built? in
-                guard let d = try? Data(contentsOf: AdBlocker.textURL(l.id)) else { return nil }
-                let p = ABPParser.parse(String(decoding: d, as: UTF8.self), env: env)
-                let net = ContentBlockerCompiler.networkJSON(p.network)
-                let cos = ContentBlockerCompiler.cosmeticJSON(p.cosmetic)
-                return Built(id: l.id, network: p.network, scriptlets: p.scriptlets, trusted: AdBlocker.isTrusted(l),
-                             netJSON: net.json, cosJSON: cos.json, networkCount: p.network.count,
-                             cosmeticCount: p.cosmetic.count, unsupported: p.unsupported, skipped: net.skipped + cos.skipped)
-            }
-        }.value
-        let engine: BlockEngine = await Task.detached(priority: .utility) {
-            BlockEngine(rules: built.flatMap { $0.network })
-        }.value
-        box.set(engine: engine)
-        log("広告ブロック: VNet 用のルール \(engine.ruleCount) 個を作りました（\(Int(Date().timeIntervalSince(start) * 1000))ms）")
-        await rebuildScriptlets(built.map { ($0.scriptlets, $0.trusted) })
-
-        var newNet: [String: WKContentRuleList] = [:], newCos: [String: WKContentRuleList] = [:]
-        for (n, b) in built.enumerated() {
-            status = "WebKit のルールを用意しています \(n + 1)/\(built.count)…"
-            guard let i = lists.firstIndex(where: { $0.id == b.id }) else { continue }
-            lists[i].networkRules = b.networkCount
-            lists[i].cosmeticRules = b.cosmeticCount
-            lists[i].unsupported = b.unsupported + b.skipped
-            lists[i].scriptletRules = b.scriptlets.count
-            let netID = "\(AdBlocker.idPrefix)\(b.id)-net-\(ContentBlockerCompiler.hash(b.netJSON))"
-            let cosID = "\(AdBlocker.idPrefix)\(b.id)-cos-\(ContentBlockerCompiler.hash(b.cosJSON))"
-            if let l = await compile(netID, b.netJSON, name: "\(lists[i].name) の通信") { newNet[b.id] = l; lists[i].netID = netID }
-            if let l = await compile(cosID, b.cosJSON, name: "\(lists[i].name) の隠すルール") { newCos[b.id] = l; lists[i].cosID = cosID }
-        }
-        netLists = newNet
-        cosLists = newCos
-        saveState()
-        removeUnusedCompiled()
-        busy = false
-        status = "ルール \(engine.ruleCount) 個（VNet）・リスト \(built.count) 個"
-        onRuleListsChanged?(false)
-    }
-
-    // MARK: スクリプトレット
-
-    /// 行の束から、ホストごとの索引を作り直す（道具が無ければ空）
-    private func rebuildScriptlets(_ sources: [([ScriptletFilter], Bool)]) async {
-        lastScriptletSources = sources
-        guard let lib = scriptletLibrary else {
-            scriptletIndex = ScriptletIndex()
-            scriptletCache = [:]
-            scriptletRuleCount = 0
-            return
-        }
-        let idx: ScriptletIndex = await Task.detached(priority: .utility) {
-            var idx = ScriptletIndex()
-            for (rules, trusted) in sources { for r in rules { idx.add(r, trusted: trusted, library: lib) } }
-            return idx
-        }.value
-        scriptletIndex = idx
-        scriptletCache = [:]
-        scriptletRuleCount = idx.size
-        var line = "スクリプトレット \(idx.size) 個・道具 uBO \(lib.ubo)（\(lib.count) 個）"
-        if idx.rejectedTrust > 0 { line += "・信頼しないリストの trusted \(idx.rejectedTrust) 個を除いた" }
-        if idx.badTargets > 0 { line += "・読めないドメイン \(idx.badTargets) 個" }
-        log(line)
-        if !idx.unknown.isEmpty {
-            let top = idx.unknown.sorted { $0.value > $1.value }.prefix(10).map { "\($0.key)（\($0.value)）" }
-            log("⚠️ 道具に無いスクリプトレット（リストの方が新しい uBO を前提にしている）: \(top.joined(separator: "・"))", level: .warning)
-        }
-    }
-
-    /// 置いてある道具を読む（署名を確かめ直す）
-    private func loadScriptletLibrary() {
-        guard let d = try? Data(contentsOf: AdBlocker.scriptletsFile),
-              let sig = try? String(contentsOf: AdBlocker.scriptletsSigFile, encoding: .utf8) else {
-            scriptletStatus = "まだありません（ダウンロードします）"
-            return
-        }
-        switch ScriptletVerify.verify(d, signature: sig, current: nil) {
-        case .success(let lib):
-            scriptletLibrary = lib
-            scriptletStatus = "uBO \(lib.ubo)（\(lib.count) 個）・署名 OK"
-        case .failure(let e):
-            scriptletStatus = "使えません: \(e)"
-            log("⚠️ 置いてあるスクリプトレットの道具が使えません: \(e)", level: .warning)
-        }
-    }
-
-    /// 1 日ごとに道具を落とす（署名・形式・古くないかを確かめたものだけ置き換える）
-    func updateScriptletsIfDue(force: Bool = false) async {
-        if checkingScriptlets { return }
-        if !force, scriptletLibrary != nil, let last = scriptletsChecked, Date().timeIntervalSince(last) < AdBlocker.scriptletsInterval { return }
-        checkingScriptlets = true
-        defer { checkingScriptlets = false }
-        let j = await AdBlocker.fetchData(AdBlocker.scriptletsURL)
-        let s = await AdBlocker.fetchData(AdBlocker.scriptletsURL + ".sig")
-        scriptletsChecked = Date()
-        saveState()
-        guard let j, let s, let sigText = String(data: s, encoding: .utf8) else {
-            log("⚠️ スクリプトレットの道具をダウンロードできません", level: .warning)
-            return
-        }
-        switch ScriptletVerify.verify(j, signature: sigText, current: scriptletLibrary) {
-        case .success(let lib):
-            if lib.generated == scriptletLibrary?.generated { return }
-            do {
-                try j.write(to: AdBlocker.scriptletsFile, options: .atomic)
-                try s.write(to: AdBlocker.scriptletsSigFile, options: .atomic)
-            } catch {
-                log("⚠️ スクリプトレットの道具を保存できません: \(error.localizedDescription)", level: .warning)
-                return
-            }
-            scriptletLibrary = lib
-            scriptletStatus = "uBO \(lib.ubo)（\(lib.count) 個）・署名 OK"
-            log("スクリプトレットの道具を更新しました: uBO \(lib.ubo)（\(lib.generated ?? "?")）")
-            if !lastScriptletSources.isEmpty {
-                await rebuildScriptlets(lastScriptletSources)
-                onRuleListsChanged?(false)
-            }
-        case .failure(let e):
-            scriptletStatus = (scriptletLibrary.map { "uBO \($0.ubo)（\($0.count) 個）・署名 OK" } ?? "使えません") + "／新しいもの: \(e)"
-            log("⚠️ 落としたスクリプトレットの道具を使いません: \(e)", level: .warning)
-        }
-    }
-
-    nonisolated static func fetchData(_ urlString: String) async -> Data? {
-        guard let u = URL(string: urlString) else { return nil }
-        var req = URLRequest(url: u, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
-        req.setValue(BrowserIdentity.userAgent, forHTTPHeaderField: "User-Agent")
-        return await withCheckedContinuation { (c: CheckedContinuation<Data?, Never>) in
-            URLSession.shared.dataTask(with: req) { data, response, error in
-                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                c.resume(returning: (error == nil && status == 200) ? data : nil)
-            }.resume()
-        }
-    }
-
-    /// 自己テストなどで、今の道具を使う
-    var currentScriptletLibrary: ScriptletLibrary? { scriptletLibrary }
-
-    /// そのタブに入れるスクリプトレット。top: トップのページ・frames: サブフレーム（URL が分かったもの）
-    func scriptlets(top: URL?, frames: [URL]) -> ScriptletInjection? {
-        guard let lib = scriptletLibrary, scriptletIndex.size > 0, let top, isActive(for: top.host) else { return nil }
-        let all = [top] + frames
-        let cacheKey = all.map { $0.absoluteString }.joined(separator: "\n")
-        if let c = scriptletCache[cacheKey] { return c }
-        var picked: [(host: String, selection: ScriptletIndex.Selection)] = []
-        for (i, u) in all.enumerated() {
-            guard let h = u.host?.lowercased(), !h.isEmpty else { continue }
-            picked.append((h, scriptletIndex.retrieve(url: u, ancestors: i == 0 ? [] : [top])))
-        }
-        let out = ScriptletAssembler.assemble(picked, library: lib)
-        let r: ScriptletInjection? = out.isEmpty ? nil
-            : ScriptletInjection(key: ContentBlockerCompiler.hash(out.main + "\u{0}" + out.isolated), main: out.main, isolated: out.isolated, filters: out.filters)
-        if scriptletCache.count > 64 { scriptletCache = [:] }
-        scriptletCache[cacheKey] = r
-        return r
-    }
-
-    /// 同じ名前のものがあれば取り出し、無ければコンパイルする
-    private func compile(_ id: String, _ json: String, name: String) async -> WKContentRuleList? {
-        let store: WKContentRuleListStore = WKContentRuleListStore.default()
-        if let found = await withCheckedContinuation({ (c: CheckedContinuation<WKContentRuleList?, Never>) in
-            store.lookUpContentRuleList(forIdentifier: id) { l, _ in c.resume(returning: l) }
-        }) { return found }
-        let t0 = Date()
-        let (list, error) = await withCheckedContinuation { (c: CheckedContinuation<(WKContentRuleList?, String?), Never>) in
-            store.compileContentRuleList(forIdentifier: id, encodedContentRuleList: json) { l, e in
-                c.resume(returning: (l, e.map { "\($0)" }))
-            }
-        }
-        if let list {
-            log("WebKit のルールをコンパイルしました: \(name)（\(Int(Date().timeIntervalSince(t0) * 1000))ms）")
-            return list
-        }
-        log("⚠️ WebKit のルールをコンパイルできません: \(name)（\(error ?? "不明")）", level: .warning)
-        return nil
-    }
-
-    /// 使っていない古いコンパイル済みのルールを消す
-    private func removeUnusedCompiled() {
-        let keep = Set(lists.flatMap { [$0.netID, $0.cosID] }.compactMap { $0 })
-        let store: WKContentRuleListStore = WKContentRuleListStore.default()
-        let lg = logs
-        store.getAvailableContentRuleListIdentifiers { ids in
-            for id in ids ?? [] where id.hasPrefix(AdBlocker.idPrefix) && !keep.contains(id) {
-                store.removeContentRuleList(forIdentifier: id) { _ in }
-                lg?.add("古い WebKit のルールを消しました: \(id)", level: .debug, category: .block)
-            }
-        }
-    }
-
-    private func saveState() {
-        stateFile.save(AdBlockState(lists: lists, lastAutoUpdate: lastAutoUpdate, scriptletsChecked: scriptletsChecked))
     }
 }

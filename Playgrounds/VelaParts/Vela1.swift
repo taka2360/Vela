@@ -3,6 +3,7 @@
 
 import SwiftUI
 import WebKit
+import PhotosUI
 import Foundation
 import Network
 #if canImport(FoundationNetworking)
@@ -88,7 +89,7 @@ struct TopBar: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 14) {
+            HStack(spacing: 18) {
                 NavButtons(tab: tab)
                 Button { store.openLibrary(.bookmarks) } label: { Image(systemName: "book") }
                 AddressField(store: store, tab: tab, editor: store.address, library: store.library)
@@ -99,9 +100,10 @@ struct TopBar: View {
                     .keyboardShortcut("t", modifiers: .command)
                 Button { store.openTabOverview() } label: { Image(systemName: "square.on.square") }
             }
-            .font(.system(size: 18))
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            // 大きさは前（18pt・高さ 36）の 1.3 倍くらい
+            .font(.system(size: 23))
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
             LoadingBar(progress: tab.progress, visible: tab.isLoading)
         }
         .background(Color(UIColor.secondarySystemBackground))
@@ -133,7 +135,7 @@ struct NavButtons: View {
     @ObservedObject var tab: BrowserTab
 
     var body: some View {
-        HStack(spacing: 18) {
+        HStack(spacing: 23) {
             Button { tab.goBack() } label: { Image(systemName: "chevron.backward") }
                 .disabled(!tab.canGoBack)
                 .contextMenu { HistoryMenu(tab: tab, back: true) }
@@ -184,9 +186,9 @@ struct LoadingBar: View {
         GeometryReader { g in
             Rectangle()
                 .fill(Color.accentColor)
-                .frame(width: g.size.width * CGFloat(max(0.05, min(progress, 1))), height: 2)
+                .frame(width: g.size.width * CGFloat(max(0.05, min(progress, 1))), height: 3)
         }
-        .frame(height: 2)
+        .frame(height: 3)
         .opacity(visible ? 1 : 0)
     }
 }
@@ -215,8 +217,8 @@ struct AddressField: View {
                 }
             }
         }
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color(UIColor.tertiarySystemFill)))
-        .frame(height: 36)
+        .background(RoundedRectangle(cornerRadius: 13).fill(Color(UIColor.tertiarySystemFill)))
+        .frame(height: 46)
         .frame(maxWidth: .infinity)
         .onChange(of: focused) { f in
             if editor.editing != f { editor.editing = f }
@@ -233,28 +235,30 @@ struct AddressField: View {
             .textInputAutocapitalization(.never)
             .keyboardType(.webSearch)
             .submitLabel(.go)
+            .font(.system(size: 20))
             .onSubmit {
                 store.open(editor.text, in: tab)
                 focused = false
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 13)
     }
 
     private var display: some View {
-        HStack(spacing: 6) {
-            if tab.isSecure { Image(systemName: "lock.fill").font(.system(size: 12)).foregroundStyle(.secondary) }
+        HStack(spacing: 8) {
+            if tab.isSecure { Image(systemName: "lock.fill").font(.system(size: 16)).foregroundStyle(.secondary) }
             Text(displayText)
+                .font(.system(size: 20))
                 .lineLimit(1)
                 .foregroundColor(tab.url == nil ? .secondary : .primary)
             if tab.blockedCount > 0 {
                 Label("\(tab.blockedCount)", systemImage: "shield.lefthalf.filled")
-                    .font(.system(size: 11))
+                    .font(.system(size: 14))
                     .foregroundStyle(.secondary)
             }
             ModeBadge(tab: tab, status: store.status)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 13)
     }
 
     private var displayText: String {
@@ -278,14 +282,14 @@ struct ModeBadge: View {
     var body: some View {
         HStack(spacing: 4) {
             Text(label)
-                .font(.system(size: 10, weight: .semibold))
-                .padding(.horizontal, 5)
-                .padding(.vertical, 2)
-                .background(RoundedRectangle(cornerRadius: 4).fill(color.opacity(0.18)))
+                .font(.system(size: 13, weight: .semibold))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(RoundedRectangle(cornerRadius: 5).fill(color.opacity(0.18)))
                 .foregroundColor(color)
             if !tab.nonVNetUsage.isEmpty {
                 Text(tab.nonVNetUsage.sorted().joined(separator: "・"))
-                    .font(.system(size: 10))
+                    .font(.system(size: 13))
                     .foregroundStyle(.secondary)
             }
         }
@@ -363,7 +367,7 @@ struct TabPage: View {
         ZStack {
             WebHost(webView: tab.webView)
             if tab.url == nil {
-                StartPage(store: store, library: store.library)
+                StartPage(store: store, library: store.library, home: store.home, icons: store.icons)
             }
         }
     }
@@ -467,8 +471,8 @@ struct PageMenu: View {
             ModeSwitchItems(store: store, tab: tab)
         } label: {
             Text("ぁあ")
-                .font(.system(size: 15, weight: .medium))
-                .padding(.horizontal, 6)
+                .font(.system(size: 20, weight: .medium))
+                .padding(.horizontal, 8)
         }
     }
 }
@@ -676,7 +680,7 @@ struct TabCard: View {
 // MARK: - LibraryView.swift
 // ======================================================================
 
-// MARK: - ブックマーク・履歴の画面（シート）、アドレス欄の候補、新しいタブの画面
+// MARK: - ブックマーク・履歴の画面（シート）、アドレス欄の候補（新しいタブの画面は HomeViews.swift）
 
 struct LibraryView: View {
     @ObservedObject var store: BrowserStore
@@ -964,52 +968,159 @@ struct SuggestionList: View {
     }
 }
 
-// MARK: 新しいタブの画面（ブックマークとよく見るサイト）
+// ======================================================================
+// MARK: - HomeViews.swift
+// ======================================================================
 
+// MARK: - ホーム（新しいタブの画面）: 背景・ブックマークとよく見るサイトのタイル・カスタマイズの画面
+//
+// ・タイルを長押しすると、新しいタブで開く・コピー・名前を変える・並べ替え・削除（ブックマーク）、ブックマークに入れる・外す（よく見るサイト）
+// ・下の「編集」から、出す項目と背景（用意した色・自分の写真）を変えられる
+
+/// ホームのタイル 1 つ分
+struct HomeSite: Identifiable {
+    let title: String
+    let url: String
+    /// ブックマークのタイルなら、そのブックマーク
+    let bookmark: Bookmark?
+    var id: String { (bookmark?.id.uuidString ?? "top") + url }
+}
+
+@MainActor
 struct StartPage: View {
     @ObservedObject var store: BrowserStore
     @ObservedObject var library: Library
+    @ObservedObject var home: HomeStore
+    @ObservedObject var icons: SiteIconStore
+    @State private var customizing = false
+    @State private var renaming: Bookmark?
+    @State private var newTitle = ""
     private let columns = [GridItem(.adaptive(minimum: 96), spacing: 16)]
+    static let maxBookmarks = 24
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                let favorites = Array(library.bookmarks.items.prefix(12))
-                let top = library.history.topSites(limit: 8)
-                if favorites.isEmpty && top.isEmpty {
-                    EmptyNote(icon: "globe", text: "上のアドレス欄に、URL か調べたいことを入れてください")
-                        .padding(.top, 120)
+        let layout = home.layout
+        let onImage = layout.background != .none
+        let favorites = layout.showBookmarks ? Array(library.bookmarks.items.prefix(StartPage.maxBookmarks)) : []
+        let top = layout.showTopSites ? layout.visibleTopSites(library.history) : []
+        ZStack {
+            HomeBackgroundView(background: layout.background, photo: home.wallpaper)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    if favorites.isEmpty && top.isEmpty {
+                        HomeEmptyNote(onImage: onImage)
+                            .padding(.top, 120)
+                    }
+                    if !favorites.isEmpty {
+                        SiteGrid(title: "ブックマーク", onImage: onImage, columns: columns,
+                                 sites: favorites.map { HomeSite(title: $0.title, url: $0.url, bookmark: $0) }) { site in
+                            tile(site, onImage: onImage)
+                        }
+                    }
+                    if !top.isEmpty {
+                        SiteGrid(title: "よく見るサイト", onImage: onImage, columns: columns,
+                                 sites: top.map { HomeSite(title: $0.title, url: $0.url, bookmark: nil) }) { site in
+                            tile(site, onImage: onImage)
+                        }
+                    }
+                    HStack {
+                        Spacer()
+                        Button { customizing = true } label: {
+                            Label("編集", systemImage: "slider.horizontal.3")
+                                .font(.system(size: 15, weight: .medium))
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 8)
+                                .background(.regularMaterial, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        Spacer()
+                    }
+                    .padding(.top, 8)
                 }
-                if !favorites.isEmpty {
-                    SiteGrid(store: store, title: "ブックマーク", sites: favorites.map { ($0.title, $0.url) }, columns: columns)
-                }
-                if !top.isEmpty {
-                    SiteGrid(store: store, title: "よく見るサイト", sites: top.map { ($0.title, $0.url) }, columns: columns)
-                }
+                .frame(maxWidth: 760)
+                .padding(32)
+                .frame(maxWidth: .infinity)
             }
-            .frame(maxWidth: 760)
-            .padding(32)
-            .frame(maxWidth: .infinity)
         }
-        .background(Color(UIColor.systemBackground))
+        .sheet(isPresented: $customizing) {
+            HomeCustomizeView(home: home)
+        }
+        .alert("名前を変える", isPresented: Binding.present({ renaming }, clear: { renaming = nil })) {
+            TextField("名前", text: $newTitle)
+            Button("キャンセル", role: .cancel) { renaming = nil }
+            Button("OK") {
+                if let b = renaming { library.renameBookmark(b.id, title: newTitle) }
+                renaming = nil
+            }
+        } message: {
+            Text(renaming?.url ?? "")
+        }
+    }
+
+    private func tile(_ site: HomeSite, onImage: Bool) -> some View {
+        SiteTile(title: site.title, url: site.url, icon: icons.image(for: site.url), onImage: onImage) {
+            open(site.url, newTab: false)
+        }
+        .onAppear { icons.ensure(site.url, viaVNet: store.defaultMode.usesVNet) }
+        .contextMenu {
+            SiteLinkMenuItems(url: site.url) { open(site.url, newTab: true) }
+            if let b = site.bookmark {
+                Button {
+                    newTitle = b.title
+                    renaming = b
+                } label: { Label("名前を変える", systemImage: "pencil") }
+                Button { library.moveBookmark(b.id, by: -1) } label: { Label("前へ", systemImage: "arrow.left") }
+                Button { library.moveBookmark(b.id, by: 1) } label: { Label("後ろへ", systemImage: "arrow.right") }
+                Button(role: .destructive) { library.removeBookmark(b.id) } label: { Label("削除", systemImage: "trash") }
+            } else {
+                if !library.bookmarks.contains(site.url), let u = URL(string: site.url) {
+                    Button { library.toggleBookmark(url: u, title: site.title) } label: { Label("ブックマークに入れる", systemImage: "book") }
+                }
+                Button(role: .destructive) { home.hideTopSite(site.url) } label: { Label("よく見るサイトから外す", systemImage: "eye.slash") }
+            }
+        }
+    }
+
+    private func open(_ url: String, newTab: Bool) {
+        guard let u = URL(string: url) else { return }
+        store.open(url: u, newTab: newTab)
     }
 }
 
-struct SiteGrid: View {
-    let store: BrowserStore
+/// 何も無いときの案内（背景が画像なら白い字）
+struct HomeEmptyNote: View {
+    let onImage: Bool
+
+    var body: some View {
+        if onImage {
+            VStack(spacing: 10) {
+                Image(systemName: "globe").font(.system(size: 36))
+                Text("上のアドレス欄に、URL か調べたいことを入れてください").multilineTextAlignment(.center)
+            }
+            .foregroundColor(.white)
+            .shadow(color: .black.opacity(0.5), radius: 3)
+            .frame(maxWidth: .infinity)
+        } else {
+            EmptyNote(icon: "globe", text: "上のアドレス欄に、URL か調べたいことを入れてください")
+        }
+    }
+}
+
+struct SiteGrid<Tile: View>: View {
     let title: String
-    let sites: [(String, String)]
+    let onImage: Bool
     let columns: [GridItem]
+    let sites: [HomeSite]
+    @ViewBuilder let tile: (HomeSite) -> Tile
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(title).font(.headline)
-            LazyVGrid(columns: columns, spacing: 16) {
-                ForEach(sites, id: \.1) { site in
-                    SiteTile(title: site.0, url: site.1) {
-                        if let u = URL(string: site.1) { store.open(url: u) }
-                    }
-                }
+                .foregroundColor(onImage ? .white : .primary)
+                .shadow(color: onImage ? .black.opacity(0.5) : .clear, radius: 3)
+            // タイルの高さはそろえてある（SiteTile.titleHeight）ので、アイコンの y は名前の長さで変わらない
+            LazyVGrid(columns: columns, alignment: .center, spacing: 16) {
+                ForEach(sites) { site in tile(site) }
             }
         }
     }
@@ -1018,19 +1129,28 @@ struct SiteGrid: View {
 struct SiteTile: View {
     let title: String
     let url: String
+    let icon: UIImage?
+    let onImage: Bool
     let open: () -> Void
+
+    static let iconSide: CGFloat = 64
+    /// 名前は 2 行まで。1 行でも 2 行分の高さを取って、アイコンの位置（y）をそろえる
+    static let titleHeight: CGFloat = 30
 
     var body: some View {
         Button(action: open) {
             VStack(spacing: 6) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 14).fill(Color(UIColor.tertiarySystemFill))
-                    Text(initial).font(.system(size: 26, weight: .semibold)).foregroundStyle(.secondary)
-                }
-                .frame(width: 64, height: 64)
-                Text(title.isEmpty ? host : title).font(.system(size: 12)).lineLimit(2).multilineTextAlignment(.center)
-                    .foregroundColor(.primary)
+                SiteIconView(icon: icon, initial: initial, onImage: onImage)
+                Text(title.isEmpty ? host : title)
+                    .font(.system(size: 12))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+                    .foregroundColor(onImage ? .white : .primary)
+                    .shadow(color: onImage ? .black.opacity(0.6) : .clear, radius: 2)
+                    .frame(maxWidth: .infinity, minHeight: SiteTile.titleHeight, maxHeight: SiteTile.titleHeight, alignment: .top)
             }
+            .frame(maxWidth: .infinity, alignment: .top)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
@@ -1039,250 +1159,194 @@ struct SiteTile: View {
     private var initial: String { String(host.first ?? "?").uppercased() }
 }
 
-// ======================================================================
-// MARK: - DevPanel.swift
-// ======================================================================
+/// タイルのアイコン（サイトのアイコンが無ければ頭文字）
+struct SiteIconView: View {
+    let icon: UIImage?
+    let initial: String
+    let onImage: Bool
 
-// MARK: - 開発者パネル（「…」メニュー・⌘⌥I から。普段の画面とは分ける）
-//
-// ページ: 概要・ログ・通信・タブ・Cookie・HSTS・広告ブロック・VNet・システム・範囲とリスク
-// 開いている間だけ、StatusModel.devTick（0.5 秒ごと）で描き直す。どのページも、数が多いものは新しい方から数百件だけ出す
+    /// これより小さいアイコン（16・32px の favicon）は、引き伸ばさずに真ん中に小さく出す
+    static let smallIcon: CGFloat = 60
 
-enum DevPage: String, CaseIterable, Hashable {
-    case overview = "概要", log = "ログ", network = "通信", tabs = "タブ", cookies = "Cookie", hsts = "HSTS"
-    case adblock = "広告ブロック", vnet = "VNet", system = "システム", scope = "範囲とリスク"
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+        ZStack {
+            if let icon {
+                shape.fill(Color.white)
+                if icon.size.width * icon.scale < SiteIconView.smallIcon {
+                    Image(uiImage: icon).resizable().aspectRatio(contentMode: .fit).frame(width: 32, height: 32)
+                } else {
+                    Image(uiImage: icon).resizable().aspectRatio(contentMode: .fit)
+                }
+            } else {
+                if onImage { shape.fill(.ultraThinMaterial) } else { shape.fill(Color(UIColor.tertiarySystemFill)) }
+                Text(initial).font(.system(size: 26, weight: .semibold))
+                    .foregroundColor(onImage ? .white : .secondary)
+            }
+        }
+        .frame(width: SiteTile.iconSide, height: SiteTile.iconSide)
+        .clipShape(shape)
+        .shadow(color: .black.opacity(onImage ? 0.25 : 0.08), radius: 3, y: 1)
+    }
 }
 
+// MARK: 背景
+
+enum HomePresets {
+    static func title(_ id: String) -> String {
+        switch id {
+        case "sky": return "空"
+        case "sunset": return "夕焼け"
+        case "forest": return "森"
+        case "ocean": return "海"
+        case "lavender": return "ラベンダー"
+        case "night": return "夜"
+        default: return id
+        }
+    }
+
+    static func colors(_ id: String) -> [Color] {
+        switch id {
+        case "sky": return [Color(red: 0.30, green: 0.56, blue: 0.92), Color(red: 0.55, green: 0.78, blue: 0.98)]
+        case "sunset": return [Color(red: 0.93, green: 0.42, blue: 0.36), Color(red: 0.62, green: 0.30, blue: 0.62)]
+        case "forest": return [Color(red: 0.16, green: 0.45, blue: 0.33), Color(red: 0.42, green: 0.66, blue: 0.40)]
+        case "ocean": return [Color(red: 0.05, green: 0.30, blue: 0.48), Color(red: 0.14, green: 0.60, blue: 0.66)]
+        case "lavender": return [Color(red: 0.52, green: 0.44, blue: 0.80), Color(red: 0.80, green: 0.56, blue: 0.80)]
+        case "night": return [Color(red: 0.07, green: 0.08, blue: 0.20), Color(red: 0.24, green: 0.20, blue: 0.42)]
+        default: return [Color.gray, Color.gray]
+        }
+    }
+
+    static func gradient(_ id: String) -> LinearGradient {
+        LinearGradient(colors: colors(id), startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+}
+
+struct HomeBackgroundView: View {
+    let background: HomeBackground
+    let photo: UIImage?
+
+    var body: some View {
+        Group {
+            switch background {
+            case .none:
+                Color(UIColor.systemBackground)
+            case .preset(let id):
+                HomePresets.gradient(id)
+            case .photo:
+                if let photo {
+                    GeometryReader { g in
+                        Image(uiImage: photo).resizable().scaledToFill()
+                            .frame(width: g.size.width, height: g.size.height)
+                            .clipped()
+                    }
+                    // 白い字を読みやすくする
+                    .overlay(Color.black.opacity(0.18))
+                } else {
+                    Color(UIColor.systemBackground)
+                }
+            }
+        }
+        .ignoresSafeArea()
+    }
+}
+
+// MARK: カスタマイズの画面
+
 @MainActor
-struct DevPanel: View {
-    @ObservedObject var store: BrowserStore
-    @ObservedObject var status: StatusModel
+struct HomeCustomizeView: View {
+    @ObservedObject var home: HomeStore
     @Environment(\.dismiss) private var dismiss
-    @State private var page = DevPage.overview
+    @State private var picked: PhotosPickerItem?
+    private let swatchColumns = [GridItem(.adaptive(minimum: 88), spacing: 12)]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SheetHeader(closeLabel: "閉じる", closeLeading: 12, close: { dismiss() }) {
-                Text("開発者パネル").font(.headline)
-            } trailing: {
-                Menu {
-                    Button("ログをコピー") { UIPasteboard.general.string = store.logs.export() }
-                    Button("通信の記録をコピー") { UIPasteboard.general.string = store.netLog.export() }
-                    Button(status.hadCrash ? "前回の記録をコピー（落ちた）" : "前回の記録をコピー") {
-                        UIPasteboard.general.string = CrashLog.previous() ?? "（前回の記録はありません）"
+        VStack(spacing: 0) {
+            SheetHeader(closeLabel: "完了", close: { dismiss() }) {
+                Text("ホームをカスタマイズ").font(.headline)
+            }
+            .padding()
+            List {
+                Section("表示する項目") {
+                    Toggle("ブックマーク", isOn: flag(\.showBookmarks))
+                    Toggle("よく見るサイト", isOn: flag(\.showTopSites))
+                    if !home.layout.hiddenTopSites.isEmpty {
+                        Button("外したよく見るサイトを戻す（\(home.layout.hiddenTopSites.count) 件）") { home.restoreTopSites() }
                     }
-                } label: {
-                    Label(status.hadCrash ? "コピー（前回は落ちた）" : "コピー", systemImage: "doc.on.doc")
                 }
-            }
-            DevPageBar(page: $page)
-            DevPageContent(store: store, page: page, tick: status.devTick)
-        }
-        .padding()
-    }
-}
-
-@MainActor
-struct DevPageBar: View {
-    @Binding var page: DevPage
-
-    var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                ForEach(DevPage.allCases, id: \.self) { p in
-                    Button { page = p } label: {
-                        Text(p.rawValue)
-                            .font(.system(size: 13, weight: page == p ? .semibold : .regular))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(RoundedRectangle(cornerRadius: 7).fill(page == p ? Color.accentColor.opacity(0.2) : Color(UIColor.tertiarySystemFill)))
+                Section("背景") {
+                    LazyVGrid(columns: swatchColumns, spacing: 12) {
+                        swatch(.none, title: "なし") { Color(UIColor.systemBackground) }
+                        ForEach(HomeLayout.presetIDs, id: \.self) { id in
+                            swatch(.preset(id), title: HomePresets.title(id)) { HomePresets.gradient(id) }
+                        }
+                        if let photo = home.wallpaper {
+                            swatch(.photo, title: "写真") {
+                                Image(uiImage: photo).resizable().scaledToFill()
+                            }
+                        }
+                        PhotosPicker(selection: $picked, matching: .images) {
+                            SwatchBox(title: home.preparingPhoto ? "読み込み中…" : "写真を選ぶ", selected: false) {
+                                ZStack {
+                                    Color(UIColor.tertiarySystemFill)
+                                    Image(systemName: "photo.on.rectangle").font(.system(size: 22)).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(home.preparingPhoto)
                     }
-                    .buttonStyle(.plain)
+                    .padding(.vertical, 6)
+                    if home.wallpaper != nil {
+                        Button("写真を削除", role: .destructive) { home.removePhoto() }
+                    }
                 }
+            }
+            .listStyle(.insetGrouped)
+        }
+        .onChange(of: picked) { item in
+            guard let item else { return }
+            Task { @MainActor in
+                if let d = try? await item.loadTransferable(type: Data.self) { home.setPhoto(d) }
+                picked = nil
             }
         }
     }
-}
 
-@MainActor
-struct DevPageContent: View {
-    @ObservedObject var store: BrowserStore
-    let page: DevPage
-    /// 変わると描き直す（中身は使わない）。各ページにもそのまま渡す
-    let tick: Int
+    private func flag(_ k: WritableKeyPath<HomeLayout, Bool>) -> Binding<Bool> {
+        Binding(get: { home.layout[keyPath: k] }, set: { v in home.update { $0[keyPath: k] = v } })
+    }
 
-    var body: some View {
-        switch page {
-        case .overview: DevOverview(store: store, tick: tick, status: store.status)
-        case .log: DevLogPage(store: store, tick: tick)
-        case .network: DevNetworkPage(store: store, tick: tick)
-        case .tabs: DevTabsPage(store: store, tick: tick)
-        case .cookies: DevCookiePage(store: store, tick: tick)
-        case .hsts: DevHSTSPage(store: store, tick: tick)
-        case .adblock: DevAdBlockPage(store: store, tick: tick, adblock: store.adblock)
-        case .vnet: DevVNetPage(store: store, tick: tick, status: store.status)
-        case .system: DevSystemPage(store: store, tick: tick)
-        case .scope: DevScopePage()
+    private func swatch<P: View>(_ b: HomeBackground, title: String, @ViewBuilder preview: () -> P) -> some View {
+        Button { home.setBackground(b) } label: {
+            SwatchBox(title: title, selected: home.layout.background == b, preview: preview)
         }
+        .buttonStyle(.plain)
     }
 }
 
-/// 等幅の小さな文字の行
-@MainActor
-struct DevLine: View {
-    let text: String
-    init(_ text: String) { self.text = text }
-    var body: some View {
-        Text(text).font(.system(size: 12, design: .monospaced)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
-    }
-}
-
-// MARK: 概要
-
-@MainActor
-struct DevOverview: View {
-    @ObservedObject var store: BrowserStore
-    /// 変わると描き直す（中身は使わない）。@Published でない値（ログ・通信の記録・Cookie・HSTS・WebView の数・
-    /// ダウンロード中の数）を毎秒出し直すため。今は store が毎秒変わることでも描き直している
-    let tick: Int
-    @ObservedObject var status: StatusModel
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 4) {
-                Group {
-                DevLine(store.takeover.description)
-                DevLine("新しいタブの通信: \(store.defaultMode.rawValue)")
-                DevLine("VNet: \(status.vnetStatus)")
-                DevLine("タブ \(store.tabs.count) 枚・動いている WebView \(store.liveWebViewCount) / \(BrowserStore.maxLiveWebViews)")
-                DevLine("Cookie（写し）\(store.cookieJar.count) 個・HSTS \(store.hsts.all().count) 件")
-                DevLine("広告ブロック: \(store.adblock.enabled ? "使う" : "止めている")・VNet 用のルール \(store.adblock.ruleCount) 個・止めた数 \(store.adblock.totalBlocked)")
-                DevLine("ネットワーク: \(status.isOnline ? "つながっている" : "つながっていない")・ダウンロード中 \(store.downloads.runningCount) 件")
-                DevLine("ログ: 警告 \(store.logs.count(.warning))・エラー \(store.logs.count(.error))・通信の記録 \(store.netLog.count) 件")
-                if status.hadCrash { DevLine("⚠️ 前回は落ちて終わりました（右上の「コピー」→ 前回の記録）") }
-                }
-                Divider().padding(.vertical, 6)
-                Text("最近の警告・エラー").font(.subheadline)
-                ForEach(store.logs.all().filter { $0.level >= .warning }.suffix(30).reversed()) { e in
-                    DevLine(e.line).foregroundColor(e.level == .error ? .red : .orange)
-                }
-            }
-        }
-    }
-}
-
-// MARK: ログ
-
-@MainActor
-struct DevLogPage: View {
-    @ObservedObject var store: BrowserStore
-    /// 変わると描き直す（中身は使わない）。@Published でない値（ログ・通信の記録・Cookie・HSTS・WebView の数・
-    /// ダウンロード中の数）を毎秒出し直すため。今は store が毎秒変わることでも描き直している
-    let tick: Int
-    @State private var minLevel = LogLevel.info
-    @State private var category: LogCategory?
-    @State private var onlyThisTab = false
-    @State private var query = ""
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 12) {
-                Menu("重さ: \(levelName(minLevel)) 以上") {
-                    ForEach(LogLevel.allCases, id: \.self) { l in Button(levelName(l)) { minLevel = l } }
-                }
-                Menu("種類: \(category?.rawValue ?? "全部")") {
-                    Button("全部") { category = nil }
-                    ForEach(LogCategory.allCases, id: \.self) { c in Button(c.rawValue) { category = c } }
-                }
-                Toggle("このタブだけ", isOn: $onlyThisTab).fixedSize()
-                TextField("探す", text: $query).searchFieldStyle()
-                Button("コピー") { UIPasteboard.general.string = filtered.map { $0.line }.joined(separator: "\n") }
-                Button("消す") { store.logs.clear() }
-            }
-            .font(.system(size: 13))
-            DevLogView(text: filtered.suffix(400).map { $0.line }.joined(separator: "\n"))
-        }
-    }
-
-    private var filtered: [LogEntry] {
-        let dq = DevQuery(onlyThisTab: onlyThisTab, query: query)
-        let tab = dq.tab(selected: store.selectedID)
-        return store.logs.all().filter { e in
-            e.level >= minLevel && (category == nil || e.category == category) && (tab == nil || e.tab == tab)
-                && dq.matches(e.message)
-        }
-    }
-
-    private func levelName(_ l: LogLevel) -> String {
-        switch l { case .debug: return "細かい"; case .info: return "普通"; case .warning: return "警告"; case .error: return "エラー" }
-    }
-}
-
-@MainActor
-struct DevLogView: View {
-    let text: String
-
-    var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                Text(text)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(.green)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-                Color.clear.frame(height: 1).id("end")
-            }
-            .background(Color.black)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            .onChange(of: text) { _ in proxy.scrollTo("end", anchor: .bottom) }
-        }
-    }
-}
-
-// MARK: タブ
-
-@MainActor
-struct DevTabsPage: View {
-    @ObservedObject var store: BrowserStore
-    /// 変わると描き直す（中身は使わない）。@Published でない値（ログ・通信の記録・Cookie・HSTS・WebView の数・
-    /// ダウンロード中の数）を毎秒出し直すため。今は store が毎秒変わることでも描き直している
-    let tick: Int
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(store.tabs) { tab in
-                    DevTabBlock(tab: tab, selected: tab.id == store.selectedID)
-                }
-            }
-        }
-    }
-}
-
-@MainActor
-struct DevTabBlock: View {
-    @ObservedObject var tab: BrowserTab
+/// 背景の見本 1 つ（選んでいるものは青い枠）
+struct SwatchBox<P: View>: View {
+    let title: String
     let selected: Bool
+    let preview: P
+
+    init(title: String, selected: Bool, @ViewBuilder preview: () -> P) {
+        self.title = title
+        self.selected = selected
+        self.preview = preview()
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            DevLine("\(selected ? "▶" : " ") #\(tab.id) [\(tab.mode.short)・\(tab.state.rawValue)\(tab.isLoading ? "・読み込み中 \(Int(tab.progress * 100))%" : "")]"
-                    + "・WebView \(tab.webView == nil ? "なし" : "あり")・文字 \(PageZoom.percent(tab.zoom))・ブロック \(tab.blockedCount)")
-            DevLine("   \(tab.url?.absoluteString ?? "（空）")")
-            if !tab.nonVNetUsage.isEmpty { DevLine("   VNet を通らない通信: \(tab.nonVNetUsage.sorted().joined(separator: "・"))") }
-            ForEach(Array(tab.navEvents.suffix(8).enumerated()), id: \.offset) { _, ev in
-                DevLine("   \(DevTime.format(ev.0)) \(ev.1)").foregroundStyle(.secondary)
-            }
+        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+        VStack(spacing: 4) {
+            preview
+                .frame(width: 80, height: 56)
+                .clipShape(shape)
+                .overlay(shape.stroke(selected ? Color.accentColor : Color.gray.opacity(0.3), lineWidth: selected ? 3 : 1))
+            Text(title).font(.system(size: 12)).lineLimit(1).foregroundColor(.primary)
         }
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
     }
-}
-
-enum DevTime {
-    static let formatter: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "HH:mm:ss"
-        return f
-    }()
-    static func format(_ d: Date) -> String { formatter.string(from: d) }
 }

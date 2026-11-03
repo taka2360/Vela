@@ -588,6 +588,10 @@ final class BrowserTab: ObservableObject, Identifiable {
         if let u = url, u != errorPageURL, LibraryKey.isRecordable(u) {
             store?.recordVisit(url: u, title: title)
             lastRecorded = u
+            // ホームのタイルに出すアイコン（VNet が動いていて、このタブも VNet なら VNet で取る）
+            if let wv = webView, let store {
+                store.icons.pageLoaded(wv, page: u, viaVNet: mode.usesVNet && store.defaultMode.usesVNet)
+            }
         }
         store?.saveSession()
     }
