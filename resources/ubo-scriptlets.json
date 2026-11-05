@@ -1,11 +1,11 @@
 {
  "format": 1,
- "ubo": "1.75.2",
- "commit": "7cdf1375509050e6474509825c95bca79df06081",
- "generated": "2026-11-03T05:48:25.390Z",
+ "ubo": "1.75.4",
+ "commit": "f417911934edb2d3e2700110803ed7fde6f51022",
+ "generated": "2026-11-05T11:47:25.110Z",
  "license": "GPL-3.0-or-later",
  "notice": "uBlock Origin - Copyright (C) 2014-present Raymond Hill. Functions are taken unmodified from https://github.com/gorhill/uBlock (src/js/resources) under the GNU General Public License v3 or later.",
- "source": "https://github.com/gorhill/uBlock/tree/1.75.2/src/js/resources",
+ "source": "https://github.com/gorhill/uBlock/tree/1.75.4/src/js/resources",
  "scriptlets": [
   {
    "name": "safe-self.fn",
