@@ -2,7 +2,9 @@
 import { createPrivateKey, createPublicKey, sign, verify } from 'node:crypto';
 
 export function signBytes(bytes, privatePem) {
-    return sign(null, bytes, createPrivateKey(privatePem)).toString('base64');
+    let pem = privatePem.trim();
+    if (pem.includes('\\n')) pem = pem.replace(/\\n/g, '\n');
+    return sign(null, bytes, createPrivateKey(pem)).toString('base64');
 }
 
 export function verifyBytes(bytes, sigBase64, publicKeyBase64) {
