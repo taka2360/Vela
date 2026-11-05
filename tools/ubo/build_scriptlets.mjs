@@ -17,7 +17,7 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'no
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { signBytes } from './sign.mjs';
+import { signBytes, checkSigningKey, appPublicKey } from './sign.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..', '..');
@@ -133,6 +133,7 @@ async function main() {
     const tag = args.find(a => !a.startsWith('--'));
     const key = signingKey();
     if (!key && !unsigned) throw new Error('署名の鍵がありません（UBO_SIGNING_KEY / UBO_SIGNING_KEY_FILE。試すだけなら --unsigned）');
+    if (key) checkSigningKey(key, appPublicKey(root));
     const out = await build(tag);
     let prev = null;
     if (existsSync(outFile)) { try { prev = JSON.parse(readFileSync(outFile, 'utf8')); } catch { } }
